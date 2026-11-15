@@ -1,0 +1,41 @@
+# 四个 sidecar entry 的宿主装载冒烟（开发用，不进生产装配）
+#
+# 验证 state-handle 的 ctx.provide('state')、obs-broker / context-render 的 ctx.on 挂载、
+# action-gate 的 ctx.tools.guard 注册是否在真实宿主上生效。
+# 不需要 API Key：装载与接线先于任何 LLM 调用完成，任务会在 MISSING_CREDENTIAL 处终止，
+# 那正是本冒烟要的观测点。
+
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  config:
+    agents: []
+    maxParallelToolCalls: 10
+  disabled: true
+- insert:
+    - id: stream-agent
+      name: ../dist/entry/loop.js
+      inject: [llm, tools, agents, sessions]
+      config:
+        announceTakeover: true
+        streamIdleTimeoutMs: 30000
+    - id: stream-agent-state
+      name: ../dist/entry/state-handle.js
+      inject: [storage]
+      config:
+        unit: tfAgentState
+        announce: true
+    - id: stream-agent-obs-broker
+      name: ../dist/entry/obs-broker.js
+      inject: [tools, state]
+      config:
+        announce: true
+    - id: stream-agent-action-gate
+      name: ../dist/entry/action-gate.js
+      inject: [tools, storage]
+      config:
+        announce: true
+    - id: stream-agent-context-render
+      name: ../dist/entry/context-render.js
+      inject: []
+      config:
+        announce: true

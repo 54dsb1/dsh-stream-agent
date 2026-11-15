@@ -16,7 +16,7 @@
 //     mock 只依赖 llm 流契约，谁被测都一样。
 //   - fail-fast：剧本非法、waitTools 等不到信号、消费方从不 abort 一律快速抛清晰错误，
 //     绝不挂死（红线 5 的反面）。
-//   - 只挂测试 preset（test-preset.yml）；生产 preset.yml 不得引用本 entry。
+//   - 只挂测试 preset（patches/test-preset.yml）；生产 preset.yml 不得引用本 entry。
 
 // ---------------------------------------------------------------------------
 // 流契约镜像（勿改语义；来源 file:line 见注释）

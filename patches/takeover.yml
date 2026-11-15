@@ -1,0 +1,28 @@
+# 开发/调试形态入口：--patch 顶层叠加，接管内建 loop
+#
+#   dsh --profile headless --patch <本文件绝对路径> headless "<任务>"
+#
+# 与根目录 cordis.patch.yml 语义一致（停内建 agent-loop + 挂本插件 loop），
+# 差别只在挂载方式：本文件随命令叠加，不进 profile、不改用户配置，验证完即失效。
+# 相对路径以本文件所在目录为 baseUrl，因此这里写 ../dist/。
+#
+# announceTakeover: true 在 stderr 打一行接管横幅——patch 激活对 CLI 是静默的，
+# 接管与否只能靠插件自证或 session log 对账。
+
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  config:
+    agents: []
+    maxParallelToolCalls: 10
+  disabled: true
+- insert:
+    - id: stream-agent
+      name: ../dist/entry/loop.js
+      # inject 在 patch 行必须显式声明（loader 读 entry.options.inject，
+      # cordis-plugin-loader/lib/index.js:768——模块导出的 inject 不进 patch 行）
+      inject: [llm, tools, agents, sessions, sessionProjections]
+      config:
+        announceTakeover: true
+        maxParallelToolCalls: 3
+        maxReentries: 8
+        streamIdleTimeoutMs: 30000

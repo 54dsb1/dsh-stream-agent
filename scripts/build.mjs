@@ -1,6 +1,6 @@
 // scripts/build.mjs —— 零依赖构建：Node 24 原生 stripTypeScriptTypes → dist/
 //
-// 宿主 loader 只加载 .js（test-preset.yml 引 ./dist/entry/mock-provider.js 的先例，
+// 宿主 loader 只加载 .js（patches/test-preset.yml 引 ../dist/entry/mock-provider.js 的先例，
 // 05 号 results §4），因此 src/*.ts 需要产出 dist/*.js：
 //   1. module.stripTypeScriptTypes(code, { mode: 'strip' }) 擦除类型
 //      （本包无 enum/namespace/参数属性，strip 模式安全；出现不可擦除语法会快速报错）

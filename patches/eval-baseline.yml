@@ -1,0 +1,33 @@
+# 评测基线臂：内建 loop 原样运行 + 中立探针
+#
+# 基线 = 内建 agent-loop 不做任何行为调参（minimal），唯一附加是 eval-probe
+# （两臂同装的测量仪器，只读透传）。对照臂见 patches/eval-stream.yml；
+# 任务集、seed、探针在两臂间逐字节相同——控制变量红线。
+#
+#   dsh --profile headless --patch <本文件> headless "<任务文本>"
+#   env DSH_EVAL_PROBE_DIR=<每任务每臂独立目录>，由 runner 设置
+#
+# 注意：本包经 dsh plugin add 安装后，bundle 层已经停用内建 agent-loop 并插入五个生产
+# entry，基线臂必须先覆盖回来，否则基线会被对照臂实现劫持。--patch 层优先级最高，
+# 下面用同 id 覆盖行逐行恢复原生形态。
+
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  disabled: false
+- id: stream-agent
+  disabled: true
+- id: stream-agent-state
+  disabled: true
+- id: stream-agent-obs-broker
+  disabled: true
+- id: stream-agent-action-gate
+  disabled: true
+- id: stream-agent-context-render
+  disabled: true
+
+- insert:
+    - id: stream-agent-eval-probe
+      name: ../dist/entry/eval-probe.js
+      inject: []
+      config:
+        announce: true

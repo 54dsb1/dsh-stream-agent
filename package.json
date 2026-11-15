@@ -32,7 +32,7 @@
     "build": "node scripts/build.mjs"
   },
   "engines": {
-    "node": ">=24",
+    "node": ">=22.18",
     "dsh": ">=0.2.2-rc.1"
   },
   "dsh": {
@@ -43,22 +43,20 @@
   },
   "files": [
     "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
     "dist/",
     "src/",
     "test/",
     "scripts/",
+    "docs/",
     "eval/METRICS.md",
     "eval/RESULTS.md",
     "eval/tasks/",
     "eval/tools/",
     "preset.yml",
-    "test-preset.yml",
     "cordis.patch.yml",
-    "patch-takeover.yml",
-    "patch-adapters-smoke.yml",
-    "patch-eval-baseline.yml",
-    "patch-eval-stream.yml",
-    "README.md",
-    "CHANGELOG.md"
+    "patches/"
   ]
 }

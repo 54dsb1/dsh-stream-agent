@@ -1,0 +1,51 @@
+# 评测对照臂：本插件全量接管 + 中立探针
+#
+# 对照 = patches/takeover.yml 的接管 + 四个 sidecar entry（生产形态）+ eval-probe
+# （两臂同装的测量仪器，只读透传）。基线臂见 patches/eval-baseline.yml；
+# 任务集、seed、探针两臂逐字节相同——控制变量红线。
+#
+#   dsh --profile headless --patch <本文件> headless "<任务文本>"
+#   env DSH_EVAL_PROBE_DIR=<每任务每臂独立目录>   （runner 设置）
+#   env STREAM_LOOP_EVAL_DUMP=<dir>/driver-       （驱动器 turn-end snapshot，M3 权威口径）
+
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  config:
+    agents: []
+    maxParallelToolCalls: 10
+  disabled: true
+- insert:
+    - id: stream-agent
+      name: ../dist/entry/loop.js
+      inject: [llm, tools, agents, sessions, sessionProjections]
+      config:
+        announceTakeover: true
+        maxParallelToolCalls: 3
+        maxReentries: 8
+        streamIdleTimeoutMs: 60000
+    - id: stream-agent-state
+      name: ../dist/entry/state-handle.js
+      inject: [storage]
+      config:
+        unit: tfAgentState
+        announce: true
+    - id: stream-agent-obs-broker
+      name: ../dist/entry/obs-broker.js
+      inject: [tools, state]
+      config:
+        announce: true
+    - id: stream-agent-action-gate
+      name: ../dist/entry/action-gate.js
+      inject: [tools, storage]
+      config:
+        announce: true
+    - id: stream-agent-context-render
+      name: ../dist/entry/context-render.js
+      inject: []
+      config:
+        announce: true
+    - id: stream-agent-eval-probe
+      name: ../dist/entry/eval-probe.js
+      inject: []
+      config:
+        announce: true

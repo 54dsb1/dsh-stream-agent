@@ -1,16 +1,16 @@
-// eval/tools/runner.cjs ¡ª¡ª ·ÖÅÉ 08 ÆÀ²â runner£ºÖğÈÎÎñÖğ±ÛÕæÁ¬Ö´ĞĞ + È¡Ö¤ + Ö¸±ê³õËã
+// eval/tools/runner.cjs ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ 08 ï¿½ï¿½ï¿½ï¿½ runnerï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö´ï¿½ï¿½ + È¡Ö¤ + Ö¸ï¿½ï¿½ï¿½ï¿½ï¿½
 //
-// ÓÃ·¨£º
+// ï¿½Ã·ï¿½ï¿½ï¿½
 //   node eval/tools/runner.cjs --arm baseline|stream [--stamp <2026-11-14>] [--tasks W1,R1] [--timeout 600]
-//     --stamp 2026-11-14a   £¨È±Ê¡ = µ±ÌìÈÕÆÚ£»Í¬ stamp ÖØÅÜ¸²¸ÇÍ¬ÈÎÎñÄ¿Â¼£¬±ãÓÚÍ¬ÈÕ¸´ÅÜ£©
-//     --key  <DEEPSEEK_API_KEY>£¨È±Ê¡Í¸´« process.env£»Á½±ÛÍ¬Ò» key = ¿ØÖÆ±äÁ¿ºìÏß 4£©
+//     --stamp 2026-11-14a   ï¿½ï¿½È±Ê¡ = ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ú£ï¿½Í¬ stamp ï¿½ï¿½ï¿½Ü¸ï¿½ï¿½ï¿½Í¬ï¿½ï¿½ï¿½ï¿½Ä¿Â¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¬ï¿½Õ¸ï¿½ï¿½Ü£ï¿½
+//     --key  <DEEPSEEK_API_KEY>ï¿½ï¿½È±Ê¡Í¸ï¿½ï¿½ process.envï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¬Ò» key = ï¿½ï¿½ï¿½Æ±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 4ï¿½ï¿½
 //
-// Ã¿ÈÎÎñ²ú³ö eval/runs/<stamp>/<arm>/<TASK>/£º
-//   ws/            ÈÎÎñ¹¤×÷Çø£¨seed ºóÊµÅÜ£¬ÅÜÍêÁôÔ­Ñù + manifest.json£©
-//   probe/         eval-probe ÂäÅÌ£¨probe.jsonl£ºÖğÇëÇó options Ô­ÎÄ + Öğ chunk usage Ô­ÎÄ£©
-//   driver-*.json  ¶ÔÕÕ±Û£º06 Çı¶¯Æ÷ turn-end snapshot£¨STREAM_LOOP_EVAL_DUMP£©
-//   session-log/session.v4.jsonl.zstd  Ô­Ñù´æµµ£¨ÖØ·Å oracle£¬ºìÏß£ºzstd Ô­Ñù±£Áô£©
-//   metrics.json   ËÄÔª×é + prefix ĞòÁĞ + checks + ´æµµÂ·¾¶£¨gen-results µÄÊäÈë£©
+// Ã¿ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ eval/runs/<stamp>/<arm>/<TASK>/ï¿½ï¿½
+//   ws/            ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½seed ï¿½ï¿½Êµï¿½Ü£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô­ï¿½ï¿½ + manifest.jsonï¿½ï¿½
+//   probe/         eval-probe ï¿½ï¿½ï¿½Ì£ï¿½probe.jsonlï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ options Ô­ï¿½ï¿½ + ï¿½ï¿½ chunk usage Ô­ï¿½Ä£ï¿½
+//   driver-*.json  ï¿½ï¿½ï¿½Õ±Û£ï¿½06 ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ turn-end snapshotï¿½ï¿½STREAM_LOOP_EVAL_DUMPï¿½ï¿½
+//   session-log/session.v4.jsonl.zstd  Ô­ï¿½ï¿½ï¿½æµµï¿½ï¿½ï¿½Ø·ï¿½ oracleï¿½ï¿½ï¿½ï¿½ï¿½ß£ï¿½zstd Ô­ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+//   metrics.json   ï¿½ï¿½Ôªï¿½ï¿½ + prefix ï¿½ï¿½ï¿½ï¿½ + checks + ï¿½æµµÂ·ï¿½ï¿½ï¿½ï¿½gen-results ï¿½ï¿½ï¿½ï¿½ï¿½ë£©
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -19,8 +19,8 @@ const { spawnSync } = require('node:child_process');
 const { newestSessionDir, parseSessionLog, summarizeSession, workspaceManifest } = require('./session-log.cjs');
 
 const PKG_ROOT = path.resolve(__dirname, '..', '..');
-const PATCH_BASELINE = path.join(PKG_ROOT, 'patch-eval-baseline.yml');
-const PATCH_STREAM = path.join(PKG_ROOT, 'patch-eval-stream.yml');
+const PATCH_BASELINE = path.join(PKG_ROOT, 'patches', 'eval-baseline.yml');
+const PATCH_STREAM = path.join(PKG_ROOT, 'patches', 'eval-stream.yml');
 const TASKS_FILE = path.join(PKG_ROOT, 'eval', 'tasks', 'tasks.json');
 const FIXTURES = path.join(PKG_ROOT, 'eval', 'tasks', 'fixtures');
 
@@ -29,7 +29,7 @@ function arg(name, def) {
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : def;
 }
 
-/** Ì½ÕëÇëÇóÊÇ·ñÎª±êÌâÅÔÂ·£¨METRICS.md M1/M2 ÌŞ³ıÏî£»Ê¶±ğÌØÕ÷°´ E5£© */
+/** Ì½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½Îªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Â·ï¿½ï¿½METRICS.md M1/M2 ï¿½Ş³ï¿½ï¿½î£»Ê¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ E5ï¿½ï¿½ */
 function isTitleRequest(optionsText) {
   try {
     const o = JSON.parse(optionsText);
@@ -40,12 +40,12 @@ function isTitleRequest(optionsText) {
   } catch { return false; }
 }
 
-/** ÏàÁÚÇëÇó¹«¹²Ç°×º£¨×Ö½Ú¼¶£¬M4£©£ºÒÔ probe ´æµÄ options ĞòÁĞ»¯ÎÄ±¾Îª×¼ */
+/** ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ó¹«¹ï¿½Ç°×ºï¿½ï¿½ï¿½Ö½Ú¼ï¿½ï¿½ï¿½M4ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ probe ï¿½ï¿½ï¿½ options ï¿½ï¿½ï¿½Ğ»ï¿½ï¿½Ä±ï¿½Îª×¼ */
 function prefixSequence(requests) {
   const out = [];
   let prev = null;
   for (const r of requests) {
-    const messages = r.messages; // probe request options Ô­ÎÄ£¨JSON ×Ö·û´®£©
+    const messages = r.messages; // probe request options Ô­ï¿½Ä£ï¿½JSON ï¿½Ö·ï¿½ï¿½ï¿½ï¿½ï¿½
     const hash = crypto.createHash('sha256').update(messages).digest('hex').slice(0, 16);
     let common = 0;
     if (prev !== null) {
@@ -70,7 +70,7 @@ function runTask(task, arm, runDir, apiKey, timeoutSec) {
   fs.mkdirSync(wsDir, { recursive: true });
   fs.mkdirSync(probeDir, { recursive: true });
 
-  // seed£¨Á½±ÛÖğ×Ö½ÚÍ¬Ò»·İ fixtures£©
+  // seedï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö½ï¿½Í¬Ò»ï¿½ï¿½ fixturesï¿½ï¿½
   for (const s of task.seed || []) {
     const dst = path.join(wsDir, s.path);
     fs.mkdirSync(path.dirname(dst), { recursive: true });
@@ -90,7 +90,7 @@ function runTask(task, arm, runDir, apiKey, timeoutSec) {
   const timedOut = res.error && res.error.code === 'ETIMEDOUT';
 
   // ---- È¡Ö¤ ----
-  // session log ÔÚ½ø³ÌÍË³öºóÓĞÂäÅÌÑÓ³Ù£¨Êµ²â£©£¬ÂÖÑ¯×î¶à 30s Ö±µ½³öÏÖ
+  // session log ï¿½Ú½ï¿½ï¿½ï¿½ï¿½Ë³ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó³Ù£ï¿½Êµï¿½â£©ï¿½ï¿½ï¿½ï¿½Ñ¯ï¿½ï¿½ï¿½ 30s Ö±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
   let session = newestSessionDir(wsDir);
   for (let waited = 0; session === undefined && waited < 30000; waited += 2000) {
     sleepSync(2000);
@@ -100,19 +100,19 @@ function runTask(task, arm, runDir, apiKey, timeoutSec) {
   if (session !== undefined) {
     const archDir = path.join(taskDir, 'session-log');
     fs.mkdirSync(archDir, { recursive: true });
-    fs.copyFileSync(session.logPath, path.join(archDir, 'session.v4.jsonl.zstd')); // Ô­Ñù×Ö½Ú
+    fs.copyFileSync(session.logPath, path.join(archDir, 'session.v4.jsonl.zstd')); // Ô­ï¿½ï¿½ï¿½Ö½ï¿½
     archived = { archived: true, sessionDir: session.sessionDir, copiedBytes: fs.statSync(path.join(archDir, 'session.v4.jsonl.zstd')).size };
   }
   const manifest = workspaceManifest(wsDir);
   fs.writeFileSync(path.join(wsDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
 
-  // ---- session log ÊÂÊµ ----
-  let sessionFacts = { error: 'session log Î´ÕÒµ½£¨archived=false Ê±±¾ÈÎÎñ²»¿É¸´Ëã£¬ÈçÊµ±ê×¢£©' };
+  // ---- session log ï¿½ï¿½Êµ ----
+  let sessionFacts = { error: 'session log Î´ï¿½Òµï¿½ï¿½ï¿½archived=false Ê±ï¿½ï¿½ï¿½ï¿½ï¿½ñ²»¿É¸ï¿½ï¿½ã£¬ï¿½ï¿½Êµï¿½ï¿½×¢ï¿½ï¿½' };
   if (session !== undefined) {
     sessionFacts = summarizeSession(parseSessionLog(session.logPath));
   }
 
-  // ---- probe ÊÂÊµ£¨M1 Ö÷¿Ú¾¶ / M2 v1.1 Ö÷¿Ú¾¶ / M4£©----
+  // ---- probe ï¿½ï¿½Êµï¿½ï¿½M1 ï¿½ï¿½ï¿½Ú¾ï¿½ / M2 v1.1 ï¿½ï¿½ï¿½Ú¾ï¿½ / M4ï¿½ï¿½----
   const probeFile = path.join(probeDir, 'probe.jsonl');
   const probeLines = fs.existsSync(probeFile)
     ? fs.readFileSync(probeFile, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return { kind: 'PARSE_ERROR' }; } })
@@ -128,11 +128,11 @@ function runTask(task, arm, runDir, apiKey, timeoutSec) {
       try {
         const c = JSON.parse(l.chunk);
         if (c.type === 'usage' && usageBySeq.has(l.seq)) usageBySeq.get(l.seq).usage.push(c.usage);
-      } catch { /* Ô­ÎÄ±£ÁôÔÚ probe.jsonl£¬½âÎöÊ§°ÜÈçÊµ¼ÇÂ¼ PARSE_ERROR */ }
+      } catch { /* Ô­ï¿½Ä±ï¿½ï¿½ï¿½ï¿½ï¿½ probe.jsonlï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê§ï¿½ï¿½ï¿½ï¿½Êµï¿½ï¿½Â¼ PARSE_ERROR */ }
     }
   }
 
-  // ---- M1 »ã×Ü£¨E3 ¿Ú¾¶£ºinput = uncached + cacheRead + cacheWrite£©----
+  // ---- M1 ï¿½ï¿½ï¿½Ü£ï¿½E3 ï¿½Ú¾ï¿½ï¿½ï¿½input = uncached + cacheRead + cacheWriteï¿½ï¿½----
   const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   let cachedFieldsSeen = false;
   const usageOriginal = [];
@@ -147,7 +147,7 @@ function runTask(task, arm, runDir, apiKey, timeoutSec) {
     }
   }
 
-  // ---- M3£ºÇı¶¯Æ÷ snapshot£¨¶ÔÕÕ±Û£©----
+  // ---- M3ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ snapshotï¿½ï¿½ï¿½ï¿½ï¿½Õ±Û£ï¿½----
   let driverDump = null;
   if (arm === 'stream') {
     const dumps = fs.readdirSync(taskDir).filter((n) => n.startsWith('driver-') && n.endsWith('.json'));
@@ -175,21 +175,21 @@ function runTask(task, arm, runDir, apiKey, timeoutSec) {
     task: task.id, arm, type: task.type,
     started, finished, exitCode: res.status, timedOut: timedOut === true, signal: res.signal || null,
     stdoutTail: (res.stdout || '').slice(-800), stderrTail: (res.stderr || '').slice(-1500),
-    M2_callCount: { main: sessionFacts.requestHeaderCount, probe: probeRequests.length, probeRaw: probeRequestsRaw.length, titleExcluded, note: 'v1.1£ºÖ÷¿Ú¾¶=probe ¼ÆÊı£»main(session log request/header) ½ö»ùÏß±Û¿ÉµÃ£¬×÷¶ÔÕË' },
-    M1_tokens: { ...tokens, unitTaskToken: tokens.input + tokens.output, cachedFieldsSeen, usageOriginal, sourceNote: 'E3 ¿Ú¾¶£ºinput=uncached+cacheRead+cacheWrite£»usage Ô­ÎÄÖğÌõÁô´æ' },
+    M2_callCount: { main: sessionFacts.requestHeaderCount, probe: probeRequests.length, probeRaw: probeRequestsRaw.length, titleExcluded, note: 'v1.1ï¿½ï¿½ï¿½ï¿½ï¿½Ú¾ï¿½=probe ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½main(session log request/header) ï¿½ï¿½ï¿½ï¿½ï¿½ß±Û¿ÉµÃ£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½' },
+    M1_tokens: { ...tokens, unitTaskToken: tokens.input + tokens.output, cachedFieldsSeen, usageOriginal, sourceNote: 'E3 ï¿½Ú¾ï¿½ï¿½ï¿½input=uncached+cacheRead+cacheWriteï¿½ï¿½usage Ô­ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½' },
     M3_injectedRatio: driverDump
-      ? { injected: driverDump.counters.injected, produced: driverDump.counters.produced, injectedRatio: driverDump.counters.injectedRatio, source: 'driver snapshot£¨È¨Íş£©' }
-      : (arm === 'baseline' ? { note: 'n/a£¨»ùÏß±ÛÎŞ×¢Èë¸ÅÄî£©' } : { note: 'driver dump È±Ê§' }),
+      ? { injected: driverDump.counters.injected, produced: driverDump.counters.produced, injectedRatio: driverDump.counters.injectedRatio, source: 'driver snapshotï¿½ï¿½È¨ï¿½ï¿½ï¿½ï¿½' }
+      : (arm === 'baseline' ? { note: 'n/aï¿½ï¿½ï¿½ï¿½ï¿½ß±ï¿½ï¿½ï¿½×¢ï¿½ï¿½ï¿½ï¿½î£©' } : { note: 'driver dump È±Ê§' }),
     M4_prefix: {
       sequence: prefixSequence(probeRequests),
-      monotonicNote: 'ÖğÇëÇó fullHash Ó¦¸÷²»ÏàÍ¬£¨×·¼ÓÊ½ÀúÊ·£©£»commonPrefixBytesWithPrev ·´Ó³Ç°×º»º´æÇ±Á¦',
-      cachedFieldsEvidence: cachedFieldsSeen ? 'probe usage Ô­ÎÄº¬ cache ×Ö¶Î' : 'provider usage Î´¼û cache ×Ö¶Î£¨ÈçÊµ±ê×¢£¬¼û usageOriginal£©',
+      monotonicNote: 'ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ fullHash Ó¦ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¬ï¿½ï¿½×·ï¿½ï¿½Ê½ï¿½ï¿½Ê·ï¿½ï¿½ï¿½ï¿½commonPrefixBytesWithPrev ï¿½ï¿½Ó³Ç°×ºï¿½ï¿½ï¿½ï¿½Ç±ï¿½ï¿½',
+      cachedFieldsEvidence: cachedFieldsSeen ? 'probe usage Ô­ï¿½Äºï¿½ cache ï¿½Ö¶ï¿½' : 'provider usage Î´ï¿½ï¿½ cache ï¿½Ö¶Î£ï¿½ï¿½ï¿½Êµï¿½ï¿½×¢ï¿½ï¿½ï¿½ï¿½ usageOriginalï¿½ï¿½',
     },
     modelConfig: sessionFacts.providers || [],
     checks, checksPass: checks.every((c) => c.pass),
     sessionArchived: archived,
     sessionFactsNote: sessionFacts.error ? sessionFacts.error : undefined,
-    replay: { pending: true, note: 'ÓÉ replay-check.cjs »ØÌî' },
+    replay: { pending: true, note: 'ï¿½ï¿½ replay-check.cjs ï¿½ï¿½ï¿½ï¿½' },
   };
   fs.writeFileSync(path.join(taskDir, 'metrics.json'), JSON.stringify(metrics, null, 2), 'utf8');
   console.log(`[${arm}/${task.id}] exit=${res.status} calls=${metrics.M2_callCount.probe}(recon:${metrics.M2_callCount.main}) tokens=${metrics.M1_tokens.unitTaskToken} checks=${metrics.checksPass ? 'PASS' : 'FAIL'} archived=${archived.archived}`);
@@ -199,7 +199,7 @@ function runTask(task, arm, runDir, apiKey, timeoutSec) {
 function main() {
   const arm = arg('arm', '');
   if (arm !== 'baseline' && arm !== 'stream') {
-    console.error('--arm ±ØĞëÊÇ baseline »ò stream');
+    console.error('--arm ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ baseline ï¿½ï¿½ stream');
     process.exit(2);
   }
   const all = JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8'));

@@ -1,25 +1,19 @@
-# preset.yml —— @54dsb1/dsh-stream-agent 生产 preset 声明（分派 06 交付 + 分派 07 增补）
+# preset.yml —— @54dsb1/dsh-stream-agent 生产装配清单
 #
-# ⚠ 接管事实（results/01-micro-spike-results.md 探针 A，已实测）：
-#   loop 接管走全局 setFactory 槽位，preset realm 在创建路径上没有消费点。
-#   因此本 preset 只做声明式装配（插件安装/卸载/回滚清单），不承载 loop 接管；
-#   接管由 patch-takeover.yml（profile patch，顶层组合行）完成：
-#     1. 覆盖行停用内建 agent-loop（disabled: true）；
-#     2. insert 行挂本插件 dist/entry/loop.js（apply 内 setFactory）。
-#   preset 嵌套行的关键行会静默失败（探针 A §0 实测 2），故不把任何关键行藏进 preset plugins。
+# 这里只做声明式装配（装什么、装几个、依赖谁），不承载 loop 接管：接管走全局
+# AgentRegistry.setFactory 槽位，由 cordis.patch.yml（bundle 层）或 patches/takeover.yml
+# 完成。preset 的嵌套行在 agent 创建路径上没有消费点，关键行藏进 preset 会静默失败。
 #
-# 入口清单（本包 entry；本文件引用构建产物 dist/*.js，npm run build 产出）：
-#   entry/loop.ts           AgentFactory + 单流协议驱动器（主 entry，唯一改地基）
-#   entry/state-handle.ts   ctx.state 服务提供者（07：provide + BlobSink→storage + resume 重建）
-#   entry/obs-broker.ts     工具结果出口登记 + llm/stream 泄漏扫描（07；依赖 state 服务）
-#   entry/action-gate.ts    ToolsService guard 动作门（07：spec 暂存 + 凭据 + deny 层）
-#   entry/context-render.ts llm/stream O6 preflight 断言器（07；06 完整接管装配后退化的形态）
-#   entry/mock-provider.ts  离线测试模型（红线：只挂 test-preset.yml，绝不进生产 preset）
+# 入口清单（全部引用构建产物 dist/*.js，由 npm run build 生成）：
+#   loop.ts            AgentFactory + 单流协议驱动器（主 entry）
+#   state-handle.ts    ctx.state 服务：句柄、blob 落 storage、resume 重建
+#   obs-broker.ts      工具结果出口登记 + llm/stream 泄漏扫描（依赖 state 服务）
+#   action-gate.ts     ToolsService guard：spec 暂存、一次性凭据、deny 层
+#   context-render.ts  O6 preflight 前缀断言
+#   mock-provider.ts   离线假模型——测试专用，绝不进本文件
 #
-# 装载顺序：state-handle 在 obs-broker 之前（后者 inject 'state' 服务）。
-# 注意（06 号 §4.1 实测）：loader 只读本行的 options.inject，模块导出的 inject 不生效，
-# 故每行显式声明 inject；'state' 为本插件自供服务名（宿主 headless 无同名服务，冲突面见
-# results/07-plugin-adapters-results.md §3）。
+# 装载顺序：state-handle 必须先于 obs-broker（后者 inject 'state'）。
+# 每行都要显式写 inject：loader 只读行选项，模块导出的 inject 不进 patch 行。
 
 - insert:
     - id: stream-agent

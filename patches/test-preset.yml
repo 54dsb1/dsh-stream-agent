@@ -1,0 +1,23 @@
+# 测试专用组合：用离线假模型驱动单流，跑 mock E2E（开发用）
+#
+# 生产 preset.yml 绝不引用 mock-provider；这里把桩 loop 与假模型单独装起来，
+# 全链路（driver / parser / gate / blob / ledger）零 API 调用可测。
+# 场景数据在 test/scenarios/*.json，代码与数据分离。
+#
+# 方言与其它 patch 相同：新增行必须写在 insert: 下；停用既有行用裸 "- id: X"。
+# 相对路径以本文件所在目录为 baseUrl，因此写 ../dist/。
+
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  config:
+    agents: []
+    maxParallelToolCalls: 10
+  disabled: true
+
+# 新增行：离线假模型适配器（provider 路由 'mock'，注册 registerAdapter + F10 目录条目）
+- insert:
+    - id: mock-provider
+      name: ../dist/entry/mock-provider.js
+      config:
+        provider: mock
+        scenarios: []

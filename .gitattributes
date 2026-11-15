@@ -1,0 +1,5 @@
+# 二进制文件不要做行尾转换
+*.zstd  binary
+*.png   binary
+*.jpg   binary
+*.ico   binary

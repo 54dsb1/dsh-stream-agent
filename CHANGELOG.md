@@ -29,9 +29,19 @@
   工具执行器作用域重绑、`steer`/`inbox`/`runMaintenance` prompt 面补齐、默认模型三级回退。
 - 测试 187 用例（`node:test`，零 API 调用），`eval/` 指标口径与 10 任务集两臂 runner。
 
+### Changed
+
+- 仓库结构整理：开发/评测用的组合补丁统一收进 `patches/`，根目录只留 bundle 入口
+  `cordis.patch.yml` 与生产装配清单 `preset.yml`。
+- 文档拆分为 [`docs/architecture.md`](docs/architecture.md)、[`docs/protocol.md`](docs/protocol.md)、
+  [`docs/limitations.md`](docs/limitations.md)，README 只保留结论与入口。
+- `engines.node` 从 `>=24` 放宽到 `>=22.18`（构建与 187 用例在 Node 22.22 上实测通过）。
+- 新增 CI、`.gitignore`、`.gitattributes`、`CONTRIBUTING.md`。
+
 ### Known limitations
 
-见 [README「已知限制」](README.md#已知限制如实声明)，其中需重点注意：写批任务 token 偏重、
-`replay` 对真连 session log 0 命中、`plugin record ledger` 在 bundle 形态下降级内存。
+见 [README「已知限制」](README.md#已知限制) 与 [`docs/limitations.md`](docs/limitations.md)，
+其中需重点注意：写批任务 token 偏重、`replay` 对真连 session log 0 命中、
+bundle 形态下 plugin record 通道可能降级内存。
 
 [0.1.0]: https://github.com/54dsb1/dsh-stream-agent/releases/tag/v0.1.0

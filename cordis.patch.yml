@@ -1,20 +1,22 @@
-# cordis.patch.yml —— DSH bundle 层组合声明（官方插件格式，package.json > dsh.bundle.patch 指向本文件）
+# cordis.patch.yml —— bundle 组合层入口（package.json > dsh.bundle.patch 指向本文件）
 #
-# 与 patch-takeover.yml 的关系：
-#   - 本文件是 **bundle 安装形态**的入口（dsh plugin add 后由 launcher 作为组合包层应用）；
-#   - patch-takeover.yml 是 **开发/patch 形态**的入口（--patch 顶层叠加，锚点为补丁文件旁）。
-#   两者停用内建 agent-loop + 挂本插件 entry 的语义一致；卸载本包即两层全部消失。
+# 本插件的全部接管都发生在这里：停用内建 agent-loop，插入五个 entry。
+# 卸载（dsh plugin remove）即整层消失，回到原生回合制 loop，零残留。
+# 开发期想临时叠加、不动用户 profile 时，用 patches/takeover.yml。
 #
-# 方言规则（results/01-micro-spike-results.md §0 实测）：
-#   - 覆盖既有行用裸 "- id: X"（停用内建 agent-loop）；
-#   - 新增组合行必须用 insert:（裸新增行会被静默跳过）；
-#   - 相对路径 ./dist/... 按 cordis-plugin-loader 的 import(name) 语义以本文件 URL 为
-#     baseUrl 解析（lib/index.js:343-345）——本文件位于包根，安装形态下指向包内 dist。
+# 方言规则（宿主实测得出的硬约束）：
+#   · 停用既有行：裸 "- id: X" 配 disabled: true
+#   · 新增行：必须写在 insert: 下，裸新增行会被静默跳过
+#   · inject 必须写在行内——loader 只读行选项，模块导出的 inject 不生效
+#   · ./dist/... 以本文件所在目录为 baseUrl 解析，故本文件必须留在包根
 #
-# announce: true 使每个 entry 在 stderr 打一行 mounted 横幅——实测 bundle 激活对 CLI 静默，
-# 插件必须自证（探针 A §0 / 07 号 §5.0 纪律）；排障后可整行删去 config 关闭。
+# 装载顺序：四个 sidecar 先、loop 最后。loop 接管后单流可能很快终止，进程退出会截断
+# 尚未挂载 entry 的激活。
 #
-# 红线：mock-provider / eval-probe 是测试设施，绝不进本组合（05 号 §4 grep 自证纪律）。
+# announce: true 给每个 entry 打一行 mounted 横幅——bundle 激活对 CLI 是静默的，
+# 插件必须自证已装载；排障后可逐行去掉。
+#
+# 红线：mock-provider / eval-probe 是测试设施，不得进入本组合。
 
 - id: agent-loop
   name: '@deepseek-ai/dsh-agent-loop'
