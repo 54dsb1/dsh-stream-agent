@@ -1,7 +1,7 @@
 // test/eval-probe.test.ts —— 分派 08：中立评测探针（透传保真 / 原文留存 / fail-open）
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import applyProbe from '../src/entry/eval-probe.ts';
@@ -87,16 +87,25 @@ describe('eval-probe（08 号插桩）', () => {
 
   it('P3. fail-open：落盘不可写 → 停用记录 + 一次告警，流照常透传', async () => {
     const { ctx, listeners, warns } = captureCtx();
-    // Windows 上不存在 Z: 盘则 ENOENT；若存在则换一个必败路径（文件作为目录）
-    applyProbe(ctx, { dumpDir: 'Z:\\definitely\\not\\writable\\eval-probe' });
-    const onStream = listeners.get('llm/stream') as unknown as (o: Record<string, unknown>, next: () => AsyncIterable<unknown>) => AsyncIterable<unknown>;
-    assert.ok(onStream);
-    const chunks = [{ type: 'text', text: 'survives' }];
-    const out: unknown[] = [];
-    const stream = onStream({ messages: [] }, () => fakeStream(chunks));
-    for await (const c of stream) out.push(c);
-    assert.deepEqual(out, chunks, '记录停用后流必须原样透传');
-    assert.ok(warns.some((w) => w.includes('eval-probe')), '必须留痕告警（不许静默）');
+    // 用「普通文件充当目录」构造必然失败的路径：mkdirSync 在 Windows 与 POSIX 上都报
+    // ENOTDIR，且不依赖盘符是否存在、也不依赖运行用户是否有权限——CI 以 root 跑也稳定。
+    // 早先这里用 Z:\... 盘符路径，在 POSIX 上只是普通相对路径，mkdir 会成功，断言假绿。
+    const blockerRoot = mkdtempSync(join(tmpdir(), 'eval-probe-blocker-'));
+    const blockerFile = join(blockerRoot, 'not-a-dir');
+    writeFileSync(blockerFile, 'x');
+    try {
+      applyProbe(ctx, { dumpDir: join(blockerFile, 'eval-probe') });
+      const onStream = listeners.get('llm/stream') as unknown as (o: Record<string, unknown>, next: () => AsyncIterable<unknown>) => AsyncIterable<unknown>;
+      assert.ok(onStream);
+      const chunks = [{ type: 'text', text: 'survives' }];
+      const out: unknown[] = [];
+      const stream = onStream({ messages: [] }, () => fakeStream(chunks));
+      for await (const c of stream) out.push(c);
+      assert.deepEqual(out, chunks, '记录停用后流必须原样透传');
+      assert.ok(warns.some((w) => w.includes('eval-probe')), '必须留痕告警（不许静默）');
+    } finally {
+      rmSync(blockerRoot, { recursive: true, force: true });
+    }
   });
 
   it('P4. 未配置 dumpDir：只透传不记录 + 告警（评测装配遗漏可发现）', async () => {
