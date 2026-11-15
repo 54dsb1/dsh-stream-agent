@@ -1,0 +1,949 @@
+{
+  "sessionId": "session-37851d68-856e-4014-9d70-81b689a2c035",
+  "taskId": "session-37851d68-856e-4014-9d70-81b689a2c035",
+  "turn": 1,
+  "turnEndReason": {
+    "kind": "completed"
+  },
+  "requestCount": 9,
+  "usage": {
+    "inputTokens": 4063,
+    "outputTokens": 6255
+  },
+  "stableHashes": [
+    "050164477eb00f266864d4eccde2f87057409caf48e8f3182871957db6d24ef4",
+    "174faf201cb5c3d21a9a29b4cb77e5f24a0b110f5c4b0852a21e78725385c2b9",
+    "638a832ec0304326f987471641ca5518d854cce2d37f06932f186854da9bef33",
+    "327a2d0aa3ac06039c3111b2e3458cd02d46feb74ad6ff5c28fad2e5b9901589",
+    "327a2d0aa3ac06039c3111b2e3458cd02d46feb74ad6ff5c28fad2e5b9901589",
+    "70d7e4c71404dab116727cfe4857eb5dcdc71313174a8a72b387c6c3cf0e275e",
+    "70d7e4c71404dab116727cfe4857eb5dcdc71313174a8a72b387c6c3cf0e275e",
+    "b6bd35feba0477380ba265741e477adddb2f89e455a172b979d2ec10608931e8",
+    "635a7a5552b9329ec3f679ded971b5aaa3db64b168b78404b116eb696f55cc88"
+  ],
+  "counters": {
+    "injected": 17,
+    "produced": 16,
+    "peeked": 3,
+    "injectedRatio": 1.0625
+  },
+  "records": [
+    {
+      "seq": 1,
+      "kind": "request",
+      "turn": 1,
+      "step": 1,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "050164477eb00f266864d4eccde2f87057409caf48e8f3182871957db6d24ef4",
+      "renderHash": "050164477eb00f266864d4eccde2f87057409caf48e8f3182871957db6d24ef4",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 2,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 3,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 4,
+      "kind": "command",
+      "id": "r2",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 5,
+      "kind": "command",
+      "id": "r2",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 6,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 7,
+      "kind": "command",
+      "id": "p2",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 8,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 159,
+      "outputTokens": 116
+    },
+    {
+      "seq": 9,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "data/users-roster.json",
+      "infoGain": "high",
+      "reason": "first-observation:read"
+    },
+    {
+      "seq": 10,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "high",
+      "detail": "6420 chars"
+    },
+    {
+      "seq": 11,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 12,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "detail": "4163 chars"
+    },
+    {
+      "seq": 13,
+      "kind": "observation",
+      "handle": "obs:read:r2@v1",
+      "key": "data/users-scores.json",
+      "infoGain": "high",
+      "reason": "first-observation:read"
+    },
+    {
+      "seq": 14,
+      "kind": "command",
+      "id": "r2",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r2@v1",
+      "infoGain": "high",
+      "detail": "520 chars"
+    },
+    {
+      "seq": 15,
+      "kind": "command",
+      "id": "p2",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 16,
+      "kind": "command",
+      "id": "p2",
+      "name": "tf-peek",
+      "status": "ok",
+      "handle": "obs:read:r2@v1",
+      "detail": "520 chars"
+    },
+    {
+      "seq": 17,
+      "kind": "request",
+      "turn": 1,
+      "step": 2,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "174faf201cb5c3d21a9a29b4cb77e5f24a0b110f5c4b0852a21e78725385c2b9",
+      "renderHash": "6f172e9167cf538928c2d95f717ef9335a798440e42f6802a62c720d4d0e0747",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 18,
+      "kind": "command",
+      "id": "b1",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 19,
+      "kind": "command",
+      "id": "b1",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 20,
+      "kind": "observation",
+      "handle": "obs:bash:b1@v1",
+      "key": "node -e &quot;const fs=require('fs');const r=JSON.parse(fs.readFileSync('data/users-roster.json','utf8')).users;const s=JSON.parse(fs.readFileSync('data/users-scores.json','utf8')).scored;const m=new Map(r.map(u=>[u.id,u]));const inter=s.filter(x=>m.has(x.id));console.log('roster count',r.length,'scored count',s.length);console.log(JSON.stringify(inter.map(x=>({id:x.id,score:x.score,tier:m.get(x.id).tier,name:m.get(x.id).name}))));console.log('pro:',JSON.stringify(inter.filter(x=>m.get(x.id).tier==='pro').map(x=>({id:x.id,score:x.score}))));&quot;",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 21,
+      "kind": "command",
+      "id": "b1",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: unknown tool \"bash\""
+    },
+    {
+      "seq": 22,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "rejected",
+      "detail": "duplicate-id (cross-stream)"
+    },
+    {
+      "seq": 23,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 2126,
+      "outputTokens": 354
+    },
+    {
+      "seq": 24,
+      "kind": "request",
+      "turn": 1,
+      "step": 3,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "638a832ec0304326f987471641ca5518d854cce2d37f06932f186854da9bef33",
+      "renderHash": "66466a9cd919d1df5355da00f4b0a4e2a623c4cdbccf6dc85f6d347e47fdd010",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 25,
+      "kind": "command",
+      "id": "w1",
+      "name": "tf-write",
+      "status": "pending"
+    },
+    {
+      "seq": 26,
+      "kind": "command",
+      "id": "w1",
+      "name": "tf-write",
+      "status": "dispatched"
+    },
+    {
+      "seq": 27,
+      "kind": "command",
+      "id": "b2",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 28,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 326,
+      "outputTokens": 312
+    },
+    {
+      "seq": 29,
+      "kind": "observation",
+      "handle": "obs:write:w1@v1",
+      "key": "work/find.js",
+      "infoGain": "low",
+      "reason": "successful-write-receipt"
+    },
+    {
+      "seq": 30,
+      "kind": "command",
+      "id": "w1",
+      "name": "tf-write",
+      "status": "ok",
+      "handle": "obs:write:w1@v1",
+      "infoGain": "low",
+      "detail": "187 chars"
+    },
+    {
+      "seq": 31,
+      "kind": "command",
+      "id": "b2",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 32,
+      "kind": "observation",
+      "handle": "obs:bash:b2@v1",
+      "key": "node work/find.js",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 33,
+      "kind": "command",
+      "id": "b2",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: unknown tool \"bash\""
+    },
+    {
+      "seq": 34,
+      "kind": "request",
+      "turn": 1,
+      "step": 4,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "327a2d0aa3ac06039c3111b2e3458cd02d46feb74ad6ff5c28fad2e5b9901589",
+      "renderHash": "e0179135bef6962f5ed2d0efda8957dc9f5323cca375031889d21bc1541aa515",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 35,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "rejected",
+      "detail": "duplicate-id (cross-stream)"
+    },
+    {
+      "seq": 36,
+      "kind": "command",
+      "id": "p2",
+      "name": "tf-peek",
+      "status": "rejected",
+      "detail": "duplicate-id (cross-stream)"
+    },
+    {
+      "seq": 37,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 190,
+      "outputTokens": 201
+    },
+    {
+      "seq": 38,
+      "kind": "fault",
+      "fault": "missing-final-nudge"
+    },
+    {
+      "seq": 39,
+      "kind": "request",
+      "turn": 1,
+      "step": 5,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "327a2d0aa3ac06039c3111b2e3458cd02d46feb74ad6ff5c28fad2e5b9901589",
+      "renderHash": "670b79d723b2277d324740b3237f37e6fde26798dfd87e9987a4e5f825649682",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 40,
+      "kind": "command",
+      "id": "b3",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 41,
+      "kind": "command",
+      "id": "b3",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 42,
+      "kind": "command",
+      "id": "p5",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 43,
+      "kind": "observation",
+      "handle": "obs:bash:b3@v1",
+      "key": "node -e &quot;const fs=require('fs');const load=(p,k)=&gt;{const j=JSON.parse(fs.readFileSync(p,'utf8'));if(Array.isArray(j))return j;if(Array.isArray(j[k]))return j[k];const f=Object.values(j).find(Array.isArray);return f||[];};const users=load('data/users-roster.json','users');const scored=load('data/users-scores.json','scored');const m=new Map(scored.map(x=&gt;[x.id,x.score]));const common=users.filter(u=&gt;m.has(u.id)).map(u=&gt;({id:u.id,name:u.name,tier:u.tier,score:m.get(u.id)}));console.log('COMMON='+JSON.stringify(common));const pro=common.filter(u=&gt;u.tier==='pro');console.log('PRO_COUNT='+pro.length);pro.forEach(u=&gt;console.log('PRO_ID='+u.id+' NAME='+u.name+' SCORE='+u.score));&quot;",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 44,
+      "kind": "command",
+      "id": "b3",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: unknown tool \"bash\""
+    },
+    {
+      "seq": 45,
+      "kind": "command",
+      "id": "p6",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 46,
+      "kind": "command",
+      "id": "p6",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 47,
+      "kind": "command",
+      "id": "p6",
+      "name": "tf-peek",
+      "status": "ok",
+      "handle": "obs:bash:b2@v1",
+      "detail": "26 chars"
+    },
+    {
+      "seq": 48,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 165,
+      "outputTokens": 2336
+    },
+    {
+      "seq": 49,
+      "kind": "command",
+      "id": "p5",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "依赖未满足：b3"
+    },
+    {
+      "seq": 50,
+      "kind": "request",
+      "turn": 1,
+      "step": 6,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "70d7e4c71404dab116727cfe4857eb5dcdc71313174a8a72b387c6c3cf0e275e",
+      "renderHash": "e2e862f448aa47b1a7605a9ba7b4a5d29b77cf863267a56ea2943495f0cee71e",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 51,
+      "kind": "command",
+      "id": "r4",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 52,
+      "kind": "command",
+      "id": "r4",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 53,
+      "kind": "command",
+      "id": "r5",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 54,
+      "kind": "command",
+      "id": "r5",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 55,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "data/users-roster.json",
+      "infoGain": "none",
+      "reason": "duplicate-observation"
+    },
+    {
+      "seq": 56,
+      "kind": "command",
+      "id": "r4",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "none",
+      "detail": "6420 chars"
+    },
+    {
+      "seq": 57,
+      "kind": "command",
+      "id": "p6",
+      "name": "tf-peek",
+      "status": "rejected",
+      "detail": "duplicate-id (cross-stream)"
+    },
+    {
+      "seq": 58,
+      "kind": "observation",
+      "handle": "obs:read:r2@v1",
+      "key": "data/users-scores.json",
+      "infoGain": "none",
+      "reason": "duplicate-observation"
+    },
+    {
+      "seq": 59,
+      "kind": "command",
+      "id": "r5",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r2@v1",
+      "infoGain": "none",
+      "detail": "520 chars"
+    },
+    {
+      "seq": 60,
+      "kind": "command",
+      "id": "p7",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 61,
+      "kind": "command",
+      "id": "p7",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 62,
+      "kind": "command",
+      "id": "p7",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "unknown-handle:obs:read:r5@v1"
+    },
+    {
+      "seq": 63,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 399,
+      "outputTokens": 656
+    },
+    {
+      "seq": 64,
+      "kind": "request",
+      "turn": 1,
+      "step": 7,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "70d7e4c71404dab116727cfe4857eb5dcdc71313174a8a72b387c6c3cf0e275e",
+      "renderHash": "03c6fe4351703a4f0ce14664b8b0730fcc387e412acdaada5eae031a863dbe04",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 65,
+      "kind": "command",
+      "id": "w2",
+      "name": "tf-write",
+      "status": "pending"
+    },
+    {
+      "seq": 66,
+      "kind": "command",
+      "id": "w2",
+      "name": "tf-write",
+      "status": "dispatched"
+    },
+    {
+      "seq": 67,
+      "kind": "observation",
+      "handle": "obs:write:w2@v1",
+      "key": "compute.js",
+      "infoGain": "low",
+      "reason": "successful-write-receipt"
+    },
+    {
+      "seq": 68,
+      "kind": "command",
+      "id": "w2",
+      "name": "tf-write",
+      "status": "ok",
+      "handle": "obs:write:w2@v1",
+      "infoGain": "low",
+      "detail": "185 chars"
+    },
+    {
+      "seq": 69,
+      "kind": "command",
+      "id": "b4",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 70,
+      "kind": "command",
+      "id": "b4",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 71,
+      "kind": "observation",
+      "handle": "obs:bash:b4@v1",
+      "key": "node compute.js",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 72,
+      "kind": "command",
+      "id": "b4",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: unknown tool \"bash\""
+    },
+    {
+      "seq": 73,
+      "kind": "command",
+      "id": "p8",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 74,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 177,
+      "outputTokens": 1113
+    },
+    {
+      "seq": 75,
+      "kind": "command",
+      "id": "p8",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "依赖未满足：b4"
+    },
+    {
+      "seq": 76,
+      "kind": "request",
+      "turn": 1,
+      "step": 8,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "b6bd35feba0477380ba265741e477adddb2f89e455a172b979d2ec10608931e8",
+      "renderHash": "8c89583c07b3f726b79abe47f7328380baf663c1684333d790bbc3f5847419ab",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 77,
+      "kind": "command",
+      "id": "w3",
+      "name": "tf-write",
+      "status": "pending"
+    },
+    {
+      "seq": 78,
+      "kind": "command",
+      "id": "w3",
+      "name": "tf-write",
+      "status": "dispatched"
+    },
+    {
+      "seq": 79,
+      "kind": "command",
+      "id": "r10",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 80,
+      "kind": "command",
+      "id": "r10",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 81,
+      "kind": "observation",
+      "handle": "obs:write:w3@v1",
+      "key": "compute2.js",
+      "infoGain": "low",
+      "reason": "successful-write-receipt"
+    },
+    {
+      "seq": 82,
+      "kind": "command",
+      "id": "w3",
+      "name": "tf-write",
+      "status": "ok",
+      "handle": "obs:write:w3@v1",
+      "infoGain": "low",
+      "detail": "186 chars"
+    },
+    {
+      "seq": 83,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "data/users-roster.json",
+      "infoGain": "none",
+      "reason": "duplicate-observation"
+    },
+    {
+      "seq": 84,
+      "kind": "command",
+      "id": "r10",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "none",
+      "detail": "6420 chars"
+    },
+    {
+      "seq": 85,
+      "kind": "command",
+      "id": "r11",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 86,
+      "kind": "command",
+      "id": "r11",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 87,
+      "kind": "command",
+      "id": "b10",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 88,
+      "kind": "command",
+      "id": "b10",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 89,
+      "kind": "observation",
+      "handle": "obs:bash:b10@v1",
+      "key": "node compute2.js",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 90,
+      "kind": "command",
+      "id": "b10",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: unknown tool \"bash\""
+    },
+    {
+      "seq": 91,
+      "kind": "command",
+      "id": "p10",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 92,
+      "kind": "observation",
+      "handle": "obs:read:r2@v1",
+      "key": "data/users-scores.json",
+      "infoGain": "none",
+      "reason": "duplicate-observation"
+    },
+    {
+      "seq": 93,
+      "kind": "command",
+      "id": "r11",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r2@v1",
+      "infoGain": "none",
+      "detail": "520 chars"
+    },
+    {
+      "seq": 94,
+      "kind": "command",
+      "id": "p11",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 95,
+      "kind": "command",
+      "id": "p11",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 96,
+      "kind": "command",
+      "id": "p11",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "unknown-handle:obs:read:r10@v1"
+    },
+    {
+      "seq": 97,
+      "kind": "command",
+      "id": "p12",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 98,
+      "kind": "command",
+      "id": "p12",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 99,
+      "kind": "command",
+      "id": "p12",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "unknown-handle:obs:read:r11@v1"
+    },
+    {
+      "seq": 100,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 172,
+      "outputTokens": 1031
+    },
+    {
+      "seq": 101,
+      "kind": "command",
+      "id": "p10",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "依赖未满足：b10"
+    },
+    {
+      "seq": 102,
+      "kind": "request",
+      "turn": 1,
+      "step": 9,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "635a7a5552b9329ec3f679ded971b5aaa3db64b168b78404b116eb696f55cc88",
+      "renderHash": "66958303c7933cb8085449dc57fda0e22bc6fe9b87d367922a64b677ac15a1a7",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 103,
+      "kind": "command",
+      "id": "r20",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 104,
+      "kind": "command",
+      "id": "r20",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 105,
+      "kind": "command",
+      "id": "r21",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 106,
+      "kind": "command",
+      "id": "r21",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 107,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "data/users-roster.json",
+      "infoGain": "none",
+      "reason": "duplicate-observation"
+    },
+    {
+      "seq": 108,
+      "kind": "command",
+      "id": "r20",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "none",
+      "detail": "6420 chars"
+    },
+    {
+      "seq": 109,
+      "kind": "command",
+      "id": "f99",
+      "name": "tf-final",
+      "status": "pending"
+    },
+    {
+      "seq": 110,
+      "kind": "command",
+      "id": "f99",
+      "name": "tf-final",
+      "status": "ok",
+      "detail": "占位"
+    },
+    {
+      "seq": 111,
+      "kind": "final",
+      "summary": "占位"
+    },
+    {
+      "seq": 112,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 349,
+      "outputTokens": 136
+    },
+    {
+      "seq": 113,
+      "kind": "observation",
+      "handle": "obs:read:r2@v1",
+      "key": "data/users-scores.json",
+      "infoGain": "none",
+      "reason": "duplicate-observation"
+    },
+    {
+      "seq": 114,
+      "kind": "command",
+      "id": "r21",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r2@v1",
+      "infoGain": "none",
+      "detail": "520 chars"
+    },
+    {
+      "seq": 115,
+      "kind": "turn-end",
+      "reason": {
+        "kind": "completed"
+      }
+    }
+  ]
+}

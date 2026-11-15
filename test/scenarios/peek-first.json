@@ -1,0 +1,11 @@
+{
+  "name": "peek-first",
+  "match": { "promptIncludes": "句柄演练" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "先读 big.txt，看骨架。\n" },
+    { "type": "commands", "commands": ["<tf-read path=\"big.txt\" id=\"r1\"/>"] },
+    { "type": "waitTools", "count": 1, "timeoutMs": 5000 },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

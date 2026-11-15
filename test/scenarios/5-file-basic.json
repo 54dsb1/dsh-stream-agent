@@ -1,0 +1,22 @@
+{
+  "name": "5-file-basic",
+  "match": { "promptIncludes": "请写五个文件" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "任务：写五个文件，逐个写完。\n" },
+    {
+      "type": "commands",
+      "commands": [
+        "<tf-write path=\"f1.txt\" id=\"w1\">内容一</tf-write>",
+        "<tf-write path=\"f2.txt\" id=\"w2\">内容二</tf-write>",
+        "<tf-write path=\"f3.txt\" id=\"w3\">内容三</tf-write>",
+        "<tf-write path=\"f4.txt\" id=\"w4\">内容四</tf-write>",
+        "<tf-write path=\"f5.txt\" id=\"w5\">内容五</tf-write>"
+      ]
+    },
+    { "type": "waitTools", "count": 5, "timeoutMs": 5000 },
+    { "type": "text", "text": "五个文件全部写入完成。\n" },
+    { "type": "commands", "commands": ["<tf-final id=\"f1\" summary=\"五个文件已写\"/>"] },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

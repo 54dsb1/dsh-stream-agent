@@ -1,0 +1,4 @@
+# settings.yaml (fixture)
+service: platform
+revision: 7
+locale: zh-CN

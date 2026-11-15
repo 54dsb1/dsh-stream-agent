@@ -1,0 +1,35 @@
+{
+  "root": "e898df893568187c2984049ecc73c72db983900b1bd75892fefd80e97f02dcd4",
+  "files": [
+    {
+      "rel": "build-manifest.txt",
+      "size": 311,
+      "sha256": "02b049fd3638b4befedd53a44ee589596bb9db431d716ed01ca2ec18c635f7de"
+    },
+    {
+      "rel": "docs/design.md",
+      "size": 1096,
+      "sha256": "3bb8d8f6547dce4358b1185ddbe40e0a0872fb31fd774d4bf24ee9d302b281ab"
+    },
+    {
+      "rel": "docs/eval.md",
+      "size": 881,
+      "sha256": "a095ef6ee740641116e04789b21a73aec9e4e6ff1f329936bbe14558942d1a18"
+    },
+    {
+      "rel": "docs/intro.md",
+      "size": 795,
+      "sha256": "829aff4519041ef2fc65421c53ae619f2c91b3dcb513643a2603662238d94ffb"
+    },
+    {
+      "rel": "docs/report.md",
+      "size": 861,
+      "sha256": "0347a0b4dda4df050e23008cade9ed0e095cd7795d162375f40f80c1f62e7bb0"
+    },
+    {
+      "rel": "docs/roadmap.md",
+      "size": 743,
+      "sha256": "b3e21c453564dd891467d8b337817ecf3b13801cc6b6190810aaa90cec461b88"
+    }
+  ]
+}

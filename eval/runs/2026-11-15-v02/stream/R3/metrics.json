@@ -1,0 +1,104 @@
+{
+  "task": "R3",
+  "arm": "stream",
+  "type": "read-peek",
+  "started": "2026-11-15T05:32:41.430Z",
+  "finished": "2026-11-15T05:33:48.059Z",
+  "exitCode": 0,
+  "timedOut": false,
+  "signal": null,
+  "stdoutTail": "logs/error.log 中唯一的 ERROR 行是第 173 行：`2026-01-01T10:173:00Z ERROR disk-quota-exceeded volume=D trace-id=tr-9f87`，其 trace-id 为 tr-9f87。\n",
+  "stderrTail": "[context-render] mounted: llm/stream O6 preflight asserter\n[state-handle] mounted: provide(state)（storage 异步接驳中，降级与否见后续告警）\n[eval-probe] mounted: llm/stream passthrough + capture -> D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\R3\\probe\\probe.jsonl\n[state-handle] storage 接驳失败，降级内存 BlobSink（服务照常提供） :: storage backend 'json' is not registered (registered: none)\n[action-gate] mounted: guard registered (actions: tf-write,write,tf-read,read,tf-peek,tf-final,tf-bash,bash; mode=stage-commit)\n[obs-broker] mounted: tools/post-execute + llm/stream listeners\n[stream-loop] TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch)\n[stream-loop] [stream-loop] plugin:tf-agent ledger 落 plugin record 失败，降级内存台账（resume 后 tf-* 状态不可重放） :: Cannot find package '@deepseek-ai/dsh-session' imported from D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\dist\\entry\\loop.js\n[llm-deepseek-account] model listing from https://api.deepseek.com/models loaded 2 model(s), skipped 0 row(s)\n",
+  "M2_callCount": {
+    "main": 0,
+    "probe": 2,
+    "probeRaw": 2,
+    "titleExcluded": 0,
+    "note": "v1.1�����ھ�=probe ������main(session log request/header) �����߱ۿɵã�������"
+  },
+  "M1_tokens": {
+    "input": 9964,
+    "output": 207,
+    "cacheRead": 1664,
+    "cacheWrite": 0,
+    "unitTaskToken": 10171,
+    "cachedFieldsSeen": true,
+    "usageOriginal": [
+      {
+        "seq": 1,
+        "usage": {
+          "inputTokens": 247,
+          "outputTokens": 55,
+          "cacheReadTokens": 768,
+          "cacheWriteTokens": 0,
+          "totalTokens": 1070
+        }
+      },
+      {
+        "seq": 2,
+        "usage": {
+          "inputTokens": 8053,
+          "outputTokens": 152,
+          "cacheReadTokens": 896,
+          "cacheWriteTokens": 0,
+          "totalTokens": 9101
+        }
+      }
+    ],
+    "sourceNote": "E3 �ھ���input=uncached+cacheRead+cacheWrite��usage ԭ����������"
+  },
+  "M3_injectedRatio": {
+    "injected": 3,
+    "produced": 1,
+    "injectedRatio": 3,
+    "source": "driver snapshot��Ȩ����"
+  },
+  "M4_prefix": {
+    "sequence": [
+      {
+        "seq": 1,
+        "fullHash": "4bb5ddc0683f991c",
+        "commonPrefixBytesWithPrev": null,
+        "identicalToPrev": false
+      },
+      {
+        "seq": 2,
+        "fullHash": "f2e556e7540025ab",
+        "commonPrefixBytesWithPrev": 2179,
+        "identicalToPrev": false
+      }
+    ],
+    "monotonicNote": "������ fullHash Ӧ������ͬ��׷��ʽ��ʷ����commonPrefixBytesWithPrev ��ӳǰ׺����Ǳ��",
+    "cachedFieldsEvidence": "probe usage ԭ�ĺ� cache �ֶ�"
+  },
+  "modelConfig": [],
+  "checks": [
+    {
+      "kind": "final-contains",
+      "text": "tr-9f87",
+      "pass": true,
+      "evidence": "\n\n<tf-read path=\"logs/error.log\" id=\"r1\"/>\n\n<tf-peek handle=\"obs:read:r1@v1\" from_line=\"1\" to_line=\"200\" depends_on=\"r1\" id=\"p1\"/>\n第 173 行为唯一的 ERROR 行，内容已在读取结果中确认。\n\n<tf-final id=\"f1\" summary=\"logs/error.log 中唯一的 ERROR 行是第 173 行：`2026-01-01T10:173:00Z ERROR disk-quota-exceeded volume=D trace-id=tr-9f87`，其 trace-id 为 tr-9f87。\"/>\nlogs/error.log 中唯一的 ERROR 行是第 173 行：`2026-01-01T10:173:00Z ERROR disk-q"
+    },
+    {
+      "kind": "final-contains",
+      "text": "disk-quota-exceeded",
+      "pass": true,
+      "evidence": "\n\n<tf-read path=\"logs/error.log\" id=\"r1\"/>\n\n<tf-peek handle=\"obs:read:r1@v1\" from_line=\"1\" to_line=\"200\" depends_on=\"r1\" id=\"p1\"/>\n第 173 行为唯一的 ERROR 行，内容已在读取结果中确认。\n\n<tf-final id=\"f1\" summary=\"logs/error.log 中唯一的 ERROR 行是第 173 行：`2026-01-01T10:173:00Z ERROR disk-quota-exceeded volume=D trace-id=tr-9f87`，其 trace-id 为 tr-9f87。\"/>\nlogs/error.log 中唯一的 ERROR 行是第 173 行：`2026-01-01T10:173:00Z ERROR disk-q"
+    }
+  ],
+  "checksPass": true,
+  "sessionArchived": {
+    "archived": true,
+    "sessionDir": "C:\\Users\\79416\\.dsh\\sessions\\--D-AIagentoutput-zcode-010-harness-dsh-stream-agent-plugin-dsh-stream-agent-eval-runs-2026-11-15-v02-stream-R3-ws--\\session-c6e93ff5-7acb-4cce-aa61-cd2615b7a6a9",
+    "copiedBytes": 4126
+  },
+  "replay": {
+    "opsReplayed": 0,
+    "skipped": [],
+    "errors": [],
+    "replRoot": "e4eaaba9e982c849ce903ac209ccf9397bc3d54c7c84e0a3ab31a686dd899c00",
+    "wsRoot": "e4eaaba9e982c849ce903ac209ccf9397bc3d54c7c84e0a3ab31a686dd899c00",
+    "pass": false,
+    "note": "提取零写入操作：回放不可得（如实标注，不假装通过）"
+  }
+}

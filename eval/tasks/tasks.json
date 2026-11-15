@@ -1,0 +1,150 @@
+{
+  "$schema": "eval-task-set-v1",
+  "note": "分派 08 交付 2：任务集（10 个；写入批 3 / 读改查 4 / 复合 3）。任务文本写死在本文件，基线与对照逐字节同一任务。seed.fixtures 相对 eval/tasks/fixtures/；seed.path 是任务工作区内的目标路径。checks: exists / contains(path,text) / final-contains(text, 对最终 assistant 消息全文)。",
+  "metricsDoc": "eval/METRICS.md",
+  "tasks": [
+    {
+      "id": "W1",
+      "type": "write-batch",
+      "title": "写 3 个文件",
+      "seed": [],
+      "prompt": "请在当前目录写三个文件：intro.md（3 行，主题：本项目的目标）、plan.md（3 行，主题：实施计划）、notes.md（2 行，主题：注意事项）。每个文件第一行以 '# ' 开头标题。",
+      "checks": [
+        { "kind": "exists", "path": "intro.md" },
+        { "kind": "exists", "path": "plan.md" },
+        { "kind": "exists", "path": "notes.md" },
+        { "kind": "contains", "path": "intro.md", "text": "#" }
+      ],
+      "budgetTokens": 40000
+    },
+    {
+      "id": "W2",
+      "type": "write-batch",
+      "title": "写 5 个章节文件 + index",
+      "seed": [],
+      "prompt": "请写 5 个章节文件 chapters/ch01.md 到 chapters/ch05.md，每个文件 3 行，第一行是 '# 第N章'。然后写 index.md，列出 5 个章节的文件名和标题。",
+      "checks": [
+        { "kind": "exists", "path": "chapters/ch01.md" },
+        { "kind": "exists", "path": "chapters/ch02.md" },
+        { "kind": "exists", "path": "chapters/ch03.md" },
+        { "kind": "exists", "path": "chapters/ch04.md" },
+        { "kind": "exists", "path": "chapters/ch05.md" },
+        { "kind": "exists", "path": "index.md" },
+        { "kind": "contains", "path": "index.md", "text": "ch03" }
+      ],
+      "budgetTokens": 60000
+    },
+    {
+      "id": "W3",
+      "type": "write-batch",
+      "title": "写 8 个模块文件 + 汇总",
+      "seed": [],
+      "prompt": "请写 8 个文件 modules/m1.txt 到 modules/m8.txt，第 N 个文件内容为 'module N: ok'。然后写 modules/summary.txt，按顺序列出全部 8 个文件名，一行一个。",
+      "checks": [
+        { "kind": "exists", "path": "modules/m1.txt" },
+        { "kind": "exists", "path": "modules/m8.txt" },
+        { "kind": "contains", "path": "modules/m8.txt", "text": "module 8: ok" },
+        { "kind": "exists", "path": "modules/summary.txt" }
+      ],
+      "budgetTokens": 80000
+    },
+    {
+      "id": "R1",
+      "type": "read-peek",
+      "title": "读大文件答指定行细节",
+      "seed": [{ "fixture": "big-report.md", "path": "data/big-report.md" }],
+      "prompt": "请读取 data/big-report.md，回答两个问题并直接给出答案：1) 第 137 行的完整原文；2) 该文件总行数。不要省略第 137 行的内容。",
+      "checks": [
+        { "kind": "final-contains", "text": "424242" },
+        { "kind": "final-contains", "text": "L137-quirk-quokka" }
+      ],
+      "budgetTokens": 40000
+    },
+    {
+      "id": "R2",
+      "type": "read-edit",
+      "title": "跨文件改配置",
+      "seed": [
+        { "fixture": "settings.yaml", "path": "config/settings.yaml" },
+        { "fixture": "features.yaml", "path": "config/features.yaml" },
+        { "fixture": "deploy.yaml", "path": "config/deploy.yaml" }
+      ],
+      "prompt": "config/ 下有三个 yaml 配置文件，每个都有 revision 字段（当前是 7）。请把三个文件的 revision 全部改为 9，其他内容保持不变。",
+      "checks": [
+        { "kind": "contains", "path": "config/settings.yaml", "text": "revision: 9" },
+        { "kind": "contains", "path": "config/features.yaml", "text": "revision: 9" },
+        { "kind": "contains", "path": "config/deploy.yaml", "text": "revision: 9" }
+      ],
+      "budgetTokens": 40000
+    },
+    {
+      "id": "R3",
+      "type": "read-peek",
+      "title": "日志找错",
+      "seed": [{ "fixture": "error.log", "path": "logs/error.log" }],
+      "prompt": "请读取 logs/error.log，找出其中唯一的 ERROR 行，并给出：1) 完整的原始行内容；2) 该行的 trace-id。请直接给出答案。",
+      "checks": [
+        { "kind": "final-contains", "text": "tr-9f87" },
+        { "kind": "final-contains", "text": "disk-quota-exceeded" }
+      ],
+      "budgetTokens": 40000
+    },
+    {
+      "id": "R4",
+      "type": "read-join",
+      "title": "双 JSON 求共同记录",
+      "seed": [
+        { "fixture": "users-roster.json", "path": "data/users-roster.json" },
+        { "fixture": "users-scores.json", "path": "data/users-scores.json" }
+      ],
+      "prompt": "data/users-roster.json 是名册（users 数组，含 id/name/tier），data/users-scores.json 是成绩表（scored 数组，含 id/score）。请找出两个文件中同时出现的全部 user id（按 id 匹配），并指出其中 tier 为 pro 的那一个，给出它的 id 和 score。",
+      "checks": [
+        { "kind": "final-contains", "text": "u-0041" },
+        { "kind": "final-contains", "text": "91" }
+      ],
+      "budgetTokens": 50000
+    },
+    {
+      "id": "C1",
+      "type": "composite",
+      "title": "读→算→写→汇报",
+      "seed": [{ "fixture": "sales-q1.csv", "path": "data/sales-q1.csv" }],
+      "prompt": "请读取 data/sales-q1.csv（含表头 region,amount），计算 amount 列的总和。然后创建 out/summary.md，内容包含：总和数值和记录条数。最后在回复中直接给出总和数字。",
+      "checks": [
+        { "kind": "exists", "path": "out/summary.md" },
+        { "kind": "contains", "path": "out/summary.md", "text": "7770" },
+        { "kind": "final-contains", "text": "7770" }
+      ],
+      "budgetTokens": 50000
+    },
+    {
+      "id": "C2",
+      "type": "composite",
+      "title": "失败改道",
+      "seed": [{ "fixture": "pipeline.yaml", "path": "pipeline.yaml" }],
+      "prompt": "pipeline.yaml 声明了一个数据管道：source 指向 data/missing-source.json。请尝试按声明执行：读取 source 文件并把内容写入 output 指定的 out/result.json。如果 source 不存在，则改用兜底方案：向 out/result.json 写入 {\"status\":\"fallback\",\"reason\":\"source missing\"}，并在回复中说明 source 缺失。",
+      "checks": [
+        { "kind": "exists", "path": "out/result.json" },
+        { "kind": "contains", "path": "out/result.json", "text": "fallback" },
+        { "kind": "final-contains", "text": "missing" }
+      ],
+      "budgetTokens": 50000
+    },
+    {
+      "id": "C3",
+      "type": "composite",
+      "title": "按清单批量产出",
+      "seed": [{ "fixture": "build-manifest.txt", "path": "build-manifest.txt" }],
+      "prompt": "请读取 build-manifest.txt，按其中 4 条 '路径 = 说明' 规格分别创建对应文件（docs/intro.md、docs/design.md、docs/eval.md、docs/roadmap.md），内容按各自说明撰写（至少 2 行）。完成后写 docs/report.md，逐个列出 4 个文件及其完成状态。",
+      "checks": [
+        { "kind": "exists", "path": "docs/intro.md" },
+        { "kind": "exists", "path": "docs/design.md" },
+        { "kind": "exists", "path": "docs/eval.md" },
+        { "kind": "exists", "path": "docs/roadmap.md" },
+        { "kind": "contains", "path": "docs/design.md", "text": "tf-peek" },
+        { "kind": "exists", "path": "docs/report.md" }
+      ],
+      "budgetTokens": 80000
+    }
+  ]
+}

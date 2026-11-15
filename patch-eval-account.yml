@@ -1,0 +1,35 @@
+# patch-eval-account.yml —— 评测模型路由覆盖：DeepSeek 账号通道（2026-11-15 增补）
+#
+# 背景：评测机无 DEEPSEEK_API_KEY，用户以 DeepSeek 账号（platform OAuth）登录 DSH。
+# 凭据存储于 ~/.dsh/.credentials.yaml 的 deepseek-account-platform/* 条目，
+# provider 路由为 deepseek-account（dsh-deepseek-account/lib/index.js:10 实证）；
+# headless 默认模型选择是 deepseek-official（API key 通道），须用本覆盖行切到账号通道。
+#
+# 用法（与两臂 patch 叠加，--patch 可重复、后者优先级高）：
+#   dsh --profile headless --patch <两臂 patch> --patch <本文件> headless "<任务>"
+#
+# 控制变量红线：两臂必须同用本覆盖（runner 两臂命令都要加 --patch 本文件），
+# 保证两臂 provider/model 一致（METRICS.md §4.2）。
+
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: deepseek-account
+    model: deepseek-flash
+    searchProvider: deepseek-official
+
+# headless 出厂把本地凭据库与账号服务禁用（dump-config 实证：两行 disabled: true），
+# 不解禁则 resolveToken 拿不到 grant → ACCOUNT_SIGN_IN_REQUIRED
+# （dsh-llm-deepseek-account/lib/index.js:82-83；dsh-deepseek-account-platform
+# /lib/index.js:804-822 经 KEY=deepseek-account-platform/default 读 ~/.dsh/.credentials.yaml）。
+# authorization 是 deepseek-account 的注入依赖（static inject = ["credentials","authorization"]，
+# headless 同样 disabled），须一并解禁（实测 pending "waiting for service: authorization"）。
+- id: credentials
+  name: '@deepseek-ai/dsh-credentials-local'
+  disabled: false
+- id: authorization
+  name: '@deepseek-ai/dsh-authorization'
+  disabled: false
+- id: deepseek-account
+  name: '@deepseek-ai/dsh-deepseek-account-platform'
+  disabled: false

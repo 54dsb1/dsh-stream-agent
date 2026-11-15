@@ -1,0 +1,54 @@
+# patch-eval-stream.yml —— 分派 08：对照臂（stream-agent preset 全量接管）+ 中立探针
+#
+# 对照定义（08 号任务书交付 3）：patch-takeover.yml（06 接管）+ patch-adapters-smoke.yml
+# 的四 entry（07 生产形态）+ eval-probe（两臂同装的测量仪器，只读透传，METRICS.md E4）。
+# 基线臂用 patch-eval-baseline.yml；任务集/seed/探针两臂逐字节相同（控制变量红线）。
+#
+# env:
+#   DSH_EVAL_PROBE_DIR=<每任务每臂独立目录>（runner 设置）
+#   STREAM_LOOP_EVAL_DUMP=<dir>/driver-（06 驱动器 turn-end snapshot dump，M3 权威口径）
+#
+# 用法：
+#   dsh --profile headless --patch <本文件绝对路径> headless "<任务文本>"
+
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  config:
+    agents: []
+    maxParallelToolCalls: 10
+  disabled: true
+- insert:
+    - id: stream-agent
+      name: ./dist/entry/loop.js
+      inject: [llm, tools, agents, sessions, sessionProjections]
+      config:
+        announceTakeover: true
+        maxParallelToolCalls: 3
+        maxReentries: 8
+        streamIdleTimeoutMs: 60000
+    - id: stream-agent-state
+      name: ./dist/entry/state-handle.js
+      inject: [storage]
+      config:
+        unit: tfAgentState
+        announce: true
+    - id: stream-agent-obs-broker
+      name: ./dist/entry/obs-broker.js
+      inject: [tools, state]
+      config:
+        announce: true
+    - id: stream-agent-action-gate
+      name: ./dist/entry/action-gate.js
+      inject: [tools, storage]
+      config:
+        announce: true
+    - id: stream-agent-context-render
+      name: ./dist/entry/context-render.js
+      inject: []
+      config:
+        announce: true
+    - id: stream-agent-eval-probe
+      name: ./dist/entry/eval-probe.js
+      inject: []
+      config:
+        announce: true

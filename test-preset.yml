@@ -1,0 +1,27 @@
+# test-preset.yml —— 测试专用 preset（分派 05 红线 6：mock 只挂测试 preset）
+#
+# ⚠ 生产 preset.yml（06/07 号分派交付）不得引用 entry/mock-provider.ts。
+# 本文件是测试环境的 patch 声明，方言遵循 results/01-micro-spike-results.md §0 的实测规则：
+#   - 新增组合行必须用 insert:（裸 "- id: X" 是覆盖行，目标不存在会被静默跳过）；
+#   - 停用内建 agent-loop 用覆盖行（mock E2E 的桩 loop 替代它驱动单流）；
+#   - preset 嵌套行的相对路径锚点是 profile 目录，激活失败对 CLI 静默——
+#     因此 mock-provider 的挂载不藏在 preset plugins 里，走顶层组合行。
+#
+# scenario 数据在 test/scenarios/*.json（代码与数据分离）；本 entry 构建产物为
+# dist/entry/mock-provider.js（构建管线随 06 号分派落地后，此路径即可被宿主 loader 加载）。
+
+# 覆盖行：停用内建回合制 loop（与探针 A 第二轮 patch-r2 同款做法）
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  config:
+    agents: []
+    maxParallelToolCalls: 10
+  disabled: true
+
+# 新增行：离线假模型适配器（provider 路由 'mock'，注册 registerAdapter + F10 目录条目）
+- insert:
+    - id: mock-provider
+      name: ./dist/entry/mock-provider.js
+      config:
+        provider: mock
+        scenarios: []

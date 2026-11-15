@@ -1,0 +1,13 @@
+{
+  "name": "3-file-basic",
+  "match": { "promptIncludes": "请写三个文件" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "分析任务：需要写三个文件，逐个写完即可。\n" },
+    { "type": "commands", "commands": ["tf-write a.txt \"A\"", "tf-write b.txt \"B\"", "tf-write c.txt \"C\""] },
+    { "type": "waitTools", "count": 3, "timeoutMs": 5000 },
+    { "type": "text", "text": "三个文件都已写入，任务完成。\n" },
+    { "type": "commands", "commands": ["tf-final"] },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

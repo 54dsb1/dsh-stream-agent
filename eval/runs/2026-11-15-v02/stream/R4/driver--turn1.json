@@ -1,0 +1,154 @@
+{
+  "sessionId": "session-de8fcb3c-52dc-47f7-97cc-f5b9bc61f51b",
+  "taskId": "session-de8fcb3c-52dc-47f7-97cc-f5b9bc61f51b",
+  "turn": 1,
+  "turnEndReason": {
+    "kind": "completed"
+  },
+  "requestCount": 2,
+  "usage": {
+    "inputTokens": 3031,
+    "outputTokens": 312
+  },
+  "stableHashes": [
+    "f393c276a14925dc4093405dc4ceb16bad53f6257c76e986b2ee7c923cf7171f",
+    "2cd7b1e8c18c64084e52494c1e8e7658dd3f3b96917ebad0332992ad2be71772"
+  ],
+  "counters": {
+    "injected": 4,
+    "produced": 2,
+    "peeked": 2,
+    "injectedRatio": 2
+  },
+  "records": [
+    {
+      "seq": 1,
+      "kind": "request",
+      "turn": 1,
+      "step": 1,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "f393c276a14925dc4093405dc4ceb16bad53f6257c76e986b2ee7c923cf7171f",
+      "renderHash": "f393c276a14925dc4093405dc4ceb16bad53f6257c76e986b2ee7c923cf7171f",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 2,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 3,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 4,
+      "kind": "command",
+      "id": "r2",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 5,
+      "kind": "command",
+      "id": "r2",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 6,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 154,
+      "outputTokens": 40
+    },
+    {
+      "seq": 7,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "data/users-roster.json",
+      "infoGain": "high",
+      "reason": "first-observation:read"
+    },
+    {
+      "seq": 8,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "high",
+      "detail": "6424 chars"
+    },
+    {
+      "seq": 9,
+      "kind": "observation",
+      "handle": "obs:read:r2@v1",
+      "key": "data/users-scores.json",
+      "infoGain": "high",
+      "reason": "first-observation:read"
+    },
+    {
+      "seq": 10,
+      "kind": "command",
+      "id": "r2",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r2@v1",
+      "infoGain": "high",
+      "detail": "524 chars"
+    },
+    {
+      "seq": 11,
+      "kind": "request",
+      "turn": 1,
+      "step": 2,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "2cd7b1e8c18c64084e52494c1e8e7658dd3f3b96917ebad0332992ad2be71772",
+      "renderHash": "04c9797c171603476923e78d5c09ed7c86c1c54c0d54a7bba996c552f7304707",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 12,
+      "kind": "command",
+      "id": "f1",
+      "name": "tf-final",
+      "status": "pending"
+    },
+    {
+      "seq": 13,
+      "kind": "command",
+      "id": "f1",
+      "name": "tf-final",
+      "status": "ok",
+      "detail": "同时出现在 users-roster.json 与 users-scores.json 的 user id 共 4 个：u-0009、u-0024、u-0041、u-0058。其中 tier 为 pro 的是 u-0041，其 score 为 91（其余：u-0009 team/33、u-0024 team/57、u-0058 free/12）。"
+    },
+    {
+      "seq": 14,
+      "kind": "final",
+      "summary": "同时出现在 users-roster.json 与 users-scores.json 的 user id 共 4 个：u-0009、u-0024、u-0041、u-0058。其中 tier 为 pro 的是 u-0041，其 score 为 91（其余：u-0009 team/33、u-0024 team/57、u-0058 free/12）。"
+    },
+    {
+      "seq": 15,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 2877,
+      "outputTokens": 272
+    },
+    {
+      "seq": 16,
+      "kind": "turn-end",
+      "reason": {
+        "kind": "completed"
+      }
+    }
+  ]
+}

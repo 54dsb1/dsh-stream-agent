@@ -1,0 +1,9 @@
+{
+  "name": "fault-timeout",
+  "match": { "promptIncludes": "故障注入：流超时" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "开始输出，然后长时间停顿模拟上游超时。\n" },
+    { "type": "fail", "mode": "timeout", "delayMs": 60000 }
+  ]
+}

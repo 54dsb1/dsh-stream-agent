@@ -1,0 +1,15 @@
+{
+  "name": "wait-tools",
+  "match": { "promptIncludes": "先写两个文件再读回来" },
+  "chunking": { "charsPerChunk": 6, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "分两批：先写 a、b，等结果回来再读 a。\n" },
+    { "type": "commands", "commands": ["tf-write a.txt \"内容A\"", "tf-write b.txt \"内容B\""] },
+    { "type": "waitTools", "count": 2, "timeoutMs": 5000 },
+    { "type": "text", "text": "前两个文件已写。\n" },
+    { "type": "commands", "commands": ["tf-read a.txt", "tf-final"] },
+    { "type": "waitTools", "count": 3, "timeoutMs": 5000 },
+    { "type": "text", "text": "读回确认，收尾。\n" },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

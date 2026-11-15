@@ -1,0 +1,145 @@
+{
+  "sessionId": "session-c6e93ff5-7acb-4cce-aa61-cd2615b7a6a9",
+  "taskId": "session-c6e93ff5-7acb-4cce-aa61-cd2615b7a6a9",
+  "turn": 1,
+  "turnEndReason": {
+    "kind": "completed"
+  },
+  "requestCount": 2,
+  "usage": {
+    "inputTokens": 8300,
+    "outputTokens": 207
+  },
+  "stableHashes": [
+    "a1c4c78268e53cb21d33fe3b28a0293dc18adf37f0b3fa08bba6b95703009739",
+    "e64ddbda60b5b9fa5565c11d1bee4f6f0078dab37a793e6579d3dfff704e5f03"
+  ],
+  "counters": {
+    "injected": 3,
+    "produced": 1,
+    "peeked": 2,
+    "injectedRatio": 3
+  },
+  "records": [
+    {
+      "seq": 1,
+      "kind": "request",
+      "turn": 1,
+      "step": 1,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "a1c4c78268e53cb21d33fe3b28a0293dc18adf37f0b3fa08bba6b95703009739",
+      "renderHash": "a1c4c78268e53cb21d33fe3b28a0293dc18adf37f0b3fa08bba6b95703009739",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 2,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 3,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 4,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 5,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 247,
+      "outputTokens": 55
+    },
+    {
+      "seq": 6,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "logs/error.log",
+      "infoGain": "high",
+      "reason": "first-observation:read"
+    },
+    {
+      "seq": 7,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "high",
+      "detail": "11917 chars"
+    },
+    {
+      "seq": 8,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 9,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "detail": "11693 chars"
+    },
+    {
+      "seq": 10,
+      "kind": "request",
+      "turn": 1,
+      "step": 2,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "e64ddbda60b5b9fa5565c11d1bee4f6f0078dab37a793e6579d3dfff704e5f03",
+      "renderHash": "1736540449ee898b6f23e68f4dad21f0e54c19dd3336a95968e73f02f67f6fb1",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 11,
+      "kind": "command",
+      "id": "f1",
+      "name": "tf-final",
+      "status": "pending"
+    },
+    {
+      "seq": 12,
+      "kind": "command",
+      "id": "f1",
+      "name": "tf-final",
+      "status": "ok",
+      "detail": "logs/error.log 中唯一的 ERROR 行是第 173 行：`2026-01-01T10:173:00Z ERROR disk-quota-exceeded volume=D trace-id=tr-9f87`，其 trace-id 为 tr-9f87。"
+    },
+    {
+      "seq": 13,
+      "kind": "final",
+      "summary": "logs/error.log 中唯一的 ERROR 行是第 173 行：`2026-01-01T10:173:00Z ERROR disk-quota-exceeded volume=D trace-id=tr-9f87`，其 trace-id 为 tr-9f87。"
+    },
+    {
+      "seq": 14,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 8053,
+      "outputTokens": 152
+    },
+    {
+      "seq": 15,
+      "kind": "turn-end",
+      "reason": {
+        "kind": "completed"
+      }
+    }
+  ]
+}

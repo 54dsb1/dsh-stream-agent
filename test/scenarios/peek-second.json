@@ -1,0 +1,11 @@
+{
+  "name": "peek-second",
+  "match": { "promptIncludes": "tf-stream:observation" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "看到骨架了，取回第 1-2 行细节。\n" },
+    { "type": "commands", "commands": ["<tf-peek handle=\"obs:read:r1@v1\" from_line=\"1\" to_line=\"2\" id=\"p1\"/>"] },
+    { "type": "waitTools", "count": 2, "timeoutMs": 5000 },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "wait-tools-continue",
+  "match": { "promptIncludes": "tf-stream:observation" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "骨架收到，任务已按计划完成。\n" },
+    { "type": "commands", "commands": ["<tf-final id=\"fc\" summary=\"两写一读完成（骨架确认）\"/>"] },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

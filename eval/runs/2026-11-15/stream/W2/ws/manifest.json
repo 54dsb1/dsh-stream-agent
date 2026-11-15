@@ -1,0 +1,35 @@
+{
+  "root": "19502cc24ca7b5f7dde6bf44b276988f839fba1d3346cbb0af5037c6dcbdfc97",
+  "files": [
+    {
+      "rel": "chapters/ch01.md",
+      "size": 88,
+      "sha256": "33907435c7f0a76244875193c6845d9aba66b391ade4354b6177f9bd82741108"
+    },
+    {
+      "rel": "chapters/ch02.md",
+      "size": 82,
+      "sha256": "93915e5f87a1621fa7a85357a8c0da75f4497dd7304fb6a53038a67b750e1edf"
+    },
+    {
+      "rel": "chapters/ch03.md",
+      "size": 88,
+      "sha256": "08d338fed5294a97d726c9db4d1e30b82a62189232a85e156de20df9ebeceb88"
+    },
+    {
+      "rel": "chapters/ch04.md",
+      "size": 91,
+      "sha256": "456a6403f1cfebce8a54174a9e3c81525f67e6dae9beca179f7e33d340ec8410"
+    },
+    {
+      "rel": "chapters/ch05.md",
+      "size": 70,
+      "sha256": "9dff3e772786e8d3d3aef5dd162ff09dafb3aec28ce5cc2c78afa77600da46c4"
+    },
+    {
+      "rel": "index.md",
+      "size": 281,
+      "sha256": "91c17d60048f1a68539358d75a8e7b820138cf808c89ecba53e8e82385483533"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "root": "1295302bdb56e54c81798fcf0e47c8ac899bb970727225c575325e0fd3543d13",
+  "files": [
+    {
+      "rel": "config/deploy.yaml",
+      "size": 66,
+      "sha256": "80f0cffcd65ac39422676b68d159a0b2303ac47f01280bc837ca82bf8063d198"
+    },
+    {
+      "rel": "config/features.yaml",
+      "size": 70,
+      "sha256": "b8f068a735e6c7678dff06366d951bc68729ea1611b3bc283edaaf9726f3de76"
+    },
+    {
+      "rel": "config/settings.yaml",
+      "size": 70,
+      "sha256": "a68b89900863e2452e5eeb6267893304bc61e61ddd639045c302209c581aabee"
+    }
+  ]
+}

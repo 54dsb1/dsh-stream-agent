@@ -1,0 +1,16 @@
+{
+  "name": "reroute-second",
+  "match": { "promptIncludes": "tf-stream:error" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "收到失败报告，改道写 fixed.txt。\n" },
+    {
+      "type": "commands",
+      "commands": ["<tf-write path=\"fixed.txt\" id=\"wx\">FIXED</tf-write>"]
+    },
+    { "type": "waitTools", "count": 3, "timeoutMs": 5000 },
+    { "type": "text", "text": "完成。\n" },
+    { "type": "commands", "commands": ["<tf-final id=\"f2\" summary=\"改道成功\"/>"] },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "degraded-final",
+  "match": { "promptIncludes": "tf-stream:degraded" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "预算告急，按台账收尾。\n" },
+    { "type": "commands", "commands": ["<tf-final id=\"fd\" summary=\"降级交付\"/>"] },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

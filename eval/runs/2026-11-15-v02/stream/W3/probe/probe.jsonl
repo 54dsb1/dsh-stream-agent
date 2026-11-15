@@ -1,0 +1,1077 @@
+{"kind":"request","seq":1,"at":1794720579202,"pid":69148,"session":"session-eb08d5b3-02aa-4649-a9f3-04e203200ce5","optionsDirty":false,"options":"{\"provider\":\"deepseek-account\",\"model\":\"deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回复流中完成任务：先简短思考，然后连续输出全部 tf-* 命令，最后输出 tf-final。\\n\\n## tf-* 单流协议（本回合唯一工具语法）\\n\\n<tf-write path=\\\"相对/绝对路径\\\" id=\\\"w1\\\" depends_on=\\\"r1\\\">\\n文件正文原文（原样输出，直到闭合标签）\\n</tf-write>\\n<tf-read path=\\\"相对/绝对路径\\\" id=\\\"r1\\\" depends_on=\\\"w1,w2\\\" offset=\\\"100\\\" limit=\\\"50\\\"/>\\n<tf-bash cmd=\\\"命令行\\\" id=\\\"b1\\\"/>\\n<tf-peek handle=\\\"obs:read:c3@v1\\\" from_line=\\\"10\\\" to_line=\\\"20\\\" id=\\\"p1\\\"/>\\n<tf-final id=\\\"f1\\\" summary=\\\"一句话完成说明\\\"/>\\n\\n（tf-read 可选 offset/limit：1 基行号起点与行数，大文件按行段取，省 token。）\\n\\n（收尾纪律：命令全部闭合后，本流必须以 tf-final 结束；写完文件、执行完命令不等于任务结束。）\\n\\n## 结果获取（关键）\\ntf-read / tf-bash 成功时结果不回灌，只有句柄进句柄目录；失败才以 [tf-stream:error] 注入。\\n因此：需要看到内容（文件片段、命令输出、计算结果）时，必须用 tf-peek 按句柄取回——\\nhandle 从 [tf-stream:observation] 与句柄目录增量中取。答案依赖命令输出时，先 peek 再收尾。\\n\\n## 时序与重发规则\\n- 同 id 同内容重复声明 = 幂等：直接返回原回执（含句柄），不重复执行；同 id 不同内容会被\\n  拒绝（换新 id）；被拒绝（无副作用）的命令可用原 id 修正后重发。\\n- 同流内后续命令自动等待先闭合的 tf-write 完成（写序保证：先写后读不会读到旧内容）。\\n- tf-peek 的句柄由命令产出——同流内提前 peek 会被自动延迟到命令完成后重试，仍无此句柄才报错；\\n  要么给 peek 加 depends_on 挂到产出命令上（如 <tf-peek ... depends_on=\\\"r1\\\"/>），\\n  要么等下一请求（句柄会出现在句柄目录增量里）再 peek。\\n- tf-bash 的命令在 Windows 宿主以 PowerShell（pwsh）执行：python3 通常不存在，优先 node -e 或\\n  PowerShell 原生命令（Select-String / Get-Content）。\\n\\ntf-final 的 summary 必须包含任务要求的最终答案原文（数字、行内容、路径、结论），\\n不得写\\\"已完成/占位\\\"式描述；还没拿到答案就不要输出 tf-final。\\n\\n规则：\\n1. 写文件一律用 tf-write（正文在标签体内原样输出）；不要用原生工具写文件。\\n2. id 建议显式给出且全任务唯一；depends_on 是逗号分隔的依赖 id 列表，可省略。\\n   依赖只能指向本任务里已出现或将要出现的命令 id。\\n3. 命令闭合即开始执行（独立命令并行，上限 3 个），不必等流结束再发后续命令。\\n4. tf-read / tf-bash 的产出默认只句柄化；tf-read 首次结果会以行骨架注入下一请求。\\n   需要某句柄的细节时发 tf-peek（handle 用句柄目录里的值，行段 1-based 闭区间）。\\n5. 上一请求若报告 [tf-stream:error]，先修复或改道该命令（换路径/换命令），再继续其余任务。\\n6. 全部命令成功且无需更多信息时输出 tf-final；收到 tf-final 后本任务收敛，不再有下一请求。\\n\\n（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）\\n\\n不变量：历史消息只增不改（任何\\\"压缩/摘要历史\\\"的请求都会被拒绝）；写文件成功不会有结果回灌（只记台账），失败一定会以 [tf-stream:error] 注入下一请求；不要用原生 tool_call 写文件。回合必须以 <tf-final .../> 收尾：所有命令输出完毕后立即输出 tf-final，不带 tf-final 的回合视为未完成——即使全部工作已做完。\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"headless 请写 8 个文件 modules/m1.txt 到 modules/m8.txt，第 N 个文件内容为 'module N: ok'。然后写 modules/summary.txt，按顺序列出全部 8 个文件名，一行一个。\"}]}],\"signal\":{},\"sessionId\":\"session-eb08d5b3-02aa-4649-a9f3-04e203200ce5\"}"}
+{"kind":"chunk","seq":1,"at":1794720580191,"chunk":"{\"type\":\"block-start\",\"index\":0,\"blockType\":\"reasoning\"}"}
+{"kind":"chunk","seq":1,"at":1794720580766,"chunk":"{\"type\":\"block-end\",\"index\":0,\"block\":{\"type\":\"reasoning\",\"text\":\"\"}}"}
+{"kind":"chunk","seq":1,"at":1794720580767,"chunk":"{\"type\":\"block-start\",\"index\":1,\"blockType\":\"text\"}"}
+{"kind":"chunk","seq":1,"at":1794720580768,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"我\"}"}
+{"kind":"chunk","seq":1,"at":1794720580770,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"先把\"}"}
+{"kind":"chunk","seq":1,"at":1794720580772,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"这\"}"}
+{"kind":"chunk","seq":1,"at":1794720580776,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720580778,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":1,"at":1794720580779,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720580780,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"个\"}"}
+{"kind":"chunk","seq":1,"at":1794720580780,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"模块\"}"}
+{"kind":"chunk","seq":1,"at":1794720580782,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"文件\"}"}
+{"kind":"chunk","seq":1,"at":1794720580784,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"写\"}"}
+{"kind":"chunk","seq":1,"at":1794720580792,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"出来\"}"}
+{"kind":"chunk","seq":1,"at":1794720580793,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"，\"}"}
+{"kind":"chunk","seq":1,"at":1794720580794,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"然后再\"}"}
+{"kind":"chunk","seq":1,"at":1794720580815,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"写\"}"}
+{"kind":"chunk","seq":1,"at":1794720580816,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"汇总\"}"}
+{"kind":"chunk","seq":1,"at":1794720580817,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"文件\"}"}
+{"kind":"chunk","seq":1,"at":1794720580824,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"。\\n\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720580825,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720580826,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720580827,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720580840,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720580841,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":1,"at":1794720580856,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720580857,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720580857,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720580858,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720580859,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720580868,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720580869,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720580870,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720580871,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720580871,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720580873,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720580885,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":1,"at":1794720580886,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720580887,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720580887,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720580901,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":1,"at":1794720580902,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720580902,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":1,"at":1794720580903,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720580904,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720580904,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720580916,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720580943,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720580945,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720580946,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720580947,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720580948,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":1,"at":1794720580953,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720580954,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720580956,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720580957,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":1,"at":1794720580957,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720580959,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720580961,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720580962,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720580963,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720580963,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":1,"at":1794720580964,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720580965,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":1,"at":1794720581031,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720581038,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":1,"at":1794720581054,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720581055,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":1,"at":1794720581056,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581060,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":1,"at":1794720581069,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581074,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581075,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581076,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581077,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720581080,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581082,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581083,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581084,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":1,"at":1794720581085,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581087,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581087,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581091,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":1,"at":1794720581093,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581094,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581095,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720581095,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581097,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581101,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":1,"at":1794720581102,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581103,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":1,"at":1794720581104,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720581105,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":1,"at":1794720581105,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720581109,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":1,"at":1794720581110,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581111,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":1,"at":1794720581112,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581113,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581114,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581116,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581117,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720581118,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581118,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581119,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581119,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":1,"at":1794720581122,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581123,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581124,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581125,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":1,"at":1794720581126,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581126,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581130,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720581131,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581132,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581133,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":1,"at":1794720581134,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581136,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":1,"at":1794720581137,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720581138,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":1,"at":1794720581139,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720581140,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":1,"at":1794720581141,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581142,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":1,"at":1794720581151,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581153,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581154,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581155,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581157,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720581158,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581159,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581160,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581161,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":1,"at":1794720581162,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581164,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581165,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581167,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":1,"at":1794720581168,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581169,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581171,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720581172,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581173,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581652,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":1,"at":1794720581653,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581660,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":1,"at":1794720581662,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720581663,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":1,"at":1794720581664,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720581665,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":1,"at":1794720581666,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581667,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":1,"at":1794720581668,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581669,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581669,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581670,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581671,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720581672,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581673,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581673,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581674,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":1,"at":1794720581679,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581680,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581681,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581682,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":1,"at":1794720581684,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581686,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581688,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720581690,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581691,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581695,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":1,"at":1794720581698,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581700,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":1,"at":1794720581703,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720581704,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":1,"at":1794720581705,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720581706,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":1,"at":1794720581706,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581707,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":1,"at":1794720581709,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581710,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581711,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581713,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581714,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720581715,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581717,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581718,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581719,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":1,"at":1794720581721,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581722,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581723,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581726,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":1,"at":1794720581729,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581730,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581731,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720581732,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581733,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581740,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":1,"at":1794720581749,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581751,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":1,"at":1794720581751,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720581752,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":1,"at":1794720581753,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720581756,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":1,"at":1794720581757,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581758,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":1,"at":1794720581759,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581763,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581765,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581770,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581774,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720581775,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581776,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581777,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581779,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":1,"at":1794720581781,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581782,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581783,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581783,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":1,"at":1794720581784,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581785,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581788,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720581790,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581791,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581791,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":1,"at":1794720581792,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581794,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":1,"at":1794720581796,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720581798,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":1,"at":1794720581798,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720581800,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":1,"at":1794720581801,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581802,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":1,"at":1794720581803,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581804,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581805,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581805,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581808,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720581809,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581812,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581813,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581814,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":1,"at":1794720581815,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581816,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581817,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/s\"}"}
+{"kind":"chunk","seq":1,"at":1794720581820,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"um\"}"}
+{"kind":"chunk","seq":1,"at":1794720581821,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"mary\"}"}
+{"kind":"chunk","seq":1,"at":1794720581823,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581824,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581825,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720581826,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581829,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581831,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"9\"}"}
+{"kind":"chunk","seq":1,"at":1794720581832,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581834,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" depends\"}"}
+{"kind":"chunk","seq":1,"at":1794720581835,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"_on\"}"}
+{"kind":"chunk","seq":1,"at":1794720581836,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581842,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581844,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720581845,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581846,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":1,"at":1794720581847,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581848,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":1,"at":1794720581854,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581861,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":1,"at":1794720581863,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581865,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":1,"at":1794720581867,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581867,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":1,"at":1794720581869,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581870,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":1,"at":1794720581876,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581877,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":1,"at":1794720581878,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581883,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581886,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581887,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720581888,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581889,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581891,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581892,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581894,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":1,"at":1794720581895,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581895,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581896,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581897,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581897,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":1,"at":1794720581899,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581900,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581901,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581902,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581903,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":1,"at":1794720581905,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581908,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581909,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581911,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581912,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":1,"at":1794720581914,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581915,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581917,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581918,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581918,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":1,"at":1794720581920,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581920,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581921,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581924,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581925,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":1,"at":1794720581926,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581927,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581928,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581929,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720581931,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":1,"at":1794720581932,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720581933,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581935,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":1,"at":1794720581936,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581937,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":1,"at":1794720581940,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":1,"at":1794720581941,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720581943,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720581945,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720581945,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-b\"}"}
+{"kind":"chunk","seq":1,"at":1794720581947,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"ash\"}"}
+{"kind":"chunk","seq":1,"at":1794720581948,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" cmd\"}"}
+{"kind":"chunk","seq":1,"at":1794720581950,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720581951,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Get\"}"}
+{"kind":"chunk","seq":1,"at":1794720581952,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-\"}"}
+{"kind":"chunk","seq":1,"at":1794720581955,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Child\"}"}
+{"kind":"chunk","seq":1,"at":1794720581956,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Item\"}"}
+{"kind":"chunk","seq":1,"at":1794720581957,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581959,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" |\"}"}
+{"kind":"chunk","seq":1,"at":1794720581961,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" Select\"}"}
+{"kind":"chunk","seq":1,"at":1794720581962,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-\"}"}
+{"kind":"chunk","seq":1,"at":1794720581963,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Object\"}"}
+{"kind":"chunk","seq":1,"at":1794720581963,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" -\"}"}
+{"kind":"chunk","seq":1,"at":1794720581965,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Expand\"}"}
+{"kind":"chunk","seq":1,"at":1794720581967,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Property\"}"}
+{"kind":"chunk","seq":1,"at":1794720581970,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" Name\"}"}
+{"kind":"chunk","seq":1,"at":1794720581976,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\";\"}"}
+{"kind":"chunk","seq":1,"at":1794720581978,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" '\"}"}
+{"kind":"chunk","seq":1,"at":1794720581989,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"---\"}"}
+{"kind":"chunk","seq":1,"at":1794720581991,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"';\"}"}
+{"kind":"chunk","seq":1,"at":1794720581992,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" Get\"}"}
+{"kind":"chunk","seq":1,"at":1794720581993,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-\"}"}
+{"kind":"chunk","seq":1,"at":1794720581994,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Content\"}"}
+{"kind":"chunk","seq":1,"at":1794720581995,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720581998,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/s\"}"}
+{"kind":"chunk","seq":1,"at":1794720582000,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"um\"}"}
+{"kind":"chunk","seq":1,"at":1794720582001,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"mary\"}"}
+{"kind":"chunk","seq":1,"at":1794720582002,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582003,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582004,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720582006,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582007,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"b\"}"}
+{"kind":"chunk","seq":1,"at":1794720582008,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720582009,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582009,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" depends\"}"}
+{"kind":"chunk","seq":1,"at":1794720582011,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"_on\"}"}
+{"kind":"chunk","seq":1,"at":1794720582013,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582014,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":1,"at":1794720582015,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"9\"}"}
+{"kind":"chunk","seq":1,"at":1794720582016,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"/\"}"}
+{"kind":"chunk","seq":1,"at":1794720582017,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720582018,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720582019,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720582020,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-pe\"}"}
+{"kind":"chunk","seq":1,"at":1794720582023,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"ek\"}"}
+{"kind":"chunk","seq":1,"at":1794720582025,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" handle\"}"}
+{"kind":"chunk","seq":1,"at":1794720582026,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582027,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"obs\"}"}
+{"kind":"chunk","seq":1,"at":1794720582028,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720582029,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"bash\"}"}
+{"kind":"chunk","seq":1,"at":1794720582030,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":b\"}"}
+{"kind":"chunk","seq":1,"at":1794720582032,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720582033,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"@\"}"}
+{"kind":"chunk","seq":1,"at":1794720582037,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"v\"}"}
+{"kind":"chunk","seq":1,"at":1794720582038,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720582038,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582039,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" from\"}"}
+{"kind":"chunk","seq":1,"at":1794720582040,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"_line\"}"}
+{"kind":"chunk","seq":1,"at":1794720582041,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582042,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720582043,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582044,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" to\"}"}
+{"kind":"chunk","seq":1,"at":1794720582045,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"_line\"}"}
+{"kind":"chunk","seq":1,"at":1794720582046,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582048,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"30\"}"}
+{"kind":"chunk","seq":1,"at":1794720582049,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582050,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720582052,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582053,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"p\"}"}
+{"kind":"chunk","seq":1,"at":1794720582054,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720582055,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582056,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" depends\"}"}
+{"kind":"chunk","seq":1,"at":1794720582057,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"_on\"}"}
+{"kind":"chunk","seq":1,"at":1794720582089,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582090,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"b\"}"}
+{"kind":"chunk","seq":1,"at":1794720582091,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720582092,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"/\"}"}
+{"kind":"chunk","seq":1,"at":1794720582093,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\\n\"}"}
+{"kind":"chunk","seq":1,"at":1794720582094,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":1,"at":1794720582096,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":1,"at":1794720582096,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-final\"}"}
+{"kind":"chunk","seq":1,"at":1794720582097,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":1,"at":1794720582098,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582100,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"f\"}"}
+{"kind":"chunk","seq":1,"at":1794720582102,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720582103,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582104,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" summary\"}"}
+{"kind":"chunk","seq":1,"at":1794720582104,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":1,"at":1794720582105,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"已\"}"}
+{"kind":"chunk","seq":1,"at":1794720582106,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"写\"}"}
+{"kind":"chunk","seq":1,"at":1794720582108,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720582109,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":1,"at":1794720582111,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720582112,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"个\"}"}
+{"kind":"chunk","seq":1,"at":1794720582114,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"文件\"}"}
+{"kind":"chunk","seq":1,"at":1794720582116,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582116,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720582117,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720582118,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582119,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"..\"}"}
+{"kind":"chunk","seq":1,"at":1794720582120,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582121,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720582122,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":1,"at":1794720582123,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582124,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"（\"}"}
+{"kind":"chunk","seq":1,"at":1794720582125,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"内容\"}"}
+{"kind":"chunk","seq":1,"at":1794720582127,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"分别为\"}"}
+{"kind":"chunk","seq":1,"at":1794720582127,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" '\"}"}
+{"kind":"chunk","seq":1,"at":1794720582129,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":1,"at":1794720582130,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720582133,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720582134,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720582135,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":1,"at":1794720582136,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"'\"}"}
+{"kind":"chunk","seq":1,"at":1794720582137,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ...\"}"}
+{"kind":"chunk","seq":1,"at":1794720582139,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" '\"}"}
+{"kind":"chunk","seq":1,"at":1794720582141,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":1,"at":1794720582142,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720582143,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":1,"at":1794720582144,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":1,"at":1794720582146,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":1,"at":1794720582147,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"'\"}"}
+{"kind":"chunk","seq":1,"at":1794720582148,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"），\"}"}
+{"kind":"chunk","seq":1,"at":1794720582149,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"并\"}"}
+{"kind":"chunk","seq":1,"at":1794720582151,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"写\"}"}
+{"kind":"chunk","seq":1,"at":1794720582152,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582153,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/s\"}"}
+{"kind":"chunk","seq":1,"at":1794720582154,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"um\"}"}
+{"kind":"chunk","seq":1,"at":1794720582156,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"mary\"}"}
+{"kind":"chunk","seq":1,"at":1794720582157,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582158,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":1,"at":1794720582159,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"按\"}"}
+{"kind":"chunk","seq":1,"at":1794720582160,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"序\"}"}
+{"kind":"chunk","seq":1,"at":1794720582162,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"逐\"}"}
+{"kind":"chunk","seq":1,"at":1794720582166,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"行\"}"}
+{"kind":"chunk","seq":1,"at":1794720582167,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"列出\"}"}
+{"kind":"chunk","seq":1,"at":1794720582168,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582169,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720582171,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":1,"at":1794720582175,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582175,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"、\"}"}
+{"kind":"chunk","seq":1,"at":1794720582177,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582178,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720582179,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":1,"at":1794720582180,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582181,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"、\"}"}
+{"kind":"chunk","seq":1,"at":1794720582183,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582187,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720582188,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":1,"at":1794720582192,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582197,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"、\"}"}
+{"kind":"chunk","seq":1,"at":1794720582198,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582200,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720582205,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":1,"at":1794720582206,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582207,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"、\"}"}
+{"kind":"chunk","seq":1,"at":1794720582208,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582209,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720582211,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":1,"at":1794720582214,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582215,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"、\"}"}
+{"kind":"chunk","seq":1,"at":1794720582217,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582221,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720582223,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":1,"at":1794720582225,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582227,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"、\"}"}
+{"kind":"chunk","seq":1,"at":1794720582228,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582229,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720582231,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":1,"at":1794720582234,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582236,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"、\"}"}
+{"kind":"chunk","seq":1,"at":1794720582249,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":1,"at":1794720582250,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":1,"at":1794720582251,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":1,"at":1794720582252,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":1,"at":1794720582253,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"。\"}"}
+{"kind":"chunk","seq":1,"at":1794720582269,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"/>\"}"}
+{"kind":"chunk","seq":1,"at":1794720582281,"chunk":"{\"type\":\"block-end\",\"index\":1,\"block\":{\"type\":\"text\",\"text\":\"我先把这 8 个模块文件写出来，然后再写汇总文件。\\n\\n<tf-write path=\\\"modules/m1.txt\\\" id=\\\"w1\\\">\\nmodule 1: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m2.txt\\\" id=\\\"w2\\\">\\nmodule 2: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m3.txt\\\" id=\\\"w3\\\">\\nmodule 3: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m4.txt\\\" id=\\\"w4\\\">\\nmodule 4: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m5.txt\\\" id=\\\"w5\\\">\\nmodule 5: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m6.txt\\\" id=\\\"w6\\\">\\nmodule 6: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m7.txt\\\" id=\\\"w7\\\">\\nmodule 7: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m8.txt\\\" id=\\\"w8\\\">\\nmodule 8: ok\\n</tf-write>\\n<tf-write path=\\\"modules/summary.txt\\\" id=\\\"w9\\\" depends_on=\\\"w1,w2,w3,w4,w5,w6,w7,w8\\\">\\nmodules/m1.txt\\nmodules/m2.txt\\nmodules/m3.txt\\nmodules/m4.txt\\nmodules/m5.txt\\nmodules/m6.txt\\nmodules/m7.txt\\nmodules/m8.txt\\n</tf-write>\\n<tf-bash cmd=\\\"Get-ChildItem modules | Select-Object -ExpandProperty Name; '---'; Get-Content modules/summary.txt\\\" id=\\\"b1\\\" depends_on=\\\"w9\\\"/>\\n\\n<tf-peek handle=\\\"obs:bash:b1@v1\\\" from_line=\\\"1\\\" to_line=\\\"30\\\" id=\\\"p1\\\" depends_on=\\\"b1\\\"/>\\n\\n<tf-final id=\\\"f1\\\" summary=\\\"已写 8 个文件 modules/m1.txt..modules/m8.txt（内容分别为 'module 1: ok' ... 'module 8: ok'），并写 modules/summary.txt 按序逐行列出 modules/m1.txt、modules/m2.txt、modules/m3.txt、modules/m4.txt、modules/m5.txt、modules/m6.txt、modules/m7.txt、modules/m8.txt。\\\"/>\"}}"}
+{"kind":"chunk","seq":1,"at":1794720582291,"chunk":"{\"type\":\"usage\",\"usage\":{\"inputTokens\":134,\"outputTokens\":496,\"cacheReadTokens\":896,\"cacheWriteTokens\":0,\"totalTokens\":1526}}"}
+{"kind":"chunk","seq":1,"at":1794720582293,"chunk":"{\"type\":\"finish\",\"reason\":{\"kind\":\"stop\"},\"replayState\":{\"response\":{\"kind\":\"deepseek-messages\",\"version\":1,\"model\":\"deepseek-flash\"},\"blocks\":[{\"type\":\"reasoning\",\"signature\":\"302ff8c3-12aa-458b-98c9-ec837989ed75\"},{\"type\":\"text\"}]}}"}
+{"kind":"stream-end","seq":1,"at":1794720582306}
+{"kind":"request","seq":2,"at":1794720583404,"pid":69148,"session":"session-eb08d5b3-02aa-4649-a9f3-04e203200ce5","optionsDirty":false,"options":"{\"provider\":\"deepseek-account\",\"model\":\"deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回复流中完成任务：先简短思考，然后连续输出全部 tf-* 命令，最后输出 tf-final。\\n\\n## tf-* 单流协议（本回合唯一工具语法）\\n\\n<tf-write path=\\\"相对/绝对路径\\\" id=\\\"w1\\\" depends_on=\\\"r1\\\">\\n文件正文原文（原样输出，直到闭合标签）\\n</tf-write>\\n<tf-read path=\\\"相对/绝对路径\\\" id=\\\"r1\\\" depends_on=\\\"w1,w2\\\" offset=\\\"100\\\" limit=\\\"50\\\"/>\\n<tf-bash cmd=\\\"命令行\\\" id=\\\"b1\\\"/>\\n<tf-peek handle=\\\"obs:read:c3@v1\\\" from_line=\\\"10\\\" to_line=\\\"20\\\" id=\\\"p1\\\"/>\\n<tf-final id=\\\"f1\\\" summary=\\\"一句话完成说明\\\"/>\\n\\n（tf-read 可选 offset/limit：1 基行号起点与行数，大文件按行段取，省 token。）\\n\\n（收尾纪律：命令全部闭合后，本流必须以 tf-final 结束；写完文件、执行完命令不等于任务结束。）\\n\\n## 结果获取（关键）\\ntf-read / tf-bash 成功时结果不回灌，只有句柄进句柄目录；失败才以 [tf-stream:error] 注入。\\n因此：需要看到内容（文件片段、命令输出、计算结果）时，必须用 tf-peek 按句柄取回——\\nhandle 从 [tf-stream:observation] 与句柄目录增量中取。答案依赖命令输出时，先 peek 再收尾。\\n\\n## 时序与重发规则\\n- 同 id 同内容重复声明 = 幂等：直接返回原回执（含句柄），不重复执行；同 id 不同内容会被\\n  拒绝（换新 id）；被拒绝（无副作用）的命令可用原 id 修正后重发。\\n- 同流内后续命令自动等待先闭合的 tf-write 完成（写序保证：先写后读不会读到旧内容）。\\n- tf-peek 的句柄由命令产出——同流内提前 peek 会被自动延迟到命令完成后重试，仍无此句柄才报错；\\n  要么给 peek 加 depends_on 挂到产出命令上（如 <tf-peek ... depends_on=\\\"r1\\\"/>），\\n  要么等下一请求（句柄会出现在句柄目录增量里）再 peek。\\n- tf-bash 的命令在 Windows 宿主以 PowerShell（pwsh）执行：python3 通常不存在，优先 node -e 或\\n  PowerShell 原生命令（Select-String / Get-Content）。\\n\\ntf-final 的 summary 必须包含任务要求的最终答案原文（数字、行内容、路径、结论），\\n不得写\\\"已完成/占位\\\"式描述；还没拿到答案就不要输出 tf-final。\\n\\n规则：\\n1. 写文件一律用 tf-write（正文在标签体内原样输出）；不要用原生工具写文件。\\n2. id 建议显式给出且全任务唯一；depends_on 是逗号分隔的依赖 id 列表，可省略。\\n   依赖只能指向本任务里已出现或将要出现的命令 id。\\n3. 命令闭合即开始执行（独立命令并行，上限 3 个），不必等流结束再发后续命令。\\n4. tf-read / tf-bash 的产出默认只句柄化；tf-read 首次结果会以行骨架注入下一请求。\\n   需要某句柄的细节时发 tf-peek（handle 用句柄目录里的值，行段 1-based 闭区间）。\\n5. 上一请求若报告 [tf-stream:error]，先修复或改道该命令（换路径/换命令），再继续其余任务。\\n6. 全部命令成功且无需更多信息时输出 tf-final；收到 tf-final 后本任务收敛，不再有下一请求。\\n\\n（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）\\n\\n不变量：历史消息只增不改（任何\\\"压缩/摘要历史\\\"的请求都会被拒绝）；写文件成功不会有结果回灌（只记台账），失败一定会以 [tf-stream:error] 注入下一请求；不要用原生 tool_call 写文件。回合必须以 <tf-final .../> 收尾：所有命令输出完毕后立即输出 tf-final，不带 tf-final 的回合视为未完成——即使全部工作已做完。\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"headless 请写 8 个文件 modules/m1.txt 到 modules/m8.txt，第 N 个文件内容为 'module N: ok'。然后写 modules/summary.txt，按顺序列出全部 8 个文件名，一行一个。\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[句柄目录增量 O3：只追加，历史目录见上文]\\n+ obs:write:w1@v1\\n+ obs:write:w2@v1\\n+ obs:write:w3@v1\\n+ obs:write:w4@v1\\n+ obs:write:w5@v1\\n+ obs:write:w6@v1\\n+ obs:write:w7@v1\\n+ obs:write:w8@v1\\n+ obs:write:w9@v1\\n+ obs:bash:b1@v1\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[tf-stream:error id=b1 cmd=tf-bash target=Get-ChildItem modules | Select-Object -ExpandProperty Name; '---'; Get-Content modules/summary.txt] Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\\\\AIagentoutput\\\\zcode\\\\010-harness\\\\dsh-stream-agent-plugin\\\\dsh-stream-agent\\\\eval\\\\runs\\\\2026-11-15-v02\\\\stream\\\\W3\\\\ws)\\n建议：请检查命令本身（语法/依赖/工作目录），修正后重发，或改道用 tf-write 落地产物。\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[tf-stream:error id=p1 cmd=tf-peek] 依赖未满足：b1\\n建议：依赖 b1 未成功（失败或不存在）。请检查依赖 id 是否正确，或改道重发本命令。\"}]}],\"signal\":{},\"sessionId\":\"session-eb08d5b3-02aa-4649-a9f3-04e203200ce5\"}"}
+{"kind":"chunk","seq":2,"at":1794720583546,"chunk":"{\"type\":\"block-start\",\"index\":0,\"blockType\":\"reasoning\"}"}
+{"kind":"chunk","seq":2,"at":1794720583907,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"The\"}"}
+{"kind":"chunk","seq":2,"at":1794720583991,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" writes\"}"}
+{"kind":"chunk","seq":2,"at":1794720584015,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" seem\"}"}
+{"kind":"chunk","seq":2,"at":1794720584027,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" to\"}"}
+{"kind":"chunk","seq":2,"at":1794720584027,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" have\"}"}
+{"kind":"chunk","seq":2,"at":1794720584028,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" succeeded\"}"}
+{"kind":"chunk","seq":2,"at":1794720584042,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" (\"}"}
+{"kind":"chunk","seq":2,"at":1794720584043,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"w\"}"}
+{"kind":"chunk","seq":2,"at":1794720584046,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"1\"}"}
+{"kind":"chunk","seq":2,"at":1794720584047,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":2,"at":1794720584048,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"9\"}"}
+{"kind":"chunk","seq":2,"at":1794720584049,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" receipts\"}"}
+{"kind":"chunk","seq":2,"at":1794720584059,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" exist\"}"}
+{"kind":"chunk","seq":2,"at":1794720584060,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\").\"}"}
+{"kind":"chunk","seq":2,"at":1794720584061,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" The\"}"}
+{"kind":"chunk","seq":2,"at":1794720584062,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" bash\"}"}
+{"kind":"chunk","seq":2,"at":1794720584067,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" failed\"}"}
+{"kind":"chunk","seq":2,"at":1794720584068,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" due\"}"}
+{"kind":"chunk","seq":2,"at":1794720584068,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" to\"}"}
+{"kind":"chunk","seq":2,"at":1794720584069,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" permission\"}"}
+{"kind":"chunk","seq":2,"at":1794720584085,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" error\"}"}
+{"kind":"chunk","seq":2,"at":1794720584086,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\".\"}"}
+{"kind":"chunk","seq":2,"at":1794720584087,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" I\"}"}
+{"kind":"chunk","seq":2,"at":1794720584099,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" need\"}"}
+{"kind":"chunk","seq":2,"at":1794720584100,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" to\"}"}
+{"kind":"chunk","seq":2,"at":1794720584101,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" verify\"}"}
+{"kind":"chunk","seq":2,"at":1794720584101,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" by\"}"}
+{"kind":"chunk","seq":2,"at":1794720584114,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" reading\"}"}
+{"kind":"chunk","seq":2,"at":1794720584115,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" files\"}"}
+{"kind":"chunk","seq":2,"at":1794720584115,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" with\"}"}
+{"kind":"chunk","seq":2,"at":1794720584129,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" tf\"}"}
+{"kind":"chunk","seq":2,"at":1794720584130,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"-read\"}"}
+{"kind":"chunk","seq":2,"at":1794720584131,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" instead\"}"}
+{"kind":"chunk","seq":2,"at":1794720584133,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\".\\n\\n\"}"}
+{"kind":"chunk","seq":2,"at":1794720584133,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"Let\"}"}
+{"kind":"chunk","seq":2,"at":1794720584145,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" me\"}"}
+{"kind":"chunk","seq":2,"at":1794720584146,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" read\"}"}
+{"kind":"chunk","seq":2,"at":1794720584147,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" the\"}"}
+{"kind":"chunk","seq":2,"at":1794720584148,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" files\"}"}
+{"kind":"chunk","seq":2,"at":1794720584160,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" to\"}"}
+{"kind":"chunk","seq":2,"at":1794720584176,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" verify\"}"}
+{"kind":"chunk","seq":2,"at":1794720584177,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\".\"}"}
+{"kind":"chunk","seq":2,"at":1794720584191,"chunk":"{\"type\":\"block-end\",\"index\":0,\"block\":{\"type\":\"reasoning\",\"text\":\"The writes seem to have succeeded (w1-w9 receipts exist). The bash failed due to permission error. I need to verify by reading files with tf-read instead.\\n\\nLet me read the files to verify.\"}}"}
+{"kind":"chunk","seq":2,"at":1794720584193,"chunk":"{\"type\":\"block-start\",\"index\":1,\"blockType\":\"text\"}"}
+{"kind":"chunk","seq":2,"at":1794720584193,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\\n\"}"}
+{"kind":"chunk","seq":2,"at":1794720584194,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":2,"at":1794720584209,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":2,"at":1794720584210,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-read\"}"}
+{"kind":"chunk","seq":2,"at":1794720584212,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":2,"at":1794720584222,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":2,"at":1794720584223,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":2,"at":1794720584230,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/s\"}"}
+{"kind":"chunk","seq":2,"at":1794720584231,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"um\"}"}
+{"kind":"chunk","seq":2,"at":1794720584237,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"mary\"}"}
+{"kind":"chunk","seq":2,"at":1794720584237,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":2,"at":1794720584238,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":2,"at":1794720584239,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":2,"at":1794720584240,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":2,"at":1794720584241,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"r\"}"}
+{"kind":"chunk","seq":2,"at":1794720584258,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":2,"at":1794720584260,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"/>\\n\"}"}
+{"kind":"chunk","seq":2,"at":1794720584268,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":2,"at":1794720584269,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":2,"at":1794720584270,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-read\"}"}
+{"kind":"chunk","seq":2,"at":1794720584271,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":2,"at":1794720584272,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":2,"at":1794720584273,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":2,"at":1794720584283,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":2,"at":1794720584285,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":2,"at":1794720584286,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":2,"at":1794720584287,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":2,"at":1794720584288,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":2,"at":1794720584289,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":2,"at":1794720584305,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"r\"}"}
+{"kind":"chunk","seq":2,"at":1794720584306,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":2,"at":1794720584307,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"/>\\n\"}"}
+{"kind":"chunk","seq":2,"at":1794720584313,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":2,"at":1794720584314,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":2,"at":1794720584315,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-read\"}"}
+{"kind":"chunk","seq":2,"at":1794720584318,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":2,"at":1794720584319,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":2,"at":1794720584320,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":2,"at":1794720584320,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":2,"at":1794720584323,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":2,"at":1794720584324,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":2,"at":1794720584342,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":2,"at":1794720584343,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":2,"at":1794720584344,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":2,"at":1794720584345,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"r\"}"}
+{"kind":"chunk","seq":2,"at":1794720584346,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":2,"at":1794720584362,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"/>\"}"}
+{"kind":"chunk","seq":2,"at":1794720584369,"chunk":"{\"type\":\"block-end\",\"index\":1,\"block\":{\"type\":\"text\",\"text\":\"\\n\\n<tf-read path=\\\"modules/summary.txt\\\" id=\\\"r1\\\"/>\\n<tf-read path=\\\"modules/m1.txt\\\" id=\\\"r2\\\"/>\\n<tf-read path=\\\"modules/m8.txt\\\" id=\\\"r3\\\"/>\"}}"}
+{"kind":"chunk","seq":2,"at":1794720584371,"chunk":"{\"type\":\"usage\",\"usage\":{\"inputTokens\":303,\"outputTokens\":90,\"cacheReadTokens\":1024,\"cacheWriteTokens\":0,\"totalTokens\":1417}}"}
+{"kind":"chunk","seq":2,"at":1794720584372,"chunk":"{\"type\":\"finish\",\"reason\":{\"kind\":\"stop\"},\"replayState\":{\"response\":{\"kind\":\"deepseek-messages\",\"version\":1,\"model\":\"deepseek-flash\"},\"blocks\":[{\"type\":\"reasoning\",\"signature\":\"3d87d3dd-f9b3-4875-836b-a1d589d226c4\"},{\"type\":\"text\"}]}}"}
+{"kind":"stream-end","seq":2,"at":1794720584374}
+{"kind":"request","seq":3,"at":1794720584428,"pid":69148,"session":"session-eb08d5b3-02aa-4649-a9f3-04e203200ce5","optionsDirty":false,"options":"{\"provider\":\"deepseek-account\",\"model\":\"deepseek-flash\",\"messages\":[{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回复流中完成任务：先简短思考，然后连续输出全部 tf-* 命令，最后输出 tf-final。\\n\\n## tf-* 单流协议（本回合唯一工具语法）\\n\\n<tf-write path=\\\"相对/绝对路径\\\" id=\\\"w1\\\" depends_on=\\\"r1\\\">\\n文件正文原文（原样输出，直到闭合标签）\\n</tf-write>\\n<tf-read path=\\\"相对/绝对路径\\\" id=\\\"r1\\\" depends_on=\\\"w1,w2\\\" offset=\\\"100\\\" limit=\\\"50\\\"/>\\n<tf-bash cmd=\\\"命令行\\\" id=\\\"b1\\\"/>\\n<tf-peek handle=\\\"obs:read:c3@v1\\\" from_line=\\\"10\\\" to_line=\\\"20\\\" id=\\\"p1\\\"/>\\n<tf-final id=\\\"f1\\\" summary=\\\"一句话完成说明\\\"/>\\n\\n（tf-read 可选 offset/limit：1 基行号起点与行数，大文件按行段取，省 token。）\\n\\n（收尾纪律：命令全部闭合后，本流必须以 tf-final 结束；写完文件、执行完命令不等于任务结束。）\\n\\n## 结果获取（关键）\\ntf-read / tf-bash 成功时结果不回灌，只有句柄进句柄目录；失败才以 [tf-stream:error] 注入。\\n因此：需要看到内容（文件片段、命令输出、计算结果）时，必须用 tf-peek 按句柄取回——\\nhandle 从 [tf-stream:observation] 与句柄目录增量中取。答案依赖命令输出时，先 peek 再收尾。\\n\\n## 时序与重发规则\\n- 同 id 同内容重复声明 = 幂等：直接返回原回执（含句柄），不重复执行；同 id 不同内容会被\\n  拒绝（换新 id）；被拒绝（无副作用）的命令可用原 id 修正后重发。\\n- 同流内后续命令自动等待先闭合的 tf-write 完成（写序保证：先写后读不会读到旧内容）。\\n- tf-peek 的句柄由命令产出——同流内提前 peek 会被自动延迟到命令完成后重试，仍无此句柄才报错；\\n  要么给 peek 加 depends_on 挂到产出命令上（如 <tf-peek ... depends_on=\\\"r1\\\"/>），\\n  要么等下一请求（句柄会出现在句柄目录增量里）再 peek。\\n- tf-bash 的命令在 Windows 宿主以 PowerShell（pwsh）执行：python3 通常不存在，优先 node -e 或\\n  PowerShell 原生命令（Select-String / Get-Content）。\\n\\ntf-final 的 summary 必须包含任务要求的最终答案原文（数字、行内容、路径、结论），\\n不得写\\\"已完成/占位\\\"式描述；还没拿到答案就不要输出 tf-final。\\n\\n规则：\\n1. 写文件一律用 tf-write（正文在标签体内原样输出）；不要用原生工具写文件。\\n2. id 建议显式给出且全任务唯一；depends_on 是逗号分隔的依赖 id 列表，可省略。\\n   依赖只能指向本任务里已出现或将要出现的命令 id。\\n3. 命令闭合即开始执行（独立命令并行，上限 3 个），不必等流结束再发后续命令。\\n4. tf-read / tf-bash 的产出默认只句柄化；tf-read 首次结果会以行骨架注入下一请求。\\n   需要某句柄的细节时发 tf-peek（handle 用句柄目录里的值，行段 1-based 闭区间）。\\n5. 上一请求若报告 [tf-stream:error]，先修复或改道该命令（换路径/换命令），再继续其余任务。\\n6. 全部命令成功且无需更多信息时输出 tf-final；收到 tf-final 后本任务收敛，不再有下一请求。\\n\\n（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）\\n\\n不变量：历史消息只增不改（任何\\\"压缩/摘要历史\\\"的请求都会被拒绝）；写文件成功不会有结果回灌（只记台账），失败一定会以 [tf-stream:error] 注入下一请求；不要用原生 tool_call 写文件。回合必须以 <tf-final .../> 收尾：所有命令输出完毕后立即输出 tf-final，不带 tf-final 的回合视为未完成——即使全部工作已做完。\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"headless 请写 8 个文件 modules/m1.txt 到 modules/m8.txt，第 N 个文件内容为 'module N: ok'。然后写 modules/summary.txt，按顺序列出全部 8 个文件名，一行一个。\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[句柄目录增量 O3：只追加，历史目录见上文]\\n+ obs:write:w1@v1\\n+ obs:write:w2@v1\\n+ obs:write:w3@v1\\n+ obs:write:w4@v1\\n+ obs:write:w5@v1\\n+ obs:write:w6@v1\\n+ obs:write:w7@v1\\n+ obs:write:w8@v1\\n+ obs:write:w9@v1\\n+ obs:bash:b1@v1\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[句柄目录增量 O3：只追加，历史目录见上文]\\n~ obs:read:r1@v2\\n~ obs:read:r2@v2\\n~ obs:read:r3@v2\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[tf-stream:observation handle=obs:read:r1@v2 key=modules/summary.txt]\\n<path>D:\\\\AIagentoutput\\\\zcode\\\\010-harness\\\\dsh-stream-agent-plugin\\\\dsh-stream-agent\\\\eval\\\\runs\\\\2026-11-15-v02\\\\stream\\\\W3\\\\ws\\\\modules\\\\summary.txt</path>\\n<type>file</type>\\n<content>\\n1: \\n2: modules/m1.txt\\n3: modules/m2.txt\\n4: modules/m3.txt\\n5: modules/m4.txt\\n6: modules/m5.txt\\n7: modules/m6.txt\\n8: modules/m7.txt\\n9: modules/m8.txt\\n\\n(End of file - total 9 lines)\\n</content>\\n（细节用 tf-peek handle=\\\"obs:read:r1@v2\\\" from_line=.. to_line=.. 取回）\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[tf-stream:observation handle=obs:read:r2@v2 key=modules/m1.txt]\\n<path>D:\\\\AIagentoutput\\\\zcode\\\\010-harness\\\\dsh-stream-agent-plugin\\\\dsh-stream-agent\\\\eval\\\\runs\\\\2026-11-15-v02\\\\stream\\\\W3\\\\ws\\\\modules\\\\m1.txt</path>\\n<type>file</type>\\n<content>\\n1: \\n2: module 1: ok\\n\\n(End of file - total 2 lines)\\n</content>\\n（细节用 tf-peek handle=\\\"obs:read:r2@v2\\\" from_line=.. to_line=.. 取回）\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[tf-stream:observation handle=obs:read:r3@v2 key=modules/m8.txt]\\n<path>D:\\\\AIagentoutput\\\\zcode\\\\010-harness\\\\dsh-stream-agent-plugin\\\\dsh-stream-agent\\\\eval\\\\runs\\\\2026-11-15-v02\\\\stream\\\\W3\\\\ws\\\\modules\\\\m8.txt</path>\\n<type>file</type>\\n<content>\\n1: \\n2: module 8: ok\\n\\n(End of file - total 2 lines)\\n</content>\\n（细节用 tf-peek handle=\\\"obs:read:r3@v2\\\" from_line=.. to_line=.. 取回）\"}]}],\"signal\":{},\"sessionId\":\"session-eb08d5b3-02aa-4649-a9f3-04e203200ce5\"}"}
+{"kind":"chunk","seq":3,"at":1794720584557,"chunk":"{\"type\":\"block-start\",\"index\":0,\"blockType\":\"reasoning\"}"}
+{"kind":"chunk","seq":3,"at":1794720584809,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"Files\"}"}
+{"kind":"chunk","seq":3,"at":1794720584935,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" were\"}"}
+{"kind":"chunk","seq":3,"at":1794720584936,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" written\"}"}
+{"kind":"chunk","seq":3,"at":1794720584937,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" but\"}"}
+{"kind":"chunk","seq":3,"at":1794720584938,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" have\"}"}
+{"kind":"chunk","seq":3,"at":1794720584940,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" leading\"}"}
+{"kind":"chunk","seq":3,"at":1794720584941,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" blank\"}"}
+{"kind":"chunk","seq":3,"at":1794720584941,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" lines\"}"}
+{"kind":"chunk","seq":3,"at":1794720584942,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" (\"}"}
+{"kind":"chunk","seq":3,"at":1794720584942,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"line\"}"}
+{"kind":"chunk","seq":3,"at":1794720584943,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" \"}"}
+{"kind":"chunk","seq":3,"at":1794720584944,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720584945,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" empty\"}"}
+{"kind":"chunk","seq":3,"at":1794720584946,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\").\"}"}
+{"kind":"chunk","seq":3,"at":1794720584946,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" The\"}"}
+{"kind":"chunk","seq":3,"at":1794720584961,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" task\"}"}
+{"kind":"chunk","seq":3,"at":1794720584963,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" says\"}"}
+{"kind":"chunk","seq":3,"at":1794720584963,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" content\"}"}
+{"kind":"chunk","seq":3,"at":1794720584968,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" should\"}"}
+{"kind":"chunk","seq":3,"at":1794720584969,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" be\"}"}
+{"kind":"chunk","seq":3,"at":1794720584970,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" '\"}"}
+{"kind":"chunk","seq":3,"at":1794720584970,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"module\"}"}
+{"kind":"chunk","seq":3,"at":1794720585005,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" N\"}"}
+{"kind":"chunk","seq":3,"at":1794720585006,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\":\"}"}
+{"kind":"chunk","seq":3,"at":1794720585006,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":3,"at":1794720585007,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"'.\"}"}
+{"kind":"chunk","seq":3,"at":1794720585007,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" Should\"}"}
+{"kind":"chunk","seq":3,"at":1794720585008,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" fix\"}"}
+{"kind":"chunk","seq":3,"at":1794720585009,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" —\"}"}
+{"kind":"chunk","seq":3,"at":1794720585012,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" the\"}"}
+{"kind":"chunk","seq":3,"at":1794720585013,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585030,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585031,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585032,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" bodies\"}"}
+{"kind":"chunk","seq":3,"at":1794720585042,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" started\"}"}
+{"kind":"chunk","seq":3,"at":1794720585043,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" with\"}"}
+{"kind":"chunk","seq":3,"at":1794720585044,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" a\"}"}
+{"kind":"chunk","seq":3,"at":1794720585059,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" new\"}"}
+{"kind":"chunk","seq":3,"at":1794720585060,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"line\"}"}
+{"kind":"chunk","seq":3,"at":1794720585061,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\".\"}"}
+{"kind":"chunk","seq":3,"at":1794720585062,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" Let\"}"}
+{"kind":"chunk","seq":3,"at":1794720585063,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" me\"}"}
+{"kind":"chunk","seq":3,"at":1794720585064,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" rewrite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585075,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" all\"}"}
+{"kind":"chunk","seq":3,"at":1794720585094,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" \"}"}
+{"kind":"chunk","seq":3,"at":1794720585095,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"9\"}"}
+{"kind":"chunk","seq":3,"at":1794720585096,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" files\"}"}
+{"kind":"chunk","seq":3,"at":1794720585096,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" without\"}"}
+{"kind":"chunk","seq":3,"at":1794720585123,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" leading\"}"}
+{"kind":"chunk","seq":3,"at":1794720585124,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" blank\"}"}
+{"kind":"chunk","seq":3,"at":1794720585124,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" line\"}"}
+{"kind":"chunk","seq":3,"at":1794720585125,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\".\\n\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585158,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"Also\"}"}
+{"kind":"chunk","seq":3,"at":1794720585159,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" summary\"}"}
+{"kind":"chunk","seq":3,"at":1794720585160,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585160,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" has\"}"}
+{"kind":"chunk","seq":3,"at":1794720585161,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" leading\"}"}
+{"kind":"chunk","seq":3,"at":1794720585168,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" blank\"}"}
+{"kind":"chunk","seq":3,"at":1794720585169,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" line\"}"}
+{"kind":"chunk","seq":3,"at":1794720585170,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\".\"}"}
+{"kind":"chunk","seq":3,"at":1794720585171,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" Let\"}"}
+{"kind":"chunk","seq":3,"at":1794720585171,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"'s\"}"}
+{"kind":"chunk","seq":3,"at":1794720585184,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" rewrite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585185,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" properly\"}"}
+{"kind":"chunk","seq":3,"at":1794720585185,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\".\\n\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585203,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"Then\"}"}
+{"kind":"chunk","seq":3,"at":1794720585204,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" verify\"}"}
+{"kind":"chunk","seq":3,"at":1794720585222,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" with\"}"}
+{"kind":"chunk","seq":3,"at":1794720585223,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" reads\"}"}
+{"kind":"chunk","seq":3,"at":1794720585226,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" and\"}"}
+{"kind":"chunk","seq":3,"at":1794720585226,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\" peek\"}"}
+{"kind":"chunk","seq":3,"at":1794720585246,"chunk":"{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\".\"}"}
+{"kind":"chunk","seq":3,"at":1794720585247,"chunk":"{\"type\":\"block-end\",\"index\":0,\"block\":{\"type\":\"reasoning\",\"text\":\"Files were written but have leading blank lines (line 1 empty). The task says content should be 'module N: ok'. Should fix — the tf-write bodies started with a newline. Let me rewrite all 9 files without leading blank line.\\n\\nAlso summary.txt has leading blank line. Let's rewrite properly.\\n\\nThen verify with reads and peek.\"}}"}
+{"kind":"chunk","seq":3,"at":1794720585247,"chunk":"{\"type\":\"block-start\",\"index\":1,\"blockType\":\"text\"}"}
+{"kind":"chunk","seq":3,"at":1794720585248,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585262,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720585263,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585264,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585271,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585272,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":3,"at":1794720585286,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585289,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585290,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585315,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720585316,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585317,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585318,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720585319,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585320,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585322,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720585323,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585324,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":3,"at":1794720585325,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":3,"at":1794720585334,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720585335,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":3,"at":1794720585336,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":3,"at":1794720585337,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585337,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":3,"at":1794720585338,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585347,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585348,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585349,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585351,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720585352,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585352,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585364,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585365,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":3,"at":1794720585366,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585367,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585368,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585369,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":3,"at":1794720585378,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585379,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585380,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720585381,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585382,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585382,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":3,"at":1794720585394,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585395,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":3,"at":1794720585396,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":3,"at":1794720585397,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":3,"at":1794720585397,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":3,"at":1794720585398,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":3,"at":1794720585414,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585415,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":3,"at":1794720585416,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585416,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585417,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585418,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585425,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720585426,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585427,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585427,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585428,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":3,"at":1794720585428,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585451,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585452,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585453,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":3,"at":1794720585454,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585455,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585456,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720585465,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585466,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585467,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":3,"at":1794720585467,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585468,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":3,"at":1794720585469,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":3,"at":1794720585486,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":3,"at":1794720585487,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":3,"at":1794720585488,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":3,"at":1794720585488,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585489,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":3,"at":1794720585489,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585497,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585498,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585499,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585500,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720585500,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585501,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585503,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585504,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":3,"at":1794720585505,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585505,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585506,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585507,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":3,"at":1794720585540,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585541,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585542,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720585543,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585543,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585544,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":3,"at":1794720585553,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585554,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":3,"at":1794720585555,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":3,"at":1794720585556,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":3,"at":1794720585556,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":3,"at":1794720585556,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":3,"at":1794720585584,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585585,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":3,"at":1794720585586,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585587,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585588,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585589,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585590,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720585591,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585592,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585593,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585593,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":3,"at":1794720585594,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585596,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585596,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585597,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":3,"at":1794720585598,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585598,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585599,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720585607,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585608,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585609,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":3,"at":1794720585610,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585611,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":3,"at":1794720585612,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":3,"at":1794720585613,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":3,"at":1794720585614,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":3,"at":1794720585615,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":3,"at":1794720585616,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585616,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":3,"at":1794720585617,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585627,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585629,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585629,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585630,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720585631,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585632,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585644,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585645,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":3,"at":1794720585646,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585646,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585647,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585647,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":3,"at":1794720585658,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585659,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585660,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720585661,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585662,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585663,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":3,"at":1794720585682,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585684,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":3,"at":1794720585686,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":3,"at":1794720585687,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":3,"at":1794720585688,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":3,"at":1794720585689,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":3,"at":1794720585691,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585691,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":3,"at":1794720585692,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585692,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585693,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585693,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585703,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720585704,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585706,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585707,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585708,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":3,"at":1794720585709,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585745,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585747,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585748,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":3,"at":1794720585749,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585751,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585751,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720585754,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585756,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585756,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":3,"at":1794720585757,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585758,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":3,"at":1794720585758,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":3,"at":1794720585759,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":3,"at":1794720585760,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":3,"at":1794720585761,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":3,"at":1794720585762,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585762,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":3,"at":1794720585763,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585774,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585775,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585776,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585776,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720585777,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585778,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585785,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585786,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":3,"at":1794720585786,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585787,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585787,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585788,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":3,"at":1794720585795,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585796,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585796,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720585799,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585800,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585801,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":3,"at":1794720585816,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585818,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"module\"}"}
+{"kind":"chunk","seq":3,"at":1794720585819,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" \"}"}
+{"kind":"chunk","seq":3,"at":1794720585820,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":3,"at":1794720585821,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":3,"at":1794720585822,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" ok\"}"}
+{"kind":"chunk","seq":3,"at":1794720585824,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585825,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":3,"at":1794720585827,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585827,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585828,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585828,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585840,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720585846,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585847,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585848,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720585849,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" path\"}"}
+{"kind":"chunk","seq":3,"at":1794720585850,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585859,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585860,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/s\"}"}
+{"kind":"chunk","seq":3,"at":1794720585861,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"um\"}"}
+{"kind":"chunk","seq":3,"at":1794720585862,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"mary\"}"}
+{"kind":"chunk","seq":3,"at":1794720585862,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585863,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585878,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720585879,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720585880,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":3,"at":1794720585881,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"9\"}"}
+{"kind":"chunk","seq":3,"at":1794720585882,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\">\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585887,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585891,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585892,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720585893,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585895,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585896,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585896,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585901,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":3,"at":1794720585902,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585902,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585904,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585905,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585906,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":3,"at":1794720585913,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585914,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585915,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585916,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585917,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":3,"at":1794720585917,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585933,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585934,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585935,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585936,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":3,"at":1794720585937,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585937,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585949,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585951,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585952,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":3,"at":1794720585952,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585954,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585955,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585980,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585982,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":3,"at":1794720585983,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585984,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585985,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720585986,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720585989,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":3,"at":1794720585990,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720585991,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720585992,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"</\"}"}
+{"kind":"chunk","seq":3,"at":1794720585993,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720585994,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-w\"}"}
+{"kind":"chunk","seq":3,"at":1794720586011,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"rite\"}"}
+{"kind":"chunk","seq":3,"at":1794720586012,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\">\\n\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720586013,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720586014,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720586015,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-b\"}"}
+{"kind":"chunk","seq":3,"at":1794720586016,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"ash\"}"}
+{"kind":"chunk","seq":3,"at":1794720586017,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" cmd\"}"}
+{"kind":"chunk","seq":3,"at":1794720586018,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586019,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Get\"}"}
+{"kind":"chunk","seq":3,"at":1794720586025,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-\"}"}
+{"kind":"chunk","seq":3,"at":1794720586026,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Child\"}"}
+{"kind":"chunk","seq":3,"at":1794720586027,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Item\"}"}
+{"kind":"chunk","seq":3,"at":1794720586029,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720586053,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" |\"}"}
+{"kind":"chunk","seq":3,"at":1794720586054,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" Select\"}"}
+{"kind":"chunk","seq":3,"at":1794720586055,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-\"}"}
+{"kind":"chunk","seq":3,"at":1794720586055,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Object\"}"}
+{"kind":"chunk","seq":3,"at":1794720586056,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" Name\"}"}
+{"kind":"chunk","seq":3,"at":1794720586057,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",\"}"}
+{"kind":"chunk","seq":3,"at":1794720586058,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Length\"}"}
+{"kind":"chunk","seq":3,"at":1794720586059,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" |\"}"}
+{"kind":"chunk","seq":3,"at":1794720586061,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" Format\"}"}
+{"kind":"chunk","seq":3,"at":1794720586062,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-\"}"}
+{"kind":"chunk","seq":3,"at":1794720586062,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Table\"}"}
+{"kind":"chunk","seq":3,"at":1794720586066,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" -\"}"}
+{"kind":"chunk","seq":3,"at":1794720586068,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Auto\"}"}
+{"kind":"chunk","seq":3,"at":1794720586069,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Size\"}"}
+{"kind":"chunk","seq":3,"at":1794720586069,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\";\"}"}
+{"kind":"chunk","seq":3,"at":1794720586070,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" Write\"}"}
+{"kind":"chunk","seq":3,"at":1794720586081,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-\"}"}
+{"kind":"chunk","seq":3,"at":1794720586083,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Output\"}"}
+{"kind":"chunk","seq":3,"at":1794720586084,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" '\"}"}
+{"kind":"chunk","seq":3,"at":1794720586085,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"---\"}"}
+{"kind":"chunk","seq":3,"at":1794720586087,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"';\"}"}
+{"kind":"chunk","seq":3,"at":1794720586087,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" Get\"}"}
+{"kind":"chunk","seq":3,"at":1794720586099,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-\"}"}
+{"kind":"chunk","seq":3,"at":1794720586101,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Content\"}"}
+{"kind":"chunk","seq":3,"at":1794720586101,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720586102,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/s\"}"}
+{"kind":"chunk","seq":3,"at":1794720586103,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"um\"}"}
+{"kind":"chunk","seq":3,"at":1794720586114,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"mary\"}"}
+{"kind":"chunk","seq":3,"at":1794720586116,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720586117,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\";\"}"}
+{"kind":"chunk","seq":3,"at":1794720586117,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" Write\"}"}
+{"kind":"chunk","seq":3,"at":1794720586129,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-\"}"}
+{"kind":"chunk","seq":3,"at":1794720586131,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Output\"}"}
+{"kind":"chunk","seq":3,"at":1794720586134,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" '\"}"}
+{"kind":"chunk","seq":3,"at":1794720586136,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"---\"}"}
+{"kind":"chunk","seq":3,"at":1794720586137,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"';\"}"}
+{"kind":"chunk","seq":3,"at":1794720586138,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" Get\"}"}
+{"kind":"chunk","seq":3,"at":1794720586147,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-\"}"}
+{"kind":"chunk","seq":3,"at":1794720586148,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"Content\"}"}
+{"kind":"chunk","seq":3,"at":1794720586148,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" modules\"}"}
+{"kind":"chunk","seq":3,"at":1794720586149,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"/m\"}"}
+{"kind":"chunk","seq":3,"at":1794720586150,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":3,"at":1794720586161,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\".txt\"}"}
+{"kind":"chunk","seq":3,"at":1794720586162,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586163,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720586176,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586177,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"b\"}"}
+{"kind":"chunk","seq":3,"at":1794720586178,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720586179,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586180,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" depends\"}"}
+{"kind":"chunk","seq":3,"at":1794720586181,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"_on\"}"}
+{"kind":"chunk","seq":3,"at":1794720586190,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586191,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"w\"}"}
+{"kind":"chunk","seq":3,"at":1794720586192,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720586193,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":3,"at":1794720586193,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"2\"}"}
+{"kind":"chunk","seq":3,"at":1794720586194,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":3,"at":1794720586206,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"3\"}"}
+{"kind":"chunk","seq":3,"at":1794720586208,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":3,"at":1794720586209,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"4\"}"}
+{"kind":"chunk","seq":3,"at":1794720586209,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":3,"at":1794720586211,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"5\"}"}
+{"kind":"chunk","seq":3,"at":1794720586212,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":3,"at":1794720586218,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"6\"}"}
+{"kind":"chunk","seq":3,"at":1794720586219,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":3,"at":1794720586220,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"7\"}"}
+{"kind":"chunk","seq":3,"at":1794720586221,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":3,"at":1794720586223,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"8\"}"}
+{"kind":"chunk","seq":3,"at":1794720586223,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\",w\"}"}
+{"kind":"chunk","seq":3,"at":1794720586234,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"9\"}"}
+{"kind":"chunk","seq":3,"at":1794720586235,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"/>\\n\"}"}
+{"kind":"chunk","seq":3,"at":1794720586236,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"<\"}"}
+{"kind":"chunk","seq":3,"at":1794720586237,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"tf\"}"}
+{"kind":"chunk","seq":3,"at":1794720586249,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"-pe\"}"}
+{"kind":"chunk","seq":3,"at":1794720586250,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"ek\"}"}
+{"kind":"chunk","seq":3,"at":1794720586251,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" handle\"}"}
+{"kind":"chunk","seq":3,"at":1794720586268,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586269,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"obs\"}"}
+{"kind":"chunk","seq":3,"at":1794720586282,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":\"}"}
+{"kind":"chunk","seq":3,"at":1794720586283,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"bash\"}"}
+{"kind":"chunk","seq":3,"at":1794720586284,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\":b\"}"}
+{"kind":"chunk","seq":3,"at":1794720586286,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720586287,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"@\"}"}
+{"kind":"chunk","seq":3,"at":1794720586302,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"v\"}"}
+{"kind":"chunk","seq":3,"at":1794720586303,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720586305,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586305,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" from\"}"}
+{"kind":"chunk","seq":3,"at":1794720586306,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"_line\"}"}
+{"kind":"chunk","seq":3,"at":1794720586316,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586317,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720586318,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586319,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" to\"}"}
+{"kind":"chunk","seq":3,"at":1794720586320,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"_line\"}"}
+{"kind":"chunk","seq":3,"at":1794720586321,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586325,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"40\"}"}
+{"kind":"chunk","seq":3,"at":1794720586326,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586328,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" id\"}"}
+{"kind":"chunk","seq":3,"at":1794720586329,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586331,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"p\"}"}
+{"kind":"chunk","seq":3,"at":1794720586341,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720586342,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586343,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\" depends\"}"}
+{"kind":"chunk","seq":3,"at":1794720586344,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"_on\"}"}
+{"kind":"chunk","seq":3,"at":1794720586345,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"=\\\"\"}"}
+{"kind":"chunk","seq":3,"at":1794720586346,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"b\"}"}
+{"kind":"chunk","seq":3,"at":1794720586360,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"1\"}"}
+{"kind":"chunk","seq":3,"at":1794720586361,"chunk":"{\"type\":\"text-delta\",\"index\":1,\"text\":\"\\\"/>\"}"}
+{"kind":"chunk","seq":3,"at":1794720586363,"chunk":"{\"type\":\"block-end\",\"index\":1,\"block\":{\"type\":\"text\",\"text\":\"\\n\\n<tf-write path=\\\"modules/m1.txt\\\" id=\\\"w1\\\">\\nmodule 1: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m2.txt\\\" id=\\\"w2\\\">\\nmodule 2: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m3.txt\\\" id=\\\"w3\\\">\\nmodule 3: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m4.txt\\\" id=\\\"w4\\\">\\nmodule 4: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m5.txt\\\" id=\\\"w5\\\">\\nmodule 5: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m6.txt\\\" id=\\\"w6\\\">\\nmodule 6: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m7.txt\\\" id=\\\"w7\\\">\\nmodule 7: ok\\n</tf-write>\\n<tf-write path=\\\"modules/m8.txt\\\" id=\\\"w8\\\">\\nmodule 8: ok\\n</tf-write>\\n<tf-write path=\\\"modules/summary.txt\\\" id=\\\"w9\\\">\\nmodules/m1.txt\\nmodules/m2.txt\\nmodules/m3.txt\\nmodules/m4.txt\\nmodules/m5.txt\\nmodules/m6.txt\\nmodules/m7.txt\\nmodules/m8.txt\\n</tf-write>\\n\\n<tf-bash cmd=\\\"Get-ChildItem modules | Select-Object Name,Length | Format-Table -AutoSize; Write-Output '---'; Get-Content modules/summary.txt; Write-Output '---'; Get-Content modules/m3.txt\\\" id=\\\"b1\\\" depends_on=\\\"w1,w2,w3,w4,w5,w6,w7,w8,w9\\\"/>\\n<tf-peek handle=\\\"obs:bash:b1@v1\\\" from_line=\\\"1\\\" to_line=\\\"40\\\" id=\\\"p1\\\" depends_on=\\\"b1\\\"/>\"}}"}
+{"kind":"chunk","seq":3,"at":1794720586364,"chunk":"{\"type\":\"usage\",\"usage\":{\"inputTokens\":642,\"outputTokens\":470,\"cacheReadTokens\":1024,\"cacheWriteTokens\":0,\"totalTokens\":2136}}"}
+{"kind":"chunk","seq":3,"at":1794720586365,"chunk":"{\"type\":\"finish\",\"reason\":{\"kind\":\"stop\"},\"replayState\":{\"response\":{\"kind\":\"deepseek-messages\",\"version\":1,\"model\":\"deepseek-flash\"},\"blocks\":[{\"type\":\"reasoning\",\"signature\":\"8f107480-dd75-4e0c-828e-f390472102ad\"},{\"type\":\"text\"}]}}"}
+{"kind":"stream-end","seq":3,"at":1794720586367}

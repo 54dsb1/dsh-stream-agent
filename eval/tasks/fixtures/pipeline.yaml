@@ -1,0 +1,4 @@
+# pipeline.yaml (fixture)
+source: data/missing-source.json
+fallback: none
+output: out/result.json

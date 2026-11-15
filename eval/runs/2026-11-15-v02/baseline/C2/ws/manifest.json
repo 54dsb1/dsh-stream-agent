@@ -1,0 +1,15 @@
+{
+  "root": "8d5d075b744212276cef383dab2da699bdb4274daaee1ae3a1e026b8ab761496",
+  "files": [
+    {
+      "rel": "out/result.json",
+      "size": 57,
+      "sha256": "d4278d5322e1422c7e0277ff6885ff87ff1715b3cc03391d42f2ee756989075b"
+    },
+    {
+      "rel": "pipeline.yaml",
+      "size": 98,
+      "sha256": "b77a8ca5d83afc33caf0557800d79191353d207127484c47fa880d2afe2d0a21"
+    }
+  ]
+}

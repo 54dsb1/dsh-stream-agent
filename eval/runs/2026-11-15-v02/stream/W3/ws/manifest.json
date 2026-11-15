@@ -1,0 +1,50 @@
+{
+  "root": "a703daeb0c1bd5ae669dfee6250af78f880c8d1e1d35c50c5957134c3e2a2441",
+  "files": [
+    {
+      "rel": "modules/m1.txt",
+      "size": 14,
+      "sha256": "8980e29934171d2618bc62d78c395b54a0e1a45807d7668251c90d0090627365"
+    },
+    {
+      "rel": "modules/m2.txt",
+      "size": 14,
+      "sha256": "309b9a062943e09c956fb6ed24e2a880e183e8dc820907dce99068c8be9ebde1"
+    },
+    {
+      "rel": "modules/m3.txt",
+      "size": 14,
+      "sha256": "7bfda39592bd30f2d0c372a8cfb837a1850815cdfcc3e9d6ce584726dc72e7a6"
+    },
+    {
+      "rel": "modules/m4.txt",
+      "size": 14,
+      "sha256": "9283c4a8f61601cf73886b61e30cdad872ecf734cdb43c5d45edf3457a08d06b"
+    },
+    {
+      "rel": "modules/m5.txt",
+      "size": 14,
+      "sha256": "df5d4558b63a58da18c97d27143b52e56648899b565547901c5259d9e8af86cc"
+    },
+    {
+      "rel": "modules/m6.txt",
+      "size": 14,
+      "sha256": "9202c98882f5e7a382bd5f50d11cd18be91d6c52ae8962793776370fa483f27d"
+    },
+    {
+      "rel": "modules/m7.txt",
+      "size": 14,
+      "sha256": "5844111c741a6259bad55bb1e1cb64963ef98a6483e60421bf0d8ceca106197a"
+    },
+    {
+      "rel": "modules/m8.txt",
+      "size": 14,
+      "sha256": "3ace5d65d794cb3f6172163a9fc60dc6a3a0ca2dc3d21475671e3f4d9cbc4ffb"
+    },
+    {
+      "rel": "modules/summary.txt",
+      "size": 121,
+      "sha256": "7c0dc9f09e4427d2737873d780b3222c6ca56934fb9aec2ec8136e705cb0b790"
+    }
+  ]
+}

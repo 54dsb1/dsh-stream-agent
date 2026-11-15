@@ -1,0 +1,45 @@
+{
+  "name": "@54dsb1/dsh-stream-agent",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "单流协议 DSH 插件：内核层零框架依赖，适配层接入 @deepseek-ai/dsh",
+  "main": "./dist/entry/loop.js",
+  "exports": {
+    ".": "./dist/entry/loop.js",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\" \"test/kernel/*.test.ts\"",
+    "build": "node scripts/build.mjs"
+  },
+  "engines": {
+    "node": ">=24",
+    "dsh": ">=0.2.2-rc.1"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "LICENSE",
+    "dist/",
+    "src/",
+    "test/",
+    "scripts/",
+    "eval/METRICS.md",
+    "eval/RESULTS.md",
+    "eval/tasks/",
+    "eval/tools/",
+    "preset.yml",
+    "test-preset.yml",
+    "cordis.patch.yml",
+    "patch-takeover.yml",
+    "patch-adapters-smoke.yml",
+    "patch-eval-baseline.yml",
+    "patch-eval-stream.yml",
+    "README.md"
+  ]
+}

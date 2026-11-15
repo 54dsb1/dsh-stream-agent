@@ -1,0 +1,11 @@
+{
+  "name": "starvation-promote",
+  "match": { "promptIncludes": "请写一个文件然后停下" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "任务：写一个文件。\n" },
+    { "type": "commands", "commands": ["<tf-write path=\"only.txt\" id=\"w1\">独苗内容</tf-write>"] },
+    { "type": "waitTools", "count": 1, "timeoutMs": 5000 },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

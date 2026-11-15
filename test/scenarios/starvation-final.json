@@ -1,0 +1,10 @@
+{
+  "name": "starvation-final",
+  "match": { "promptIncludes": "starvation-promoted" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "收到升格骨架，任务其实已完成。\n" },
+    { "type": "commands", "commands": ["<tf-final id=\"f1\" summary=\"文件已写，收尾\"/>"] },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

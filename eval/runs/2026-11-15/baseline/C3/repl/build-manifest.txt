@@ -1,0 +1,5 @@
+# build-manifest.txt (fixture)
+docs/intro.md = Stream agent intro, three paragraphs, plain markdown.
+docs/design.md = Single-stream protocol design notes, mention tf-write and tf-peek.
+docs/eval.md = Evaluation plan summary, mention METRICS and baseline.
+docs/roadmap.md = Roadmap: M0 through M10 one line each.

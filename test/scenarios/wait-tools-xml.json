@@ -1,0 +1,22 @@
+{
+  "name": "wait-tools-xml",
+  "match": { "promptIncludes": "先写两个文件再读回来" },
+  "chunking": { "charsPerChunk": 5, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "分两批：先写 a、b，等结果回来再读 a。\n" },
+    {
+      "type": "commands",
+      "commands": [
+        "<tf-write path=\"a.txt\" id=\"wa\">内容A</tf-write>",
+        "<tf-write path=\"b.txt\" id=\"wb\">内容B</tf-write>"
+      ]
+    },
+    { "type": "waitTools", "count": 2, "timeoutMs": 5000 },
+    { "type": "text", "text": "前两个文件已写。\n" },
+    { "type": "commands", "commands": ["<tf-read path=\"a.txt\" id=\"ra\" depends_on=\"wa,wb\"/>"] },
+    { "type": "waitTools", "count": 3, "timeoutMs": 5000 },
+    { "type": "text", "text": "读回确认，收尾。\n" },
+    { "type": "commands", "commands": ["<tf-final id=\"f1\" summary=\"两写一读完成\"/>"] },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

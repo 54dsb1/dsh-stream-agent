@@ -1,0 +1,4 @@
+# features.yaml (fixture)
+service: platform
+revision: 7
+flags: [a, b]

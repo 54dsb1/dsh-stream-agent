@@ -1,0 +1,9 @@
+{
+  "name": "burn-more",
+  "match": { "promptIncludes": "tf-stream:error" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "预算紧张，暂不修复，继续消耗。\n" },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

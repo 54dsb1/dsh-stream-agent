@@ -1,0 +1,12 @@
+{
+  "name": "fault-malformed-command",
+  "match": { "promptIncludes": "故障注入：畸形命令" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "下面一行是故意写坏的协议命令。\n" },
+    { "type": "fail", "mode": "malformed_command", "text": "tf-frobnicate x y z\ntf-write 没有引号的内容\n" },
+    { "type": "text", "text": "继续正常收尾。\n" },
+    { "type": "commands", "commands": ["tf-final"] },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

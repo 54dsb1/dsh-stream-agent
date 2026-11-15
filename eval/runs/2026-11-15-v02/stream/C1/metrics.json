@@ -1,0 +1,205 @@
+{
+  "task": "C1",
+  "arm": "stream",
+  "type": "composite",
+  "started": "2026-11-15T05:35:08.133Z",
+  "finished": "2026-11-15T05:37:00.745Z",
+  "exitCode": 0,
+  "timedOut": false,
+  "signal": null,
+  "stdoutTail": "pending\n",
+  "stderrTail": "[context-render] mounted: llm/stream O6 preflight asserter\n[state-handle] mounted: provide(state)（storage 异步接驳中，降级与否见后续告警）\n[eval-probe] mounted: llm/stream passthrough + capture -> D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\C1\\probe\\probe.jsonl\n[state-handle] storage 接驳失败，降级内存 BlobSink（服务照常提供） :: storage backend 'json' is not registered (registered: none)\n[action-gate] mounted: guard registered (actions: tf-write,write,tf-read,read,tf-peek,tf-final,tf-bash,bash; mode=stage-commit)\n[obs-broker] mounted: tools/post-execute + llm/stream listeners\n[stream-loop] TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch)\n[stream-loop] [stream-loop] plugin:tf-agent ledger 落 plugin record 失败，降级内存台账（resume 后 tf-* 状态不可重放） :: Cannot find package '@deepseek-ai/dsh-session' imported from D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\dist\\entry\\loop.js\n[llm-deepseek-account] model listing from https://api.deepseek.com/models loaded 2 model(s), skipped 0 row(s)\n",
+  "M2_callCount": {
+    "main": 0,
+    "probe": 8,
+    "probeRaw": 8,
+    "titleExcluded": 0,
+    "note": "v1.1�����ھ�=probe ������main(session log request/header) �����߱ۿɵã�������"
+  },
+  "M1_tokens": {
+    "input": 11136,
+    "output": 2598,
+    "cacheRead": 7936,
+    "cacheWrite": 0,
+    "unitTaskToken": 13734,
+    "cachedFieldsSeen": true,
+    "usageOriginal": [
+      {
+        "seq": 1,
+        "usage": {
+          "inputTokens": 259,
+          "outputTokens": 94,
+          "cacheReadTokens": 768,
+          "cacheWriteTokens": 0,
+          "totalTokens": 1121
+        }
+      },
+      {
+        "seq": 2,
+        "usage": {
+          "inputTokens": 1242,
+          "outputTokens": 852,
+          "cacheReadTokens": 1024,
+          "cacheWriteTokens": 0,
+          "totalTokens": 3118
+        }
+      },
+      {
+        "seq": 3,
+        "usage": {
+          "inputTokens": 265,
+          "outputTokens": 192,
+          "cacheReadTokens": 1024,
+          "cacheWriteTokens": 0,
+          "totalTokens": 1481
+        }
+      },
+      {
+        "seq": 4,
+        "usage": {
+          "inputTokens": 157,
+          "outputTokens": 314,
+          "cacheReadTokens": 1024,
+          "cacheWriteTokens": 0,
+          "totalTokens": 1495
+        }
+      },
+      {
+        "seq": 5,
+        "usage": {
+          "inputTokens": 315,
+          "outputTokens": 312,
+          "cacheReadTokens": 1024,
+          "cacheWriteTokens": 0,
+          "totalTokens": 1651
+        }
+      },
+      {
+        "seq": 6,
+        "usage": {
+          "inputTokens": 646,
+          "outputTokens": 518,
+          "cacheReadTokens": 1024,
+          "cacheWriteTokens": 0,
+          "totalTokens": 2188
+        }
+      },
+      {
+        "seq": 7,
+        "usage": {
+          "inputTokens": 180,
+          "outputTokens": 127,
+          "cacheReadTokens": 1024,
+          "cacheWriteTokens": 0,
+          "totalTokens": 1331
+        }
+      },
+      {
+        "seq": 8,
+        "usage": {
+          "inputTokens": 136,
+          "outputTokens": 189,
+          "cacheReadTokens": 1024,
+          "cacheWriteTokens": 0,
+          "totalTokens": 1349
+        }
+      }
+    ],
+    "sourceNote": "E3 �ھ���input=uncached+cacheRead+cacheWrite��usage ԭ����������"
+  },
+  "M3_injectedRatio": {
+    "injected": 14,
+    "produced": 7,
+    "injectedRatio": 2,
+    "source": "driver snapshot��Ȩ����"
+  },
+  "M4_prefix": {
+    "sequence": [
+      {
+        "seq": 1,
+        "fullHash": "063ccef48ca01b0f",
+        "commonPrefixBytesWithPrev": null,
+        "identicalToPrev": false
+      },
+      {
+        "seq": 2,
+        "fullHash": "094775a01fc13dfa",
+        "commonPrefixBytesWithPrev": 2210,
+        "identicalToPrev": false
+      },
+      {
+        "seq": 3,
+        "fullHash": "3e904f5eb369d8ff",
+        "commonPrefixBytesWithPrev": 2374,
+        "identicalToPrev": false
+      },
+      {
+        "seq": 4,
+        "fullHash": "d7ed7cf323dfb46d",
+        "commonPrefixBytesWithPrev": 2498,
+        "identicalToPrev": false
+      },
+      {
+        "seq": 5,
+        "fullHash": "94c27897b3d1d1d1",
+        "commonPrefixBytesWithPrev": 2488,
+        "identicalToPrev": false
+      },
+      {
+        "seq": 6,
+        "fullHash": "dea23f2c1a131551",
+        "commonPrefixBytesWithPrev": 2593,
+        "identicalToPrev": false
+      },
+      {
+        "seq": 7,
+        "fullHash": "8a63f3a92652d60c",
+        "commonPrefixBytesWithPrev": 2593,
+        "identicalToPrev": false
+      },
+      {
+        "seq": 8,
+        "fullHash": "0451b2a6a51f67c8",
+        "commonPrefixBytesWithPrev": 2593,
+        "identicalToPrev": false
+      }
+    ],
+    "monotonicNote": "������ fullHash Ӧ������ͬ��׷��ʽ��ʷ����commonPrefixBytesWithPrev ��ӳǰ׺����Ǳ��",
+    "cachedFieldsEvidence": "probe usage ԭ�ĺ� cache �ֶ�"
+  },
+  "modelConfig": [],
+  "checks": [
+    {
+      "kind": "exists",
+      "path": "out/summary.md",
+      "pass": true
+    },
+    {
+      "kind": "contains",
+      "path": "out/summary.md",
+      "text": "7770",
+      "pass": true
+    },
+    {
+      "kind": "final-contains",
+      "text": "7770",
+      "pass": true,
+      "evidence": "\n\n<tf-read path=\"data/sales-q1.csv\" id=\"r1\"/>\n\n<tf-bash cmd=\"Get-Content data/sales-q1.csv | Select-Object -First 5\" id=\"b0\"/>\n\n<tf-peek handle=\"obs:read:r1@v1\" from_line=\"1\" to_line=\"50\" depends_on=\"r1\" id=\"p1\"/>\n\n\n<tf-bash cmd=\"node -e &quot;const fs=require('fs');const L=fs.readFileSync('data/sales-q1.csv','utf8').trim().split(/\\r?\\n/).slice(1);let s=0;for(const l of L){s+=Number(l.split(',')[1"
+    }
+  ],
+  "checksPass": true,
+  "sessionArchived": {
+    "archived": true,
+    "sessionDir": "C:\\Users\\79416\\.dsh\\sessions\\--D-AIagentoutput-zcode-010-harness-dsh-stream-agent-plugin-dsh-stream-agent-eval-runs-2026-11-15-v02-stream-C1-ws--\\session-a245628d-a101-4c24-b2db-71d7815f5196",
+    "copiedBytes": 12471
+  },
+  "replay": {
+    "opsReplayed": 0,
+    "skipped": [],
+    "errors": [],
+    "replRoot": "6cd7edb2ffea10fe27c95e0e198898924fcefd7e6e900c17c2fdd3307c025d6d",
+    "wsRoot": "87461b049fe8d4f1e319a00d96920a3aa8970591e608495e9de7262d6df29485",
+    "pass": false,
+    "note": "提取零写入操作：回放不可得（如实标注，不假装通过）"
+  }
+}

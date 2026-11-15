@@ -1,0 +1,11 @@
+{
+  "name": "fault-midstream-abort",
+  "match": { "promptIncludes": "故障注入：流中断" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "开始写文件，然后流会突然中断。\n" },
+    { "type": "commands", "commands": ["tf-write a.txt \"A\""] },
+    { "type": "waitTools", "count": 1, "timeoutMs": 5000 },
+    { "type": "fail", "mode": "midstream_abort" }
+  ]
+}

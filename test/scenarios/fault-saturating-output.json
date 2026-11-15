@@ -1,0 +1,9 @@
+{
+  "name": "fault-saturating-output",
+  "match": { "promptIncludes": "故障注入：饱和输出" },
+  "chunking": { "charsPerChunk": 512, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "开始无限制输出，直到消费方按预算掐断。\n" },
+    { "type": "fail", "mode": "saturating_output", "maxChars": 4000000 }
+  ]
+}

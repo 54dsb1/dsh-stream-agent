@@ -1,0 +1,10 @@
+{
+  "name": "recover-final",
+  "match": { "promptIncludes": "tf-stream:nudge" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "收到提醒，任务已完成，收尾。\n" },
+    { "type": "commands", "commands": ["<tf-final id=\"fr\" summary=\"收尾完成\"/>"] },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

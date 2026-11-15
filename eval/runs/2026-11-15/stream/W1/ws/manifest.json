@@ -1,0 +1,20 @@
+{
+  "root": "77f7c25fba321de5aa0e83c8ca75ee98de7f7aec78acc9b04ca71ead1f50c52d",
+  "files": [
+    {
+      "rel": "intro.md",
+      "size": 240,
+      "sha256": "ce481921a4dc893a98a860d618c6d00df8f2ff49fc8fa2684ad8b625594d0fe2"
+    },
+    {
+      "rel": "notes.md",
+      "size": 180,
+      "sha256": "6746de9e76a87ba244e5a2740adeac97d95202f82e07fefd53ecd28bf7740b0d"
+    },
+    {
+      "rel": "plan.md",
+      "size": 261,
+      "sha256": "ac82362f669ee208367b1ea8ae683472597fa6534601bae019430e7364cb9fad"
+    }
+  ]
+}

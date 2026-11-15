@@ -1,0 +1,35 @@
+{
+  "root": "050fcf32a86f6488c3f8a17bff9f022aa207270a10802a66fd90420b322c62e2",
+  "files": [
+    {
+      "rel": "chapters/ch01.md",
+      "size": 82,
+      "sha256": "4f81cf32e91bb87a2d16264152a6023739c76c02602e301769c493533cd76b8e"
+    },
+    {
+      "rel": "chapters/ch02.md",
+      "size": 82,
+      "sha256": "0f69ec846a84d2d3e33ae7072e4223ca6be3e450dcdcb0228bb8c5d5982b06f6"
+    },
+    {
+      "rel": "chapters/ch03.md",
+      "size": 70,
+      "sha256": "b518b500af336fd60aa6733b0c5f73c058d6f2fd50647a5686ce8457c0beadd7"
+    },
+    {
+      "rel": "chapters/ch04.md",
+      "size": 79,
+      "sha256": "70d8d5ee9acd4fdecd255c5f375a1803a14d5f7db79804c2c5fedbdf6b861b08"
+    },
+    {
+      "rel": "chapters/ch05.md",
+      "size": 58,
+      "sha256": "6b050bf5516504e028f08817186a89668992f414388c82cf940eb110d270239e"
+    },
+    {
+      "rel": "index.md",
+      "size": 166,
+      "sha256": "7d0b366a1830d21790df4f4c53257312c079692b13524def25026e3798b3d58e"
+    }
+  ]
+}

@@ -1,0 +1,1082 @@
+{
+  "sessionId": "session-d13a4669-216b-4245-8b19-d572d8c1dcb7",
+  "taskId": "session-d13a4669-216b-4245-8b19-d572d8c1dcb7",
+  "turn": 1,
+  "turnEndReason": {
+    "kind": "blocked",
+    "detail": "重入次数达到上限 8"
+  },
+  "requestCount": 9,
+  "usage": {
+    "inputTokens": 3756,
+    "outputTokens": 4550
+  },
+  "stableHashes": [
+    "ea16e6cb50977dc0e02ba31d95f1d4751c540714dc228833be7fa5149ee6634e",
+    "833373ed70e48185d9c2a93447fd15922755914128fd428bbde8f952026cc34d",
+    "20ea68dca751265a2813dbdc5825131eb36afce13c4f3f18cd449e77c18071d0",
+    "73c9b6757c6c84c16211574f82a544dd120b7031854b304aff064dc913d04018",
+    "6776abe0feb9c1ce7089cc6da7444101007abfc0ef11534834018ea5e007b70c",
+    "84910b880c25b3d08c051226aa678790ddfc8a2bcdd37f9f58b5da791bd966e4",
+    "655e3e1473244becd243f65573162843ab32c9dccaf02e9e3949ef6769ad92a9",
+    "8dba4b50719875803e0f15b5e72bd5b4a4be833e88026cd92c353adbf5ce86a6",
+    "175f6d5e4fdd2702cf1d4a72d762d13c69e263f99e304eed51c8abf99816e7ea"
+  ],
+  "counters": {
+    "injected": 25,
+    "produced": 18,
+    "peeked": 8,
+    "injectedRatio": 1.3888888888888888
+  },
+  "records": [
+    {
+      "seq": 1,
+      "kind": "request",
+      "turn": 1,
+      "step": 1,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "ea16e6cb50977dc0e02ba31d95f1d4751c540714dc228833be7fa5149ee6634e",
+      "renderHash": "ea16e6cb50977dc0e02ba31d95f1d4751c540714dc228833be7fa5149ee6634e",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 2,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 3,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 4,
+      "kind": "command",
+      "id": "b1",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 5,
+      "kind": "command",
+      "id": "b1",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 6,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 156,
+      "outputTokens": 56
+    },
+    {
+      "seq": 7,
+      "kind": "observation",
+      "handle": "obs:bash:b1@v1",
+      "key": "Get-ChildItem -Recurse -File | Select-Object -ExpandProperty FullName",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 8,
+      "kind": "command",
+      "id": "b1",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\C2\\ws)"
+    },
+    {
+      "seq": 9,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "pipeline.yaml",
+      "infoGain": "high",
+      "reason": "first-observation:read"
+    },
+    {
+      "seq": 10,
+      "kind": "command",
+      "id": "r1",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "high",
+      "detail": "320 chars"
+    },
+    {
+      "seq": 11,
+      "kind": "request",
+      "turn": 1,
+      "step": 2,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "833373ed70e48185d9c2a93447fd15922755914128fd428bbde8f952026cc34d",
+      "renderHash": "22ff0c7af99c9b450825a21e88bcdb54c49f6175636298793936483eb64d9cb3",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 12,
+      "kind": "command",
+      "id": "r2",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 13,
+      "kind": "command",
+      "id": "r2",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 14,
+      "kind": "command",
+      "id": "b2",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 15,
+      "kind": "command",
+      "id": "b2",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 16,
+      "kind": "observation",
+      "handle": "obs:read:r2@v1",
+      "key": "data/missing-source.json",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 17,
+      "kind": "command",
+      "id": "r2",
+      "name": "tf-read",
+      "status": "failed",
+      "detail": "Error: cannot read \"D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\C2\\ws\\data\\missing-source.json\": not found"
+    },
+    {
+      "seq": 18,
+      "kind": "command",
+      "id": "p2",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 19,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 350,
+      "outputTokens": 196
+    },
+    {
+      "seq": 20,
+      "kind": "observation",
+      "handle": "obs:bash:b2@v1",
+      "key": "Test-Path data/missing-source.json; Get-ChildItem -Force out -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 21,
+      "kind": "command",
+      "id": "b2",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\C2\\ws)"
+    },
+    {
+      "seq": 22,
+      "kind": "command",
+      "id": "p2",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "依赖未满足：b2"
+    },
+    {
+      "seq": 23,
+      "kind": "request",
+      "turn": 1,
+      "step": 3,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "20ea68dca751265a2813dbdc5825131eb36afce13c4f3f18cd449e77c18071d0",
+      "renderHash": "195dccdb3a4b2b98e72df8047840d836ca3a5f088c760be898ea8042a303f955",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 24,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 25,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 26,
+      "kind": "command",
+      "id": "p1",
+      "name": "tf-peek",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "detail": "320 chars"
+    },
+    {
+      "seq": 27,
+      "kind": "command",
+      "id": "w3",
+      "name": "tf-write",
+      "status": "pending"
+    },
+    {
+      "seq": 28,
+      "kind": "command",
+      "id": "w3",
+      "name": "tf-write",
+      "status": "dispatched"
+    },
+    {
+      "seq": 29,
+      "kind": "command",
+      "id": "r4",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 30,
+      "kind": "command",
+      "id": "p5",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 31,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 385,
+      "outputTokens": 593
+    },
+    {
+      "seq": 32,
+      "kind": "observation",
+      "handle": "obs:write:w3@v1",
+      "key": "out/result.json",
+      "infoGain": "low",
+      "reason": "successful-write-receipt"
+    },
+    {
+      "seq": 33,
+      "kind": "command",
+      "id": "w3",
+      "name": "tf-write",
+      "status": "ok",
+      "handle": "obs:write:w3@v1",
+      "infoGain": "low",
+      "detail": "194 chars"
+    },
+    {
+      "seq": 34,
+      "kind": "command",
+      "id": "r4",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 35,
+      "kind": "observation",
+      "handle": "obs:read:r4@v2",
+      "key": "out/result.json",
+      "infoGain": "high",
+      "reason": "content-changed:read"
+    },
+    {
+      "seq": 36,
+      "kind": "command",
+      "id": "r4",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r4@v2",
+      "infoGain": "high",
+      "detail": "270 chars"
+    },
+    {
+      "seq": 37,
+      "kind": "command",
+      "id": "p5",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 38,
+      "kind": "command",
+      "id": "p5",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "unknown-handle:obs:read:r4@v1"
+    },
+    {
+      "seq": 39,
+      "kind": "request",
+      "turn": 1,
+      "step": 4,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "73c9b6757c6c84c16211574f82a544dd120b7031854b304aff064dc913d04018",
+      "renderHash": "b947a5dff9f2c927ed031a892ef5b0ad5f2bf0aa0b404bfd7c7587998bc963e8",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 40,
+      "kind": "command",
+      "id": "w2",
+      "name": "tf-write",
+      "status": "pending"
+    },
+    {
+      "seq": 41,
+      "kind": "command",
+      "id": "w2",
+      "name": "tf-write",
+      "status": "dispatched"
+    },
+    {
+      "seq": 42,
+      "kind": "command",
+      "id": "r5",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 43,
+      "kind": "command",
+      "id": "p6",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 44,
+      "kind": "command",
+      "id": "p7",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 45,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 481,
+      "outputTokens": 688
+    },
+    {
+      "seq": 46,
+      "kind": "observation",
+      "handle": "obs:write:w2@v3",
+      "key": "out/result.json",
+      "infoGain": "low",
+      "reason": "successful-write-receipt"
+    },
+    {
+      "seq": 47,
+      "kind": "command",
+      "id": "w2",
+      "name": "tf-write",
+      "status": "ok",
+      "handle": "obs:write:w2@v3",
+      "infoGain": "low",
+      "detail": "194 chars"
+    },
+    {
+      "seq": 48,
+      "kind": "command",
+      "id": "r5",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 49,
+      "kind": "command",
+      "id": "p6",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 50,
+      "kind": "command",
+      "id": "p6",
+      "name": "tf-peek",
+      "status": "ok",
+      "handle": "obs:bash:b1@v1",
+      "detail": "172 chars"
+    },
+    {
+      "seq": 51,
+      "kind": "command",
+      "id": "p7",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 52,
+      "kind": "command",
+      "id": "p7",
+      "name": "tf-peek",
+      "status": "ok",
+      "handle": "obs:bash:b2@v1",
+      "detail": "172 chars"
+    },
+    {
+      "seq": 53,
+      "kind": "observation",
+      "handle": "obs:read:r5@v4",
+      "key": "out/result.json",
+      "infoGain": "high",
+      "reason": "content-changed:read"
+    },
+    {
+      "seq": 54,
+      "kind": "command",
+      "id": "r5",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r5@v4",
+      "infoGain": "high",
+      "detail": "270 chars"
+    },
+    {
+      "seq": 55,
+      "kind": "request",
+      "turn": 1,
+      "step": 5,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "6776abe0feb9c1ce7089cc6da7444101007abfc0ef11534834018ea5e007b70c",
+      "renderHash": "f2319b6910e7c7b77540998b9f73b113a01cef9c77c38098a81a00fa2b63ce66",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 56,
+      "kind": "command",
+      "id": "r10",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 57,
+      "kind": "command",
+      "id": "r10",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 58,
+      "kind": "command",
+      "id": "r11",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 59,
+      "kind": "command",
+      "id": "r11",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 60,
+      "kind": "command",
+      "id": "p10",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 61,
+      "kind": "observation",
+      "handle": "obs:read:r11@v2",
+      "key": "data/missing-source.json",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 62,
+      "kind": "command",
+      "id": "r11",
+      "name": "tf-read",
+      "status": "failed",
+      "detail": "Error: cannot read \"D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\C2\\ws\\data\\missing-source.json\": not found"
+    },
+    {
+      "seq": 63,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "pipeline.yaml",
+      "infoGain": "none",
+      "reason": "duplicate-observation"
+    },
+    {
+      "seq": 64,
+      "kind": "command",
+      "id": "r10",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "none",
+      "detail": "320 chars"
+    },
+    {
+      "seq": 65,
+      "kind": "malformed",
+      "raw": "<tf-final id=\"f1\" summary=\"source 缺失：data/missing-source.json 不存在，无法按 pipeline.yaml 声明的 source 读取；已按兜底方案将 out/result.json 写入 {'status': 'fallback', 'reason': 'source missing'}（当前文件内容确认：{\"status\": \"fallback\", \"reason\": \"source missing\"}）。\"/>",
+      "reason": "bad-attribute-syntax:status\": \"fallback\","
+    },
+    {
+      "seq": 66,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 467,
+      "outputTokens": 1535
+    },
+    {
+      "seq": 67,
+      "kind": "command",
+      "id": "p10",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "依赖未满足：r11"
+    },
+    {
+      "seq": 68,
+      "kind": "request",
+      "turn": 1,
+      "step": 6,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "84910b880c25b3d08c051226aa678790ddfc8a2bcdd37f9f58b5da791bd966e4",
+      "renderHash": "3cb6ff770d9bb3a6af3895ba97ec364cf3f9ed65f291e0941ffd67eaca08b30c",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 69,
+      "kind": "command",
+      "id": "r20",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 70,
+      "kind": "command",
+      "id": "r20",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 71,
+      "kind": "command",
+      "id": "b20",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 72,
+      "kind": "command",
+      "id": "b20",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 73,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "pipeline.yaml",
+      "infoGain": "none",
+      "reason": "duplicate-observation"
+    },
+    {
+      "seq": 74,
+      "kind": "command",
+      "id": "r20",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "none",
+      "detail": "320 chars"
+    },
+    {
+      "seq": 75,
+      "kind": "command",
+      "id": "p20",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 76,
+      "kind": "command",
+      "id": "p20",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 77,
+      "kind": "command",
+      "id": "p20",
+      "name": "tf-peek",
+      "status": "dispatched",
+      "detail": "deferred: handle 未就绪，流末重试"
+    },
+    {
+      "seq": 78,
+      "kind": "command",
+      "id": "p21",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 79,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 330,
+      "outputTokens": 345
+    },
+    {
+      "seq": 80,
+      "kind": "observation",
+      "handle": "obs:bash:b20@v1",
+      "key": "Get-ChildItem -Recurse -Force | Select-Object FullName; Write-Output '---'; if (Test-Path 'data/missing-source.json') { 'SOURCE_EXISTS' } else { 'SOURCE_MISSING' }",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 81,
+      "kind": "command",
+      "id": "b20",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\C2\\ws)"
+    },
+    {
+      "seq": 82,
+      "kind": "command",
+      "id": "p20",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "unknown-handle:obs:read:r20@v1"
+    },
+    {
+      "seq": 83,
+      "kind": "command",
+      "id": "p21",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "依赖未满足：b20"
+    },
+    {
+      "seq": 84,
+      "kind": "request",
+      "turn": 1,
+      "step": 7,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "655e3e1473244becd243f65573162843ab32c9dccaf02e9e3949ef6769ad92a9",
+      "renderHash": "99a948600f331c2fb8930bddb203af31efcd7b2aa0ba5b4d2fc8673727c724fe",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 85,
+      "kind": "command",
+      "id": "r30",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 86,
+      "kind": "command",
+      "id": "r30",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 87,
+      "kind": "command",
+      "id": "b30",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 88,
+      "kind": "command",
+      "id": "b30",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 89,
+      "kind": "command",
+      "id": "b31",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 90,
+      "kind": "command",
+      "id": "b31",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 91,
+      "kind": "command",
+      "id": "p30",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 92,
+      "kind": "command",
+      "id": "p31",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 93,
+      "kind": "command",
+      "id": "p32",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 94,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 485,
+      "outputTokens": 406
+    },
+    {
+      "seq": 95,
+      "kind": "observation",
+      "handle": "obs:bash:b30@v1",
+      "key": "if (Test-Path 'data/missing-source.json') { 'SOURCE_EXISTS' } else { 'SOURCE_MISSING' }",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 96,
+      "kind": "command",
+      "id": "b30",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\C2\\ws)"
+    },
+    {
+      "seq": 97,
+      "kind": "observation",
+      "handle": "obs:bash:b31@v1",
+      "key": "Get-ChildItem -Force -Name",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 98,
+      "kind": "command",
+      "id": "b31",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\C2\\ws)"
+    },
+    {
+      "seq": 99,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "pipeline.yaml",
+      "infoGain": "none",
+      "reason": "duplicate-observation"
+    },
+    {
+      "seq": 100,
+      "kind": "command",
+      "id": "r30",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "none",
+      "detail": "320 chars"
+    },
+    {
+      "seq": 101,
+      "kind": "command",
+      "id": "p30",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 102,
+      "kind": "command",
+      "id": "p30",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "unknown-handle:obs:read:r30@v1"
+    },
+    {
+      "seq": 103,
+      "kind": "command",
+      "id": "p31",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "依赖未满足：b30"
+    },
+    {
+      "seq": 104,
+      "kind": "command",
+      "id": "p32",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "依赖未满足：b31"
+    },
+    {
+      "seq": 105,
+      "kind": "request",
+      "turn": 1,
+      "step": 8,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "8dba4b50719875803e0f15b5e72bd5b4a4be833e88026cd92c353adbf5ce86a6",
+      "renderHash": "59cb6c23f14a649fa77ebaa699e5e7f42e0401ca1f595f3f867208e26dce2f9d",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 106,
+      "kind": "command",
+      "id": "r40",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 107,
+      "kind": "command",
+      "id": "r40",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 108,
+      "kind": "command",
+      "id": "r41",
+      "name": "tf-read",
+      "status": "pending"
+    },
+    {
+      "seq": 109,
+      "kind": "command",
+      "id": "r41",
+      "name": "tf-read",
+      "status": "dispatched"
+    },
+    {
+      "seq": 110,
+      "kind": "command",
+      "id": "p40",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 111,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 663,
+      "outputTokens": 381
+    },
+    {
+      "seq": 112,
+      "kind": "observation",
+      "handle": "obs:read:r1@v1",
+      "key": "pipeline.yaml",
+      "infoGain": "none",
+      "reason": "duplicate-observation"
+    },
+    {
+      "seq": 113,
+      "kind": "command",
+      "id": "r40",
+      "name": "tf-read",
+      "status": "ok",
+      "handle": "obs:read:r1@v1",
+      "infoGain": "none",
+      "detail": "320 chars"
+    },
+    {
+      "seq": 114,
+      "kind": "command",
+      "id": "p40",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 115,
+      "kind": "command",
+      "id": "p40",
+      "name": "tf-peek",
+      "status": "dispatched",
+      "detail": "deferred: handle 未就绪，流末重试"
+    },
+    {
+      "seq": 116,
+      "kind": "observation",
+      "handle": "obs:read:r41@v3",
+      "key": "data/missing-source.json",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 117,
+      "kind": "command",
+      "id": "r41",
+      "name": "tf-read",
+      "status": "failed",
+      "detail": "Error: cannot read \"D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\C2\\ws\\data\\missing-source.json\": not found"
+    },
+    {
+      "seq": 118,
+      "kind": "command",
+      "id": "p40",
+      "name": "tf-peek",
+      "status": "failed",
+      "detail": "unknown-handle:obs:read:r40@v1"
+    },
+    {
+      "seq": 119,
+      "kind": "request",
+      "turn": 1,
+      "step": 9,
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "level": "normal",
+      "stableHash": "175f6d5e4fdd2702cf1d4a72d762d13c69e263f99e304eed51c8abf99816e7ea",
+      "renderHash": "1d8ca556c7d8bb94c3fb4525414f9ec056038af09262181607d2fec90e4a8021",
+      "injectionBlocks": 0
+    },
+    {
+      "seq": 120,
+      "kind": "command",
+      "id": "b50",
+      "name": "tf-bash",
+      "status": "pending"
+    },
+    {
+      "seq": 121,
+      "kind": "command",
+      "id": "b50",
+      "name": "tf-bash",
+      "status": "dispatched"
+    },
+    {
+      "seq": 122,
+      "kind": "malformed",
+      "raw": "<tf-bash cmd=\"powershell -NoProfile -Command \\\"Test-Path data/missing-source.json\\\"\" id=\"b51\"/>",
+      "reason": "bad-attribute-syntax:Test-Path data/missi"
+    },
+    {
+      "seq": 123,
+      "kind": "observation",
+      "handle": "obs:bash:b50@v1",
+      "key": "Get-ChildItem -Force | Select-Object Name; Write-Output '--- yaml ---'; if (Test-Path pipeline.yaml) { Get-Content pipeline.yaml } else { 'NO pipeline.yaml' }; Write-Output '--- data ---'; if (Test-Path data) { Get-ChildItem -Force data | Select-Object Name } else { 'NO data dir' }; Write-Output '--- out ---'; if (Test-Path out) { Get-ChildItem -Force out | Select-Object Name } else { 'NO out dir' }",
+      "infoGain": "high",
+      "reason": "execution-failure"
+    },
+    {
+      "seq": 124,
+      "kind": "command",
+      "id": "b50",
+      "name": "tf-bash",
+      "status": "failed",
+      "detail": "Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\\AIagentoutput\\zcode\\010-harness\\dsh-stream-agent-plugin\\dsh-stream-agent\\eval\\runs\\2026-11-15-v02\\stream\\C2\\ws)"
+    },
+    {
+      "seq": 125,
+      "kind": "command",
+      "id": "p50",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 126,
+      "kind": "command",
+      "id": "p50",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 127,
+      "kind": "command",
+      "id": "p50",
+      "name": "tf-peek",
+      "status": "ok",
+      "handle": "obs:bash:b20@v1",
+      "detail": "172 chars"
+    },
+    {
+      "seq": 128,
+      "kind": "command",
+      "id": "p51",
+      "name": "tf-peek",
+      "status": "pending"
+    },
+    {
+      "seq": 129,
+      "kind": "command",
+      "id": "p51",
+      "name": "tf-peek",
+      "status": "dispatched"
+    },
+    {
+      "seq": 130,
+      "kind": "command",
+      "id": "p51",
+      "name": "tf-peek",
+      "status": "ok",
+      "handle": "obs:bash:b30@v1",
+      "detail": "172 chars"
+    },
+    {
+      "seq": 131,
+      "kind": "usage",
+      "turn": 1,
+      "inputTokens": 439,
+      "outputTokens": 350
+    },
+    {
+      "seq": 132,
+      "kind": "fault",
+      "fault": "turn-blocked",
+      "detail": "重入次数达到上限 8"
+    },
+    {
+      "seq": 133,
+      "kind": "turn-end",
+      "reason": {
+        "kind": "blocked",
+        "detail": "重入次数达到上限 8"
+      }
+    }
+  ]
+}

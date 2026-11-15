@@ -1,0 +1,17 @@
+{
+  "name": "reroute-first",
+  "match": { "promptIncludes": "改道演练" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "开始写文件，其中一个目标会失败。\n" },
+    {
+      "type": "commands",
+      "commands": [
+        "<tf-write path=\"a.txt\" id=\"wa\">A</tf-write>",
+        "<tf-write path=\"fail.txt\" id=\"wf\">F</tf-write>"
+      ]
+    },
+    { "type": "waitTools", "count": 2, "timeoutMs": 5000 },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

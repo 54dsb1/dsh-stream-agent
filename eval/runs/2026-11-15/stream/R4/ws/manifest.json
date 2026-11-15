@@ -1,0 +1,30 @@
+{
+  "root": "9a5d830deb6bdf4ddf0b813824455830290a7118e3a7fd8d54b333e8163e02cd",
+  "files": [
+    {
+      "rel": "compute.js",
+      "size": 1073,
+      "sha256": "99ec205ca3df1c3d82a0b3bc6edf7cd7d68005baf297189756be970b615526d6"
+    },
+    {
+      "rel": "compute2.js",
+      "size": 860,
+      "sha256": "015cc916e03c8055a4e7be98bac8dd7bd9e7776766fce2c9813fa684d5980f24"
+    },
+    {
+      "rel": "data/users-roster.json",
+      "size": 4790,
+      "sha256": "d238054b30bc5176fa8af02d7927e642fa2ff4422392dddfeaa9474d4bd4a6ef"
+    },
+    {
+      "rel": "data/users-scores.json",
+      "size": 232,
+      "sha256": "4dd6e57508c61302aecd38c527b732610e6abe94b814329417283b9e17eb0dbd"
+    },
+    {
+      "rel": "work/find.js",
+      "size": 580,
+      "sha256": "fc0cd2762aa56e832bbb7de16839b3a2b8a0ef8a7ce4fd7e7f3e828b6ed15330"
+    }
+  ]
+}

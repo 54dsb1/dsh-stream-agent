@@ -1,0 +1,10 @@
+{
+  "name": "peek-third",
+  "match": { "promptIncludes": "tf-stream:peek" },
+  "chunking": { "charsPerChunk": 0, "delayMs": 0 },
+  "steps": [
+    { "type": "text", "text": "细节到手，收尾。\n" },
+    { "type": "commands", "commands": ["<tf-final id=\"fp\" summary=\"句柄演练完成\"/>"] },
+    { "type": "finish", "reason": "stop" }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "root": "87461b049fe8d4f1e319a00d96920a3aa8970591e608495e9de7262d6df29485",
+  "files": [
+    {
+      "rel": "data/sales-q1.csv",
+      "size": 674,
+      "sha256": "d325b8be593823fe088e38c690a3fe380fef8cdc067cf38cb9e2cfa41daacc15"
+    },
+    {
+      "rel": "out/summary.md",
+      "size": 92,
+      "sha256": "8fb4519434fa6db422e81030e3b9191bad7982c496121f41f2c158a84e4549a0"
+    }
+  ]
+}
