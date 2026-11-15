@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # 零 npm 依赖：不需要 install，node:test 直接跑 .ts（原生类型擦除）
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # 关键不变量：dist/ 是提交进仓库的发布产物，patch 直接引用 ./dist/entry/*.js。
+      # 源码改动后忘记重建 dist 会让安装到的版本静默落后于源码，这里直接拦下。
+      - name: dist 与 src 同步
+        run: git diff --exit-code -- dist

@@ -1,4 +1,0 @@
-# deploy.yaml (fixture)
-service: platform
-revision: 9
-replicas: 2

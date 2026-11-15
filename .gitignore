@@ -1,0 +1,28 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 发布产物
+*.tgz
+
+# 评测运行产物
+#   判定批次 2026-11-15-v02 是 eval/RESULTS.md 的唯一数据源，入库作为证据链；
+#   迭代/调试批次（probe-*、smoke-*、同日早期轮次）不入库，避免模型现场生成的临时脚本污染仓库。
+eval/runs/*
+!eval/runs/2026-11-15-v02/
+
+# 测试覆盖
+coverage/
+.nyc_output/
+
+# 本地环境与凭据
+.env
+.env.*
+!.env.example
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

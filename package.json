@@ -4,6 +4,24 @@
   "license": "Apache-2.0",
   "type": "module",
   "description": "单流协议 DSH 插件：内核层零框架依赖，适配层接入 @deepseek-ai/dsh",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "ai-agent",
+    "token-optimization",
+    "single-stream"
+  ],
+  "author": "54dsb1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/54dsb1/dsh-stream-agent.git"
+  },
+  "homepage": "https://github.com/54dsb1/dsh-stream-agent#readme",
+  "bugs": {
+    "url": "https://github.com/54dsb1/dsh-stream-agent/issues"
+  },
   "main": "./dist/entry/loop.js",
   "exports": {
     ".": "./dist/entry/loop.js",
@@ -40,6 +58,7 @@
     "patch-adapters-smoke.yml",
     "patch-eval-baseline.yml",
     "patch-eval-stream.yml",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ]
 }
