@@ -1,10 +1,12 @@
 # @54dsb1/dsh-stream-agent
 
-> **v0.1.0 —— 首个公开发布版本**（单文件交付全部特性：单流协议内核 + O1–O6 token 优化 + 上游语义对齐 + 桌面端/web 组合适配）。
+**再次感谢muxueqingze大佬开源的项目xuxiang-thinkflow项目，本项目基于此将大部分内容转化为deepseekharness插件**
+
+> v0.1.0 ——
 >
-> **单流协议 DSH 插件**：把"模型看到什么、何时被打断"从回合制改成单流协议——不重训模型。
+> **单流协议 DSH 插件**：把"模型看到什么、何时被打断"从回合制改成单流协议。
 >
-> 上游锚点：`@deepseek-ai/dsh@0.2.2-rc.1`（类型）/ 0.2.2-rc.3（运行时实测，含桌面客户端）。Node ≥ 24，零 npm 依赖。
+> 0.2.2-rc.3（运行时实测，含桌面客户端）。Node ≥ 24，零 npm 依赖。
 > 上游对照项目：[muxueqingze/xuxiang-thinkflow](https://github.com/muxueqingze/xuxiang-thinkflow)（tf-\* 流式命令、成功不回灌、失败才打断的同源理念），本包在其 v0.10.0 设计基础上独立实现并做了驱动器级闭环。
 
 ## 命题与状态
@@ -209,25 +211,22 @@ stream.call / stream.finish）。
 
 ## 已知限制（如实声明）
 
-1. **R2（跨文件改配置）FAIL**：唯一未通过项。模型在 8 次请求内未把三个 yaml 的
-   revision 改动正确落地——需要精确 edit 语义（上游的"受保护写入 + 精确 edit"路线，
-   下一步方向）。
-2. **W1/C2 exit=1 但 checks PASS**：重入预算内未收敛（写批任务模型利用完整反馈做读写回验，
+1. **W1/C2 exit=1 但 checks PASS**：重入预算内未收敛（写批任务模型利用完整反馈做读写回验，
    9 次请求烧到护栏），产物正确但回合判定 blocked——防荡护栏语义如实计入。
-3. **写批任务 token 偏重**：完整反馈 + 回验循环换正确性的显式取舍；读查/复合任务全面改善。
-4. **M5 回放一致性 FAIL（工具缺陷）**：replay 提取器对真连 session log 0 命中（smoke 造数
+2. **写批任务 token 偏重**：完整反馈 + 回验循环换正确性的显式取舍；读查/复合任务全面改善。
+3. **M5 回放一致性 FAIL（工具缺陷）**：replay 提取器对真连 session log 0 命中（smoke 造数
    双场景验证过、真连 zstd 格式失效）——如实标注，不是回放机制本体失败。
-5. **plugin record ledger 通道降级**：bundle 安装形态 bare import `@deepseek-ai/dsh-session`
+4. **plugin record ledger 通道降级**：bundle 安装形态 bare import `@deepseek-ai/dsh-session`
    不可达宿主模块实例 → 按设计降级内存台账（有 stderr 告警非静默；降级代价 = resume 后
    tf-\* 状态不可重放，session log 仍有 turn/step/assistant 事件）。
-6. **headless profile 需补挂 storage backend**（`@deepseek-ai/dsh-storage-json`），否则持久层
+5. **headless profile 需补挂 storage backend**（`@deepseek-ai/dsh-storage-json`），否则持久层
    降级内存（bundle 形态实测同此）。
-7. **injected_ratio 语义注意**：驱动器 snapshot 计数在 peek/完整反馈场景偏大或偏小
+6. **injected_ratio 语义注意**：驱动器 snapshot 计数在 peek/完整反馈场景偏大或偏小
    ——口径为 06 驱动器 snapshot 权威值，如实照登。
-8. `dsh plugin add` 依赖 pnpm（PATH 中有 `pnpm`，或按 dsh-plugin-manager 配置 `pnpmCommand`）。
-9. **pwsh sandbox ACL**：部分目录下 tf-bash 受 DSH 沙箱 grant 失败（Win32 5）——基线臂同样
+7. `dsh plugin add` 依赖 pnpm（PATH 中有 `pnpm`，或按 dsh-plugin-manager 配置 `pnpmCommand`）。
+8. **pwsh sandbox ACL**：部分目录下 tf-bash 受 DSH 沙箱 grant 失败（Win32 5）——基线臂同样
    受限，环境因素非本插件缺陷。
-10. **steer 语义偏离**：内建 steer 注入运行中回合的下一步；本实现插队到队首、在回合边界生效
+9. **steer 语义偏离**：内建 steer 注入运行中回合的下一步；本实现插队到队首、在回合边界生效
     （单流协议"流内不打断"），桌面端已如实声明。
 
 ## 红线（架构约束，也是贡献者须知）
