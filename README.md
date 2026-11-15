@@ -3,6 +3,8 @@
 [![ci](https://github.com/54dsb1/dsh-stream-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/54dsb1/dsh-stream-agent/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
+简体中文 | [English](./README.en.md)
+
 **给 DeepSeek Harness 换一颗单流的心。** 把"模型看到什么、何时被打断"从回合制改成单流协议：一次请求内写完全部操作命令，边流边执行，只在真正需要信息时才发下一次请求。
 
 真连实测（10 任务、两臂同模型 `deepseek-flash`）：**token 用量降到原生 loop 的 28.9%，任务正确性持平（10/10）**。
@@ -13,7 +15,7 @@
 | 依赖 | 零 npm 依赖；Node ≥ 22.18（原生类型擦除） |
 | 测试 | 187 用例全绿，零 API 调用（mock 全链路 + 20 个场景） |
 | 形态 | 单个 bundle 包，`dsh plugin add` 一条命令装卸，卸载即回原生 loop |
-| 发布 | 尚未发布到 npm —— 当前用本地路径安装（见下） |
+| 发布 | npm [`@hugesb/dsh-stream-agent`](https://www.npmjs.com/package/@hugesb/dsh-stream-agent) · GitHub [Releases](https://github.com/54dsb1/dsh-stream-agent/releases) |
 
 ---
 
@@ -33,16 +35,18 @@
 
 ```bash
 # 方式一：bundle 安装（推荐，进 profile，重启后生效）
-dsh plugin --profile headless add /绝对路径/dsh-stream-agent
+dsh plugin --profile headless add @hugesb/dsh-stream-agent
 
 # 方式二：临时叠加（开发/验证用，不进 profile，命令结束即失效）
-dsh --profile headless --patch /绝对路径/patches/takeover.yml headless "你的任务"
+dsh --profile headless --patch ./patches/takeover.yml headless "你的任务"
 
 # 方式三：桌面客户端（装入 desktop profile 后重启客户端，bundle 无 HMR）
-dsh plugin --profile desktop add /绝对路径/dsh-stream-agent
+dsh plugin --profile desktop add @hugesb/dsh-stream-agent
 ```
 
-卸载：`dsh plugin --profile <name> remove @54dsb1/dsh-stream-agent`，或不挂 patch——接管层整体消失，回到原生行为，零残留。
+离线或改本地源码时，把上面两处包名换成仓库绝对路径即可（`dsh plugin add /绝对路径/dsh-stream-agent`）。
+
+卸载：`dsh plugin --profile <name> remove @hugesb/dsh-stream-agent`，或不挂 patch——接管层整体消失，回到原生行为，零残留。
 
 > `dsh plugin` 依赖 `pnpm` 在 PATH 中（或按你的 dsh-plugin-manager 配置 `pnpmCommand`）。
 
@@ -149,6 +153,14 @@ node eval/tools/gen-results.cjs --stamp <YYYY-MM-DD>   # 重算 eval/RESULTS.md 
 2. **`steer` 语义偏离内建** —— 本实现插队到队首、在回合边界生效（单流"流内不打断"），不是注入运行中回合的下一步。
 3. **持久化依赖宿主 storage** —— headless 未挂 storage backend 时按设计降级内存（功能不损，跨会话 resume 不可用）；补 `@deepseek-ai/dsh-storage-json` 即恢复。
 4. **bundle 形态下 plugin record 通道可能降级** —— 宿主模块不可达时降级内存台账（stderr 告警，不静默），代价是 resume 后 `tf-*` 状态不可重放。
+
+## 更新日志
+
+完整记录见 [`CHANGELOG.md`](CHANGELOG.md)（遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)）。
+
+| 版本 | 日期 | 要点 |
+|---|---|---|
+| 0.1.0 | 2026-11-15 | 首个可安装版本：单流内核（`tf-*` 五命令）+ O1–O6 token 优化 + 上游语义对齐（隐式写序 / 幂等 id / 乐观 peek / resume 对账）+ 桌面端 Electron 真连适配。真连实测 28.9% / checks 10/10。 |
 
 ## 致谢
 

@@ -1,6 +1,6 @@
 {
-  "name": "@54dsb1/dsh-stream-agent",
-  "version": "0.1.0",
+  "name": "@hugesb/dsh-stream-agent",
+  "version": "0.1.1",
   "license": "Apache-2.0",
   "type": "module",
   "description": "单流协议 DSH 插件：内核层零框架依赖，适配层接入 @deepseek-ai/dsh",
@@ -29,7 +29,9 @@
   },
   "scripts": {
     "test": "node --test \"test/*.test.ts\" \"test/kernel/*.test.ts\"",
-    "build": "node scripts/build.mjs"
+    "build": "node scripts/build.mjs",
+    "release": "node scripts/release.mjs",
+    "release:dry": "node scripts/release.mjs --dry-run"
   },
   "engines": {
     "node": ">=22.18",
@@ -44,6 +46,7 @@
   "files": [
     "LICENSE",
     "README.md",
+    "README.en.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "dist/",

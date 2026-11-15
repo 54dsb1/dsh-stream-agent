@@ -4,7 +4,7 @@
 
 ```
                   ┌──────────────────────────────────────────────┐
-                  │            @54dsb1/dsh-stream-agent          │
+                  │            @hugesb/dsh-stream-agent          │
   DSH 宿主        │  ┌──── 内核层（零框架依赖，纯函数 + 内存态）──┐ │
   ┌────────┐      │  │  kernel/state.ts    内容寻址状态树 + 句柄  │ │
   │ Cordis │ 注入 │  │  kernel/obs.ts      info_gain 分类 + 账本  │ │

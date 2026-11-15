@@ -1561,6 +1561,11 @@ export interface StreamLoopAgentDeps {
    * 与 agent.ctx 服务面（dsh-working-directory/lib/index.js:97 实证）。缺省 = 工具批
    * 不带 agent（独立执行），fs 工具的 session 解析会失败——2026-11-15 真连 W1 教训。 */
   ctx?: unknown;
+  /** 宿主同源 dsh-scope 模块（桌面端）：构造时以 agent 实例本身为 key 铸造作用域——
+   *  镜像内建 createScope(loopCtx, this)；宿主工具执行器 selectExecutor(input.agent) 与
+   *  守卫 chainLayers(exec.agent) 按 scopeChainOf(agent) 选层，key 不是 agent 实例时
+   *  preset 层工具（write/edit/pwsh）永远解析不到。缺省（headless/fake host）不铸造。 */
+  scopeModule?: DshScopeLike;
   onWarning?: (message: string, detail?: unknown) => void;
 }
 
@@ -1582,16 +1587,33 @@ export class StreamLoopAgent {
   #running: Promise<void> | undefined;
   #cancelCause: { cause: unknown; keepInbox: boolean } | undefined;
   #selection: { provider: string; model: string; reasoningEffort?: string };
+  #disposeScope: (() => Promise<void>) | undefined;
   #disposed = false;
 
   constructor(deps: StreamLoopAgentDeps) {
     this.id = deps.id;
     this.session = deps.session;
-    this.ctx = deps.ctx;
     this.#driver = deps.driver;
     this.#storedHandle = deps.storedHandle;
     this.#warning = deps.onWarning ?? (() => {});
     this.#selection = deps.modelSelection ?? { provider: '', model: '' };
+    // 作用域 key = agent 实例本身（镜像内建 createScope(loopCtx, this)）。宿主工具执行器
+    // selectExecutor(input.agent) 与守卫 chainLayers(exec.agent) 都按 scopeChainOf(agent)
+    // 选层（dsh-tools / dsh-tools-guards rc.3）：key 用别的对象时永远解析到根层——
+    // desktop/web 组合的根层没有 fs/shell 工具（standard.patch.yml 挪进了 preset 层）。
+    if (deps.scopeModule !== undefined && deps.ctx !== undefined && deps.ctx !== null) {
+      try {
+        const scope = deps.scopeModule.createScope(deps.ctx, this);
+        this.ctx = scope.ctx;
+        this.#disposeScope = () => scope.dispose();
+        debugTrace('agent.scope.minted', { id: this.id });
+      } catch (error) {
+        this.ctx = deps.ctx;
+        this.#warning(`agent "${this.id}": dsh-scope.createScope 失败：回退 ownerCtx（桌面端 preset 绑定/工具解析可能失败）`, error);
+      }
+    } else {
+      this.ctx = deps.ctx;
+    }
   }
 
   get status(): 'idle' | 'running' {
@@ -1682,6 +1704,11 @@ export class StreamLoopAgent {
       await this.#storedHandle?.close();
     } catch (error) {
       this.#warning(`agent "${this.id}": 持久化句柄关闭失败`, error);
+    }
+    try {
+      await this.#disposeScope?.();
+    } catch (error) {
+      this.#warning(`agent "${this.id}": agent scope 释放失败（不阻断 dispose）`, error);
     }
   }
 
@@ -1905,40 +1932,59 @@ export function createStreamAgentFactory(deps: StreamAgentFactoryDeps): {
     if (sessions === undefined || typeof sessions.prepare !== 'function') {
       throw new Error('[stream-loop] ctx.sessions.prepare 不可用：无法创建 agent（需要 dsh-session 服务族在位）');
     }
-    const preparation = normalizePreparation(sessions.prepare(args.sessionId, args.prepareOpts));
+    let preparation = normalizePreparation(sessions.prepare(args.sessionId, args.prepareOpts));
     let stored = args.stored;
     try {
       if (stored === undefined && args.persistence !== undefined) {
-        stored = {
-          handle: await args.persistence.create((preparation.session as { header?: unknown }).header, {
-            ...(args.prepareOpts.inheritedEventCount === undefined ? {} : { inheritedEventCount: args.prepareOpts.inheritedEventCount }),
-            ...(args.signal === undefined ? {} : { signal: args.signal }),
-          }),
-          storedCount: 0,
-        };
+        try {
+          stored = {
+            handle: await args.persistence.create((preparation.session as { header?: unknown }).header, {
+              ...(args.prepareOpts.inheritedEventCount === undefined ? {} : { inheritedEventCount: args.prepareOpts.inheritedEventCount }),
+              ...(args.signal === undefined ? {} : { signal: args.signal }),
+            }),
+            storedCount: 0,
+          };
+        } catch (error) {
+          // 桌面端 UI 对失败的草稿会话会以同一 sessionId 重试 create：冲突 → 转 resume 语义
+          // 打开已有日志（seed 冷读），不让 "session already exists" 打死会话创建。
+          if (!/already exists/i.test(detailString(error))) throw error;
+          debugTrace('create.conflict.fallback-resume', { sessionId: args.sessionId });
+          const open = (args.persistence as {
+            open?(id: string, mode: string, opts?: { signal?: AbortSignal }): Promise<{
+              close(): Promise<void>;
+              read(from: number): Promise<{ events: readonly unknown[]; eventState?: unknown }>;
+              header: unknown;
+              inheritedEventCount?: number;
+            }>;
+          }).open;
+          if (open === undefined) throw error;
+          const handle = await open.call(args.persistence, args.sessionId, 'write', args.signal === undefined ? {} : { signal: args.signal });
+          try {
+            const coldRead = await handle.read(0);
+            const events = [...coldRead.events];
+            preparation[Symbol.dispose]?.();
+            preparation = normalizePreparation(sessions.prepare(args.sessionId, {
+              ...args.prepareOpts,
+              seed: events,
+              ...(handle.header === undefined ? {} : { meta: handle.header }),
+              ...(handle.inheritedEventCount === undefined ? {} : { inheritedEventCount: handle.inheritedEventCount }),
+              ...(coldRead.eventState === undefined ? {} : { eventState: coldRead.eventState }),
+            }));
+            stored = { handle, storedCount: events.length };
+          } catch (openError) {
+            await handle.close().catch(() => {});
+            throw openError;
+          }
+        }
       }
 
       debugTrace('createAgent.enter', { sessionId: args.sessionId, source: args.source });
 
-      // Agent 级 scoped context（桌面端 Agent preset 绑定硬要求：dsh-agent-preset-registry
-      // bind()/mount() 的 scopeOf(ctx) 必须命中 dsh-scope 的 kScope 标签——v0.1.0/0.2.0 传
-      // ownerCtx 在 headless 可行、桌面端会话创建报 "Agent preset binding requires a scoped
-      // context"）。作用域 key 用 opaque 对象（镜像内建 createScope(loopCtx, this) 的用法）。
+      // Agent 级 scoped context：在 StreamLoopAgent 构造内以 agent 实例本身为 key 铸造
+      // （镜像内建 createScope(loopCtx, this)——宿主工具执行器 selectExecutor(input.agent) 与
+      // 守卫 chainLayers(exec.agent) 都按 scopeChainOf(agent) 选层，key 不是 agent 实例时
+      // preset 层工具（desktop/web 组合的 write/edit/pwsh）永远解析不到）。此处只取同源模块。
       const dshScope = await acquireDshScope(deps.ctx);
-      let agentCtx: unknown = ownerCtx;
-      let disposeScope: (() => Promise<void>) | undefined;
-      if (dshScope !== undefined) {
-        try {
-          const scope = dshScope.createScope(ownerCtx, { agentScope: args.sessionId });
-          agentCtx = scope.ctx;
-          disposeScope = () => scope.dispose();
-          debugTrace('agent.scope.minted');
-        } catch (error) {
-          warning('[stream-loop] dsh-scope.createScope 失败：回退 ownerCtx（桌面端 preset 绑定可能失败）', error);
-        }
-      } else {
-        warning('[stream-loop] dsh-scope 不可达：agent 无 scoped context（桌面端 Agent preset 绑定会失败；headless 不受影响）');
-      }
 
       const { driver } = deps.createDriver({
         sessionId: args.sessionId,
@@ -1956,7 +2002,8 @@ export function createStreamAgentFactory(deps: StreamAgentFactoryDeps): {
         id: args.sessionId,
         session: preparation.session,
         driver,
-        ctx: agentCtx,
+        ctx: ownerCtx,
+        scopeModule: dshScope,
         storedHandle: stored?.handle,
         modelSelection: {
           provider: args.agentOptions.provider ?? '',
@@ -1987,20 +2034,14 @@ export function createStreamAgentFactory(deps: StreamAgentFactoryDeps): {
       sessions.announce?.(preparation.session);
 
       // setup（桌面端在此做 Agent preset 绑定与 model selection；镜像内建 :1574-1576 传 agent.ctx）
-      const setupCommit = await args.setup?.(agentCtx, agent);
+      // 工具解析说明：不重绑执行器——宿主 ToolsService.execute(input) 内部按
+      // selectExecutor(input.agent) → scopeChainOf(agent 实例 = 作用域 key) 选 preset 层
+      // 执行器（dsh-tools rc.3），工具批自带 agent 字段即可命中 preset 层的 write/edit/pwsh；
+      // 直读 agentCtx.tools 会触发 cordis "cannot get property without inject"（2026-11-15
+      // 桌面端实测教训）， entry 根服务与 agent 服务是同一实例，重绑无收益。
+      const setupCommit = await args.setup?.(agent.ctx, agent);
       if (setupCommit !== undefined && setupCommit !== null && typeof (setupCommit as { commit?: () => void }).commit === 'function') {
         (setupCommit as { commit: () => void }).commit();
-      }
-
-      // 工具执行器重绑到 agent 作用域（preset 层）：web/desktop 组合的 fs/shell 工具
-      // 只注册在 preset 层；headless 的 agentCtx=ownerCtx → 解析回根服务，行为不变。
-      const scopedCtx = agentCtx as { tools?: { execute(input: ToolBatchInputLike): Promise<ToolBatchResultLike> }; get?(service: string): unknown };
-      const scopedTools = scopedCtx?.tools ?? scopedCtx?.get?.('tools');
-      if (scopedTools !== undefined && typeof scopedTools.execute === 'function') {
-        driver.setToolsExecutor((input) => scopedTools.execute(input));
-        debugTrace('tools.scoped.rebind');
-      } else {
-        warning('[stream-loop] agentCtx 无 tools 服务：工具执行保持 entry 根服务（桌面端 preset 组合下可能 unknown tool）');
       }
 
       // agent 公告（镜像内建 :1578-1579；AgentRegistry.enter/announce 无 brand 校验，duck-type 可通行）
@@ -2024,11 +2065,6 @@ export function createStreamAgentFactory(deps: StreamAgentFactoryDeps): {
             detachSession?.();
           } catch (error) {
             warning('[stream-loop] sessions.detach 失败（不阻断 dispose）', error);
-          }
-          try {
-            await disposeScope?.();
-          } catch (error) {
-            warning('[stream-loop] agent scope 释放失败（不阻断 dispose）', error);
           }
         }
       };

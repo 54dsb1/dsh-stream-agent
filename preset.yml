@@ -1,4 +1,4 @@
-# preset.yml —— @54dsb1/dsh-stream-agent 生产装配清单
+# preset.yml —— @hugesb/dsh-stream-agent 生产装配清单
 #
 # 这里只做声明式装配（装什么、装几个、依赖谁），不承载 loop 接管：接管走全局
 # AgentRegistry.setFactory 槽位，由 cordis.patch.yml（bundle 层）或 patches/takeover.yml

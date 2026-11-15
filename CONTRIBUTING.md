@@ -45,3 +45,28 @@ npm run build     # src/*.ts → dist/*.js（Node 原生类型擦除，无第三
 - 提交信息用 `<type>: <中文摘要>`，`type` 取 `feat` / `fix` / `docs` / `refactor` / `chore` / `test` / `eval`。
 - 一个提交只做一件事；结构调整与逻辑改动分开。
 - 涉及行为变化时同步更新 `CHANGELOG.md` 与受影响文档。
+
+## 发布
+
+**Windows 双击 `release.cmd`** 即可，依次完成：构建 → 测试 → 版本 → 提交 → 打标签 → 推 GitHub → 建 Release → 发 npm。
+
+命令行等价：
+
+```bash
+npm run release              # 版本已手动 bump 就沿用，否则 patch+1
+npm run release -- --minor   # 或 --major / --set 0.2.0-rc.1
+npm run release:dry          # 只演练：跑构建测试 + 打印将执行的步骤
+```
+
+脚本会拦下这几类事故（都是实际踩过的）：
+
+| 拦截 | 原因 |
+|---|---|
+| 不在 `main` 分支 | 从特性分支发版会让 tag 落在错误提交上 |
+| npm 未登录 / scope 与账号不符 | `@xxx/` 只能发到自己的用户名或所属组织 |
+| `dist/` 与刚构建的结果不一致 | dist 入库且被 patch 直接引用，旧 dist 会让安装版本静默落后 |
+| 测试未通过 | 先修再发 |
+| npm 上该版本已存在 | 版本号必须递增，重复发布会 403 |
+| 标签已存在且不指向 HEAD | 链接会错位；确需覆盖加 `--force-tag` |
+
+版本规则：`package.json` 的 version 大于最近 tag 时视为**已手动 bump**，直接沿用；否则按 `--patch/--minor/--major` 递增。tag 名固定为 `v<version>`，预发布版本（带 `-rc.1`）自动发到 npm 的 `alpha` dist-tag，稳定版才占 `latest`。
