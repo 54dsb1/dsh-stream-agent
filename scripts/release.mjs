@@ -359,6 +359,20 @@ if (!has('no-npm')) {
     try {
       npmRun(pubArgs, { inherit: true });
     } catch (e) {
+      const out = String(e.stdout || '') + String(e.stderr || '');
+      if (/E403|403/.test(out) && /two-factor|2fa/i.test(out)) {
+        die(
+          'npm 拒绝了发布：账号要求 2FA，网页登录的会话 token 不能直接发布',
+          [
+            '两个办法（推荐第一个，配一次以后就不用管）：',
+            '  1. 建 Granular Access Token 并勾选 “Bypass two-factor authentication”',
+            '     https://www.npmjs.com/settings/<你的用户名>/tokens → Generate New Token',
+            '     权限 Read and write、scopes 选 @' + (pkg.name.split('/')[0].slice(1) || '') + '，然后写入：',
+            '     npm config set //registry.npmjs.org/:_authToken=npm_xxx',
+            '  2. 临时用验证码：npm publish --otp=123456',
+          ].join('\n'),
+        );
+      }
       die('npm publish 失败', e.stdout || e.message);
     }
     ok(`已发布 ${pkg.name}@${target}（dist-tag: ${distTag}）`);
