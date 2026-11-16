@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import { ActionRegistry, ActionGate, SystemClock } from '../kernel/gate.js';
                                                                                                           
 import { makeWarn, EntryLedger, kernelDiffer, openKvUnit } from './adapter-kit.js';
+import { asPluginEffect, getService } from './cordis-compat.js';
                                                                              
 
                                    
@@ -109,7 +110,7 @@ export default function apply(ctx             , config                   = {})  
 
   // staging unit 异步接驳（失败降级为纯内存暂存区，内核泄漏探测仍生效）
   let unit                        ;
-  const storage = (ctx.get?.('storage') ?? (ctx                             ).storage)                           ;
+  const storage = getService             (ctx, 'storage');
   openKvUnit(storage, config.unit ?? 'tfAgentStaging', ['staged'])
     .then((opened) => {
       unit = opened;
@@ -188,12 +189,12 @@ export default function apply(ctx             , config                   = {})  
   (ctx.get('tools')                                          ).guard(guard);
   if (config.announce === true) console.error(`[action-gate] mounted: guard registered (actions: ${Object.keys(actions).join(',')}; mode=${mode})`);
 
-  return {
+  return asPluginEffect({
     registry,
     gate,
     faults,
     dispose: () => {},
-  };
+  });
 }
 
 /** write 类参数 → SpecWrite[]（dsh-tool-fs write schema：file_path/content；兼容 path）。 */

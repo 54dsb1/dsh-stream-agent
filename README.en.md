@@ -13,9 +13,18 @@ Verified against the real API (10 tasks, two arms, same model `deepseek-flash`):
 |---|---|
 | Host | DeepSeek Harness `0.2.2-rc.1` (type anchor) / `rc.3` (runtime-tested) |
 | Dependencies | Zero npm dependencies; Node ≥ 22.18 (native type stripping) |
-| Tests | 208 cases green, zero API calls (full mock pipeline + 20 scenarios) |
+| Tests | 250 cases green, zero API calls (full mock pipeline + 20 scenarios + activation/desktop-page regression) |
 | Shape | One bundle package — install/remove with a single `dsh plugin add`; uninstall restores the native loop |
+| Control bar | `dsh-stream-agent bar`: four modes + zh/en switching, with a startup guide on activation |
+| Desktop page | Left-rail **Control bar**: status + four modes + zh/en switch, **without touching the Electron shell** |
 | Release | npm [`@hugesb/dsh-stream-agent`](https://www.npmjs.com/package/@hugesb/dsh-stream-agent) · GitHub [Releases](https://github.com/54dsb1/dsh-stream-agent/releases) |
+
+> **npm source notice**: the npm source for `v0.2.1` will be **available in no more than 3 days**
+> (by 2026-11-19; it lands on
+> [`@hugesb/dsh-stream-agent`](https://www.npmjs.com/package/@hugesb/dsh-stream-agent)).
+> Until then install from the **absolute repo path** or a GitHub Release tarball; once published,
+> `dsh plugin --profile desktop add @hugesb/dsh-stream-agent@0.2.1` works directly.
+> Do not install 0.2.0: it fails to activate inside dsh (root cause and fix in the section below).
 
 ---
 
@@ -45,11 +54,215 @@ dsh plugin --profile desktop add @hugesb/dsh-stream-agent
 ```
 
 Offline, or when hacking on local sources, swap the package name above for the repo's absolute path
-(`dsh plugin add /absolute/path/dsh-stream-agent`).
+(`dsh plugin add /absolute/path/dsh-stream-agent`). Until the npm source is live, that is the
+supported path:
+
+```bash
+dsh plugin --profile desktop add /absolute/path/dsh-stream-agent
+dsh-stream-agent status          # confirms you actually loaded 0.2.1
+```
 
 Uninstall: `dsh plugin --profile <name> remove @hugesb/dsh-stream-agent`, or simply drop the patch — the takeover layer disappears entirely and native behavior returns, zero residue.
 
 > `dsh plugin` requires `pnpm` on PATH (or a configured `pnpmCommand` in your dsh-plugin-manager).
+> After installing, run `dsh-stream-agent status` once: if it prints a mode line, both the CLI and
+> the state file are in place.
+
+<a id="control-bar"></a>
+
+## Control bar: read this first
+
+The control bar is the 0.2.1 learning surface for new users. It has **three faces** backed by
+**the same state and the same string table**:
+
+> Do not confuse "install mode" with "runtime mode": bundle / temporary overlay / desktop are
+> **install modes** (the three commands above), while balanced / lean / compat / power are
+> **runtime modes** (this section). They are orthogonal — any install can switch modes at will.
+
+| Face | When it shows up | What it is for |
+|---|---|---|
+| Startup banner | Once at plugin activation (stderr) | Prove takeover is active, report the mode, list the four steps |
+| Interactive bar `dsh-stream-agent bar` | Any time you open it | Compare the four modes, switch mode/language directly |
+| Desktop page (new in 0.2.1) | Left rail: **Control bar** | Graphical status, click-to-switch modes, zh/en; no Electron change |
+
+The banner looks like this (`STREAM_AGENT_NO_BANNER=1` silences it; `announce: false` in the patch
+does the same):
+
+```
+╭─ dsh-stream-agent v0.2.1 - CONTROL BAR ────────────────────────────────────╮
+│ * TAKEOVER ACTIVE: single-stream protocol owns agent creation              │
+│ Mode: 1 Balanced (balanced) | receipt | code auto | parallel 3             │
+│ Use when  First run, everyday read/write and lookup tasks, or when         │
+│           unsure: start here.                                              │
+│                                                                            │
+│ Four steps                                                                 │
+│   1 Install   dsh plugin --profile desktop add <package or local path>     │
+│   2 Pick mode  dsh-stream-agent mode lean (or press 1-4 in the bar)        │
+│   3 Ask   describe the task; the model runs tf-* in one stream             │
+│   4 Verify   dsh-stream-agent status                                       │
+│                                                                            │
+│ Open control bar  dsh-stream-agent bar                                     │
+│ Keys  Interactive bar: 1-4 mode, l language, ? full guide                  │
+│ Docs: README.md#control-bar                                                │
+╰────────────────────────────────────────────────────────────────────────────╯
+```
+
+### Open and drive it
+
+```bash
+dsh-stream-agent bar          # interactive (TTY): 1-4 mode, l language, ? full guide
+dsh-stream-agent bar --once   # print one panel and exit (automatic when not a TTY)
+dsh-stream-agent status       # one line: current mode + parameters (takeover state comes from the banner)
+dsh-stream-agent status --json  # machine readable (CI / scripts)
+dsh-stream-agent mode lean    # set mode: balanced / lean / compat / power
+dsh-stream-agent lang en      # set language: zh / en
+dsh-stream-agent help         # full mode guide
+```
+
+Keys (identical in both languages; `--json` exposes the same fields):
+
+| Key | Action |
+|---|---|
+| `1` `2` `3` `4` | Switch straight to that mode |
+| `Up` / `Down` (or `k` / `j`) | Move the focus without applying |
+| `Enter` | Apply the focused mode |
+| `l` | Switch Chinese / English (persisted immediately) |
+| `?` / `h` | Full mode guide (`q` goes back) |
+| `r` | Reset to the default mode (balanced) |
+| `q` / `Esc` / `Ctrl-C` | Quit |
+
+### Four modes: which one to pick
+
+Modes only map **existing** config knobs — they are not a second set of switches; `balanced` is
+equivalent to the 0.2.0 factory default.
+
+| Mode | One-liner | Pick it when | Trade-off |
+|---|---|---|---|
+| `balanced` (default) | Saves where it is safe, keeps what you need to see | First run, everyday read/write/lookup, or unsure | Write-batch re-reads of your own file return a receipt; use `tf-peek` for full text |
+| `lean` | Cost-first: the budget ladder engages early | Long sessions, batch scripts, read-heavy tasks with a clear answer | A 60k budget degrades output (after 70% only high-gain observations, after 90% only `tf-final`) |
+| `compat` | Closest to the native turn-based feel, commands run serially | Behavior looks off, you are diffing against the native loop, a tool needs full read-back | Highest token cost: full read-back and parallelism 1, also slower |
+| `power` | Write `tf-code` programs inside the single stream | Multi-step data work (filter/aggregate/transform), large-log analysis | Without `ctx.ptcRuntime` the channel stays off; longer protocol section means slightly higher fixed cost |
+
+One-line decision: **default to `balanced`; switch to `lean` when the bill matters; `compat` to debug
+and compare; `power` to process data programmatically.**
+
+How modes map to config (changing a mode changes these values; explicit config in the composition
+still wins):
+
+| Mode | `selfReadFeedback` | `enableCode` | `persistFallback` | Parallel | Reentries | `budgetTokens` |
+|---|---|---|---|---|---|---|
+| balanced | `receipt` | `auto` (on when the host has PTC) | `true` | 3 | 8 | off |
+| lean | `receipt` | `false` | `true` | 2 | 6 | 60000 |
+| compat | `full` | `false` | `true` | 1 | 12 | off |
+| power | `receipt` | `true` | `true` | 3 | 10 | off |
+
+### Language switching and the state file
+
+- Switch language: press `l` in the bar, or run `dsh-stream-agent lang en`. The startup banner and
+  the CLI panel read **one string table**, so you never get "Chinese banner, English commands".
+- State file: `~/.dsh-stream-agent/control.json` (override with `STREAM_AGENT_STATE_DIR`):
+  ```json
+  { "schema": 1, "mode": "balanced", "lang": "zh", "updatedAt": "2026-11-16T13:00:00.000Z" }
+  ```
+- Precedence: **explicit `mode`/`lang` in the composition > `STREAM_AGENT_MODE`/`STREAM_AGENT_LANG`
+  > `control.json` > built-in default (`balanced` / `zh`)**. A corrupt file only warns and falls
+  back; it never blocks activation.
+- A mode applies to the **next agent creation** (no dsh restart needed; already-open sessions keep
+  the config they were created with).
+
+<a id="desktop-control-page"></a>
+
+### Desktop control page (v0.2.1)
+
+Install into the `desktop` profile, then **restart the client**. The left rail gains a
+**Control bar** icon (slider glyph). Clicking it opens a full page — no Electron edits, no client
+rebuild. It rides dsh's own client-plugin mechanism (`dsh.client` + `ctx.slots`) and reads its
+same-origin data from the local Host.
+
+> Manually accepted in a real dsh desktop window: rail icon, full-page render, the four mode cards,
+> zh/en switching, light and dark themes, and the page surviving a client restart.
+
+What the page does:
+
+| Area | Content |
+|---|---|
+| Header | Version, **takeover active / not taking over**, current mode, current language |
+| Current state | Mode, source (composition config / environment / state file / default), language, updated time, state-file path |
+| Runtime mode | Four cards: `balanced` / `lean` / `compat` / `power`, each with "when to choose" and "trade-off"; one click applies |
+| Effective parameters | Self-read feedback, tf-code, local fallback, parallel commands, max re-entries, token budget |
+| Language | Chinese / English, persisted to `control.json` immediately |
+| Footer | Equivalent CLI commands for scripting |
+
+Rules and boundaries:
+
+- **New sessions only**: after a switch, agents created later use the new parameters; open sessions
+  keep the config they were created with.
+- **Composition wins**: if the profile patch pins `mode`/`lang`, or `STREAM_AGENT_MODE` /
+  `STREAM_AGENT_LANG` is set, the page disables the control and explains why. The UI never
+  overrides explicit configuration — that is the 0.2.1 precedence rule.
+- **Multiple windows**: the page carries an `updatedAt` fence. If another window or the CLI changed
+  the state, the write returns 409 and the page refreshes instead of silently overwriting.
+- **Honest degradation**: if the loop is not taking over (activation failure), the page still opens,
+  shows "not taking over", allows writing the state file, and says a restart is required after the
+  load failure is fixed — it never pretends success.
+- **Install path unchanged**: still `dsh plugin --profile desktop add ...`; bundles have no HMR, so a
+  client restart is required after an upgrade.
+- **Not a native window**: no new Electron `BrowserWindow`, no `app.asar` change, no preload IPC.
+  That also means plugin upgrades never have to ride a client release. Full assessment:
+  [`docs/desktop-ui-feasibility.md`](docs/desktop-ui-feasibility.md).
+
+> No icon after restart? Run `dsh plugin --profile desktop list` to confirm 0.2.1 is installed,
+> then check the client log for a `stream-agent-ui` activation error. The page depends on
+> `dsh-client-modules`' dynamic client-plugin mechanism (verified on dsh desktop `0.2.2-rc.3`).
+
+## v0.2.1: why 0.2.0 could not be used
+
+**Symptom** (dsh desktop profile, right after installing 0.2.0):
+
+```
+启用失败：dsh: warning: 1 entry did not activate stream-agent
+(file:///.../@hugesb/dsh-stream-agent/dist/entry/loop.js):
+Error: cannot get property "ptcRuntime" without inject
+```
+
+**Root cause: two independent Cordis 4.x contract violations; the first one fires and masks the second.**
+
+1. **Bare read of an optional service.** `apply()` contained
+   `(ctx as { ptcRuntime?: unknown }).ptcRuntime ?? ctx.get?.('ptcRuntime')`. The `??` left side
+   evaluates first, and Cordis 4.x contexts are proxies: reading a property that was **not injected**
+   throws `cannot get property "ptcRuntime" without inject`, so the `ctx.get` fallback never runs.
+   `ptcRuntime` is optional (absent when the host does not mount PTC), so the entry threw during
+   activation.
+2. **Functional-plugin return value.** All five entries ended with `return { ...handle }`.
+   Cordis collects a functional plugin's return value as an **effect**, accepting only
+   function / null / thenable / iterator — a plain object throws `TypeError: Invalid effect`.
+   Fixing the first defect just exposes this one, with a harder-to-read error.
+
+**Why the symptom is "completely unusable":** the entry throws → the fiber goes to failed → its
+registrations are rolled back → `setFactory` never happens → the bundle has already disabled the
+built-in `agent-loop` → that profile cannot create a single agent.
+
+**Fix** (`src/entry/cordis-compat.ts`):
+
+- `getService(ctx, name)`: reads only via `ctx.get(name)` (reflect.get has no inject requirement),
+  with a `try/catch` property fallback for test stubs. `ptcRuntime` / `loader` /
+  `sessionProjections` / `agentDefaultModel` / `storage` / `logger` all go through it. Optional
+  services never enter the inject array (an array entry means "required" in Cordis and would
+  suspend the entry forever when absent).
+- `asPluginEffect(handle)`: wraps the handle into a callable disposer with the handle's properties
+  attached — callers keep reading `handle.x`, Cordis receives a legal effect.
+
+**Verification**: a minimal host on dsh's own Cordis 4.1.0, mounting all seven entries with the exact
+inject lists from the patch:
+
+```
+ACTIVE  stream-agent-state / obs-broker / action-gate / context-render / control-bar / stream-agent-ui / stream-agent (7/7, state 2)
+factory registered: true
+control route GET: 200 (takeover: true, modes: 4)
+```
+
+The regression lives in the repo: `test/activation.test.ts` (strict inject-guard ctx + effect
+contract, 10 cases).
 
 ## Results
 
@@ -116,13 +329,14 @@ User task ─► open 1 streaming request
 
 ```
 dsh-stream-agent/
-├── cordis.patch.yml      # bundle entry: disables the built-in agent-loop, mounts 5 entries
+├── cordis.patch.yml      # bundle entry: disables the built-in agent-loop, mounts 7 entries
 ├── preset.yml            # production assembly manifest (declarative, not the takeover path)
 ├── src/
-│   ├── kernel/           # zero framework deps: state / obs / parser / gate / render
-│   └── entry/            # Cordis thin shells: translation only, no business logic
+│   ├── kernel/           # zero framework deps: state / obs / parser / gate / render / modes / control-bar
+│   └── entry/            # Cordis thin shells: translation only (+ cordis-compat discipline)
+├── ui/                   # desktop page subpackage: Host route + browser bundle (own dsh.client)
 ├── dist/                 # build output (committed; patches reference it directly)
-├── test/                 # 208 cases + 20 mock scenarios
+├── test/                 # 250 cases (activation regression + control-bar i18n/layout + desktop route) + 20 mock scenarios
 ├── patches/              # composition patches for development and evaluation
 ├── docs/                 # architecture, protocol, limitations
 ├── scripts/build.mjs     # zero-dependency build (Node native type stripping)
@@ -134,8 +348,8 @@ dsh-stream-agent/
 ## Development
 
 ```bash
-npm test          # 208/208, zero API calls
-npm run build     # emits dist/ (13 files) + full smoke imports
+npm test          # 250/250, zero API calls
+npm run build     # emits dist/ (24 files) + full smoke imports
 ```
 
 `dist/` is a committed release artifact that patches reference directly. **Always run `npm run build` after touching `src/`** — CI uses `git diff --exit-code -- dist` to catch the silent "edited source, forgot to rebuild" failure.
@@ -151,15 +365,6 @@ node eval/tools/gen-results.cjs --stamp <YYYY-MM-DD>   # recomputes the verdict 
 
 Desktop troubleshooting: set `STREAM_LOOP_DEBUG=1` to enable per-milestone driver tracing (`createAgent.enter` / `agent.scope.minted` / `projection.modelSelection.registered` / `resume.suffix.flushed` / `stream.call` / `stream.finish`).
 
-## Changelog
-
-Full history in [`CHANGELOG.md`](CHANGELOG.md) (follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); currently written in Chinese).
-
-| Version | Date | Highlights |
-|---|---|---|
-| 0.2.0 | 2026-11-16 | Targeted fixes for the four known limitations (O7 self-write receipt, mid-turn steer injection, local persistence fallback, local file ledger) + PTC bridge: new `tf-code` command brings the host `ctx.ptcRuntime` into the single-stream execution channels (programmatic data processing, intermediate results stay out of context; declared only when the channel is available, degrades automatically otherwise). |
-| 0.1.0 | 2026-11-15 | First installable release: single-stream kernel (five `tf-*` commands) + O1–O6 token optimizations + upstream semantic alignment (implicit write ordering / idempotent ids / optimistic peek / resume reconciliation) + desktop (Electron) real-API adaptation. Verified at 28.9% tokens / checks 10/10. |
-
 ## Known limitations
 
 The full list with evidence is in [`docs/limitations.md`](docs/limitations.md). v0.2.0 fixes the original four in a targeted way:
@@ -172,9 +377,21 @@ The full list with evidence is in [`docs/limitations.md`](docs/limitations.md). 
 Still worth knowing:
 
 - **Write-batch gains need a fresh eval run** — the 28.9% figure in `eval/` is the 0.1.0 measurement (before the receipt); O7 should improve write-heavy tasks, but the numbers must come from a new two-arm run.
-- **The local fallback creates a state directory** — enabled by default (`~/.dsh-stream-agent/{sessions,ledger,storage}`); opt out with `persistFallback: false`.
+- **The local fallback creates a state directory** — enabled by default (`~/.dsh-stream-agent/{sessions,ledger,storage,control.json}`); opt out with `persistFallback: false`. `control.json` only stores the control-bar mode and language; delete it to return to defaults.
+- **0.2.0 fails to activate inside dsh** — fixed in 0.2.1 (bare optional-service read + return-value contract, see "v0.2.1: why 0.2.0 could not be used" above). Upgrade any profile still on 0.2.0; a plain restart will not help.
 - **`tf-code` depends on the host PTC runtime** — when `ctx.ptcRuntime` is missing or malformed, the channel shuts off automatically (never declared in the protocol); declared `<tf-code>` commands fail at command level with reroute guidance; see [`docs/limitations.md`](docs/limitations.md).
+- **The desktop control page depends on dsh's dynamic client-plugin mechanism** — requires dsh `>=0.2.2-rc.1` (tested on desktop `rc.3`); bundles have no HMR, so restart the client after an upgrade; the page affects new sessions only, and it is not a native window (no tray/menu/shortcut).
 - **`dsh plugin` needs pnpm**, **the replay tool has 0 hits on real session logs**, **`injected_ratio` measurement bias** — see [`docs/limitations.md`](docs/limitations.md) 4 / 8 / 9.
+
+## Changelog
+
+Full history in [`CHANGELOG.md`](CHANGELOG.md) (follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); currently written in Chinese).
+
+| Version | Date | Highlights |
+|---|---|---|
+| 0.2.1 | 2026-11-16 | Activation hotfix: fixes the two Cordis 4.x contract violations that made 0.2.0 unusable inside dsh (bare read of an optional service; functional-plugin return value collected as an effect). Adds the control bar (startup banner + `dsh-stream-agent bar`) and four runtime modes (balanced / lean / compat / power) with a persisted zh/en switch. |
+| 0.2.0 | 2026-11-16 | Targeted fixes for the four known limitations (O7 self-write receipt, mid-turn steer injection, local persistence fallback, local file ledger) + PTC bridge: new `tf-code` command brings the host `ctx.ptcRuntime` into the single-stream execution channels (programmatic data processing, intermediate results stay out of context; declared only when the channel is available, degrades automatically otherwise). |
+| 0.1.0 | 2026-11-15 | First installable release: single-stream kernel (five `tf-*` commands) + O1–O6 token optimizations + upstream semantic alignment (implicit write ordering / idempotent ids / optimistic peek / resume reconciliation) + desktop (Electron) real-API adaptation. Verified at 28.9% tokens / checks 10/10. |
 
 ## Acknowledgements
 

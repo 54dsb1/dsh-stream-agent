@@ -10,19 +10,16 @@
 #   obs-broker.ts      工具结果出口登记 + llm/stream 泄漏扫描（依赖 state 服务）
 #   action-gate.ts     ToolsService guard：spec 暂存、一次性凭据、deny 层
 #   context-render.ts  O6 preflight 前缀断言
+#   control-bar.ts     控制栏：装载横幅 + 模式/语言状态（v0.2.1）
+#   ui/index.js        桌面控制页的宿主半边（独立子包，含 dsh.client 的浏览器半边）
 #   mock-provider.ts   离线假模型——测试专用，绝不进本文件
 #
-# 装载顺序：state-handle 必须先于 obs-broker（后者 inject 'state'）。
+# 装载顺序（与 cordis.patch.yml 同一纪律）：四个 sidecar 先行，control-bar / ui 其后，
+# loop 最后——loop 接管后单流若很快终止，进程退出会截断尚未挂载 entry 的激活。
+# state-handle 必须先于 obs-broker（后者 inject 'state'）。
 # 每行都要显式写 inject：loader 只读行选项，模块导出的 inject 不进 patch 行。
 
 - insert:
-    - id: stream-agent
-      name: ./dist/entry/loop.js
-      inject: [llm, tools, agents, sessions]
-      config:
-        maxParallelToolCalls: 3
-        maxReentries: 8
-        streamIdleTimeoutMs: 30000
     - id: stream-agent-state
       name: ./dist/entry/state-handle.js
       inject: [storage]
@@ -40,3 +37,18 @@
       name: ./dist/entry/context-render.js
       inject: []
       config: {}
+    - id: stream-agent-control-bar
+      name: ./dist/entry/control-bar.js
+      inject: []
+      config:
+        announce: true
+    - id: stream-agent-ui
+      name: ./ui/index.js
+      inject: []
+    - id: stream-agent
+      name: ./dist/entry/loop.js
+      inject: [llm, tools, agents, sessions]
+      config:
+        maxParallelToolCalls: 3
+        maxReentries: 8
+        streamIdleTimeoutMs: 30000

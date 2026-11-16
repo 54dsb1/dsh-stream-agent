@@ -18,6 +18,7 @@ import { assertPrefixStable, PrefixBrokenError, renderHash, ContextRenderer } fr
 import type { RenderMessage, DynamicPlacement } from '../kernel/render.ts';
 import { makeWarn, EntryLedger, wireMessageText } from './adapter-kit.ts';
 import type { HostCtxLike, Warn } from './adapter-kit.ts';
+import { asPluginEffect } from './cordis-compat.ts';
 
 /** 镜像 dsh-llm GenerateOptions（读子集；types.d.ts:538-580） */
 interface WireOptions {
@@ -109,10 +110,10 @@ export default function apply(ctx: HostCtxLike, config: ContextRenderConfig = {}
   ctx.on('llm/stream', onStream as unknown as (...args: never[]) => unknown);
   if (config.announce === true) console.error('[context-render] mounted: llm/stream O6 preflight asserter');
 
-  return {
+  return asPluginEffect({
     preflight,
     freezeDynamics: (dynamics, placement) => freezeRenderer.freezeDynamics(dynamics, placement),
     faults,
     dispose: () => {},
-  };
+  });
 }

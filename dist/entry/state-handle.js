@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { StateStore, parseHandle, formatHandle } from '../kernel/state.js';
                                                  
 import { makeWarn, EntryLedger, DurableBlobSink, bytesToB64, b64ToBytes, hydrateFromUnit, openKvUnit } from './adapter-kit.js';
+import { asPluginEffect, getService } from './cordis-compat.js';
                                                                              
 import { JsonFileKvUnit, resolveStateDir, safeFileName } from './json-persistence.js';
 
@@ -175,7 +176,7 @@ export default function apply(ctx             , config                    = {}) 
 
   // storage 异步接驳（open → 水合 → attach）；宿主 backend 缺位 → 本地文件 KvUnit 兜底
   // （修复限制 3，durable 不再是易失内存）；连本地兜底也失败才降级内存（fail-open，不静默）
-  const storage = (ctx.get?.('storage') ?? (ctx                             ).storage)                           ;
+  const storage = getService             (ctx, 'storage');
   const unitName = config.unit ?? 'tfAgentState';
   openKvUnit(storage, unitName, ['blobs', 'handles'])
     .catch(() => undefined) // 宿主 storage 异常 → 走本地兜底，最终降级由下级 catch 统一记账
@@ -212,5 +213,5 @@ export default function apply(ctx             , config                    = {}) 
     })();
   };
   ctx.effect?.(() => dispose, 'stateHandle.provide(state)');
-  return { service, dispose };
+  return asPluginEffect({ service, dispose });
 }

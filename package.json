@@ -1,9 +1,9 @@
 {
   "name": "@hugesb/dsh-stream-agent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "Apache-2.0",
   "type": "module",
-  "description": "单流协议 DSH 插件：内核层零框架依赖，适配层接入 @deepseek-ai/dsh",
+  "description": "单流协议 DSH 插件：内核层零框架依赖，适配层接入 @deepseek-ai/dsh（v0.2.1 含控制栏与装载修复）",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -50,6 +50,7 @@
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "dist/",
+    "ui/",
     "src/",
     "test/",
     "scripts/",
@@ -61,5 +62,8 @@
     "preset.yml",
     "cordis.patch.yml",
     "patches/"
-  ]
+  ],
+  "bin": {
+    "dsh-stream-agent": "./dist/entry/control-bar-cli.js"
+  }
 }

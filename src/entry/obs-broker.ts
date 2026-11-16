@@ -19,6 +19,7 @@ import { ObservationLedger } from '../kernel/obs.ts';
 import type { BlobSink as StateBlobSink } from '../kernel/state.ts';
 import { makeWarn, EntryLedger, contentTextOf, wireMessageText } from './adapter-kit.ts';
 import type { HostCtxLike } from './adapter-kit.ts';
+import { asPluginEffect } from './cordis-compat.ts';
 
 /** 镜像 dsh-tools/lib/types/contracts.d.ts:163-191 ToolExecution（读子集） */
 interface ToolExecLike {
@@ -165,7 +166,7 @@ export default function apply(ctx: HostCtxLike, config: ObsBrokerConfig = {}): O
   ctx.on('llm/stream', onStream as unknown as (...args: never[]) => unknown);
   if (config.announce === true) console.error('[obs-broker] mounted: tools/post-execute + llm/stream listeners');
 
-  return {
+  return asPluginEffect({
     ledger,
     faults,
     counters() {
@@ -173,5 +174,5 @@ export default function apply(ctx: HostCtxLike, config: ObsBrokerConfig = {}): O
       return { ...c, injectedRatio: ledger.injectedRatio() };
     },
     dispose: () => {},
-  };
+  });
 }

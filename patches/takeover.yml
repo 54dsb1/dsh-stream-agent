@@ -16,10 +16,24 @@
     maxParallelToolCalls: 10
   disabled: true
 - insert:
+    # 控制栏先挂载（横幅由 takeover 事件触发，不依赖装载顺序）；loop 最后。
+    # 本文件是最小接管形态：不带四个 sidecar（工具守卫 / 上下文回验 / state 句柄缺席），
+    # 但 loop 与控制页照常工作——control.json 与模式预设是同一份事实源。
+    - id: stream-agent-control-bar
+      name: ../dist/entry/control-bar.js
+      inject: []
+      config:
+        announce: true
+    # 桌面控制页：独立子包（dsh.client 只能由单一包源声明）；webServer 由内部可选等待。
+    - id: stream-agent-ui
+      name: ../ui/index.js
+      inject: []
     - id: stream-agent
       name: ../dist/entry/loop.js
       # inject 在 patch 行必须显式声明（loader 读 entry.options.inject，
       # cordis-plugin-loader/lib/index.js:768——模块导出的 inject 不进 patch 行）
+      # 可选服务（ptcRuntime / loader / sessionProjections）不进 inject 数组：
+      # 数组在 Cordis 里是"必需"，缺席会把 entry 挂起（v0.2.1 修复）。
       inject: [llm, tools, agents, sessions, sessionProjections]
       config:
         announceTakeover: true

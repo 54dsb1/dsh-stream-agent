@@ -1,6 +1,6 @@
 # cordis.patch.yml —— bundle 组合层入口（package.json > dsh.bundle.patch 指向本文件）
 #
-# 本插件的全部接管都发生在这里：停用内建 agent-loop，插入五个 entry。
+# 本插件的全部接管都发生在这里：停用内建 agent-loop，插入七个 entry。
 # 卸载（dsh plugin remove）即整层消失，回到原生回合制 loop，零残留。
 # 开发期想临时叠加、不动用户 profile 时，用 patches/takeover.yml。
 #
@@ -10,8 +10,9 @@
 #   · inject 必须写在行内——loader 只读行选项，模块导出的 inject 不生效
 #   · ./dist/... 以本文件所在目录为 baseUrl 解析，故本文件必须留在包根
 #
-# 装载顺序：四个 sidecar 先、loop 最后。loop 接管后单流可能很快终止，进程退出会截断
-# 尚未挂载 entry 的激活。
+# 装载顺序：四个 sidecar → control-bar → ui（桌面控制页宿主半边）→ loop。loop 排最后（它接管后
+# 单流若很快终止，进程退出会截断尚未挂载 entry 的激活）；控制栏排在 loop 之前，但横幅由
+# takeover-registry 的 onTakeover 事件触发——不依赖装载时序，也不靠定时器猜。
 #
 # announce: true 给每个 entry 打一行 mounted 横幅——bundle 激活对 CLI 是静默的，
 # 插件必须自证已装载；排障后可逐行去掉。
@@ -27,6 +28,8 @@
     # loop 接管后单流若快速终止，进程退出会截断尚未挂载 entry 的激活。
     # inject 必须逐行显式声明（loader 只读 entry.options.inject，模块导出不进 patch 行——
     # cordis-plugin-loader/lib/index.js:768，06 号 §4 实测）。
+    # 可选服务（ptcRuntime / loader / sessionProjections / agentDefaultModel）一律不进 inject：
+    # 数组形式在 Cordis 里是"必需"，服务缺席会把 entry 挂起（v0.2.1 修复，见 dist/entry/cordis-compat.js）。
     - id: stream-agent-state
       name: ./dist/entry/state-handle.js
       inject: [storage]
@@ -48,6 +51,18 @@
       inject: []
       config:
         announce: true
+    - id: stream-agent-control-bar
+      name: ./dist/entry/control-bar.js
+      inject: []
+      config:
+        announce: true
+    # 桌面控制页（v0.2.1）：必须住在独立子包 ui/（有自己的 package.json 与 dsh.client）。
+    # 原因：dsh-client-modules 以“包”为单位扫描；主包已被上面六个 entry 引用，
+    # 若主包再声明 dsh.client，会抛 "resolves from multiple active Loader sources"。
+    # 这一行本身没有 inject 要求；webServer 由 ui/index.js 内部可选等待。
+    - id: stream-agent-ui
+      name: ./ui/index.js
+      inject: []
     - id: stream-agent
       name: ./dist/entry/loop.js
       inject: [llm, tools, agents, sessions, sessionProjections]

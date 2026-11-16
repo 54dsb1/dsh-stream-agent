@@ -65,6 +65,19 @@
   `executeTools` 通道，宿主 guard/工作区策略/凭据全部生效；沙箱能力（文件策略/超时）按宿主 runtime 装配为准。
 - **取证**：`src/entry/ptc-bridge.ts`、`src/entry/loop.ts` 的 tf-code 分支；`test/ptc-bridge.test.ts`。
 
+### 5c. 桌面控制页依赖动态客户端插件机制（0.2.1 新增）
+
+- **依赖**：dsh `>=0.2.2-rc.1` 的 `dsh-client-modules`（扫描 `dsh.client`、组 `__DSH_BOOT__`）与
+  `dsh-client-ui-layout` / `dsh-client-ui-sidebar` 的 `main` / `sidebar.panellist` 槽位；桌面 `rc.3` 实测在位。
+- **装载**：页面在 `ui/` 独立子包，主包**不能**声明 `dsh.client`（同包多 entry 会触发
+  `resolves from multiple active Loader sources`，整个客户端 boot 失败）。构建闸门与
+  `test/desktop-ui.test.ts` 都钉住这条。
+- **生效**：bundle 无 HMR，升级插件后必须重启客户端；页面只影响新会话；装配 config/env 的值
+  会锁定对应控件（界面不覆盖显式配置）。
+- **边界**：不是原生窗口，没有托盘/菜单/全局快捷键；这些需要改 Electron `app.asar`，不在插件能力内。
+- **降级**：loop 未接管时页面仍可打开，显示"未接管"、允许写 `control.json`，并提示修复装载后重启；
+  路由鉴权复用 `ctx.connection.admit`，跨站/非 JSON 请求被拒。
+
 ### 6. `tf-bash` 可能被沙箱拒
 
 - 部分目录下 pwsh grant 失败（Win32 5）。基线臂同样受限，属环境因素而非插件缺陷。

@@ -42,6 +42,13 @@ import {
 import type { FileLedgerFallback } from './json-persistence.ts';
 import { createCodeExecutor, looksLikePtcRuntime } from './ptc-bridge.ts';
 import type { CodeExecutor } from './ptc-bridge.ts';
+import { asPluginEffect, getService } from './cordis-compat.ts';
+import { readPersistedControl, resolveControlState, writePersistedControl } from './control-state.ts';
+import type { ControlStateWithSource } from './control-state.ts';
+import { clearTakeover, markTakeover } from './takeover-registry.ts';
+import { MODES, isModeId, modeConfig } from '../kernel/modes.ts';
+import { isLang } from '../kernel/control-bar.ts';
+import { VERSION } from '../version.ts';
 
 // ---------------------------------------------------------------------------
 // ① 流契约镜像（dsh-llm/lib/types/types.d.ts 与 dsh-tools/lib/types/executor.d.ts，rc.1 npm）
@@ -2137,7 +2144,9 @@ async function acquireHostModule(ctx: unknown, specifier: string): Promise<unkno
         internal?: { import?(id: string, base?: unknown, opts?: unknown): Promise<unknown> };
       };
     };
-    const loader = anyCtx?.loader;
+    // v0.2.1：loader 是可选服务——Cordis 下裸读会抛 "cannot get property ... without inject"，
+    // 必须走安全探测（cordis-compat.ts 顶部记录了完整事故链）。
+    const loader = getService<NonNullable<typeof anyCtx.loader>>(ctx, 'loader');
     if (typeof loader?.import === 'function') {
       try {
         return await loader.import(specifier);
@@ -2546,6 +2555,10 @@ export interface LoopEntryConfig {
   persistFallback?: boolean;
   /** 本地持久化状态根目录（缺省 env STREAM_AGENT_STATE_DIR → ~/.dsh-stream-agent） */
   stateDir?: string;
+  /** 控制栏模式（v0.2.1）：balanced / lean / compat / power；缺省读 control.json → balanced */
+  mode?: string;
+  /** 控制栏语言：zh / en（只影响控制栏文案，不影响协议） */
+  lang?: string;
   /** 接管自证：注册成功后向 stderr 打一行横幅（探针 A 实测 preset 激活对 CLI 静默，排障只能靠插件自证日志） */
   announceTakeover?: boolean;
 }
@@ -2571,16 +2584,18 @@ export default function apply(ctx: {
   get?(service: string): unknown;
   effect?(fn: () => () => void, name?: string): unknown;
 }, config: LoopEntryConfig = {}): { factory: ReturnType<typeof createStreamAgentFactory>; dispose: () => void } {
+  const logger = getService<{ warn?(message: string): void }>(ctx, 'logger');
   const warning = (message: string, detail?: unknown): void => {
     // 红线 5：告警走宿主 logger（可用时），否则 console.error —— 都不静默
-    const logger = (ctx.get?.('logger') ?? null) as { warn?(message: string): void } | null;
     const text = `[stream-loop] ${message}${detail === undefined ? '' : ` :: ${detailString(detail)}`}`;
     if (logger?.warn !== undefined) logger.warn(text);
     else console.error(text);
   };
 
-  const llm = ctx.llm ?? (ctx.get?.('llm') as { stream(options: StreamRequestOptions): AsyncIterable<StreamChunkLike> } | undefined);
-  const tools = ctx.tools ?? (ctx.get?.('tools') as { execute(input: ToolBatchInputLike): Promise<ToolBatchResultLike> } | undefined);
+  // v0.2.1：全部服务读取走 getService —— Cordis 对未 inject 的属性裸读会抛
+  // "cannot get property ... without inject"，v0.2.0 因此整层接管未激活（见 cordis-compat.ts）。
+  const llm = getService<{ stream(options: StreamRequestOptions): AsyncIterable<StreamChunkLike> }>(ctx, 'llm');
+  const tools = getService<{ execute(input: ToolBatchInputLike): Promise<ToolBatchResultLike> }>(ctx, 'tools');
   if (llm === undefined || typeof llm.stream !== 'function') {
     throw new Error('[stream-loop] ctx.llm.stream 不可用：entry 挂载失败（需要 dsh-llm 服务在位）');
   }
@@ -2591,14 +2606,40 @@ export default function apply(ctx: {
   // 默认模型三级回退：agentOptions（宿主 agentDefaultModel 惰性 getter）→ entry config →
   // 宿主 agentDefaultModel → 最后兜底。桌面端部署常只挂 deepseek-account 路由，
   // 硬编码 deepseek-official/deepseek-chat 会请求到无凭据的路由。
-  const agentDefaultModel = (ctx.get?.('agentDefaultModel') ?? null) as { currentSelection?(): { provider?: string; model?: string; reasoningEffort?: string } } | null;
+  const agentDefaultModel = getService<{ currentSelection?(): { provider?: string; model?: string; reasoningEffort?: string } }>(ctx, 'agentDefaultModel');
   const defaultSelection = agentDefaultModel?.currentSelection?.() ?? {};
-  // 修复限制 3/4：本地持久化兜底（默认开启；config.persistFallback === false 关闭）
-  const persistFallbackEnabled = config.persistFallback !== false;
   const stateRoot = resolveStateDir(config.stateDir);
+  // 控制栏模式（v0.2.1）：显式 config.mode > STREAM_AGENT_MODE > control.json > balanced。
+  // 模式只提供默认值，下面每个字段都用 `config.X ?? preset.X` —— 显式装配永远压过模式。
+  const control = resolveControlState({ mode: config.mode, lang: config.lang }, config.stateDir, warning);
+  // 每次新建 agent 时重算：桌面控制页可以在不重启的情况下切模式，
+  // 已有的 driver 保持创建时的参数（会话内不突变），新会话拿到新参数。
+  const resolveEffective = (): {
+    selfReadFeedback: 'receipt' | 'full';
+    enableCode: boolean | undefined;
+    persistFallback: boolean;
+    maxParallelToolCalls: number;
+    maxReentries: number;
+    budgetTokens: number | undefined;
+  } => {
+    const preset = modeConfig(control.mode);
+    return {
+      selfReadFeedback: config.selfReadFeedback ?? preset.selfReadFeedback,
+      // 'auto' = 交给 codeExecutor 是否存在决定（保持 v0.2.0 的"宿主有 PTC 就开"语义）
+      enableCode: config.enableCode ?? (preset.enableCode === 'auto' ? undefined : preset.enableCode),
+      persistFallback: config.persistFallback ?? preset.persistFallback,
+      maxParallelToolCalls: config.maxParallelToolCalls ?? preset.maxParallelToolCalls,
+      maxReentries: config.maxReentries ?? preset.maxReentries,
+      budgetTokens: config.budgetTokens ?? preset.budgetTokens,
+    };
+  };
+  const effective = resolveEffective();
+  // 修复限制 3/4：本地持久化兜底（默认开启；模式或 config.persistFallback === false 关闭）
+  const persistFallbackEnabled = effective.persistFallback !== false;
   // 0.2.0 PTC 桥接：ctx.ptcRuntime 在位（形状校验通过）→ tf-code 通道可用；
   // 形状不符或缺失 → 通道关闭（协议文本不声明 tf-code），告警不静默（红线 5）。
-  const ptcRuntime = (ctx as { ptcRuntime?: unknown }).ptcRuntime ?? ctx.get?.('ptcRuntime');
+  // v0.2.1：ptcRuntime 是可选服务，只经 getService 探测（裸读即装载期抛错）。
+  const ptcRuntime = getService<unknown>(ctx, 'ptcRuntime');
   const codeExecutor = looksLikePtcRuntime(ptcRuntime)
     ? createCodeExecutor(ptcRuntime, { executeTools: (input) => tools.execute(input as never) })
     : undefined;
@@ -2617,16 +2658,17 @@ export default function apply(ctx: {
         }
       : undefined,
     createDriver({ agentOptions, session }) {
+      const live = resolveEffective();
       const cfg: StreamDriverConfig = {
         provider: agentOptions.provider || config.provider || defaultSelection.provider || '',
         model: agentOptions.model || config.model || defaultSelection.model || '',
         reasoningEffort: agentOptions.reasoningEffort ?? config.reasoningEffort ?? defaultSelection.reasoningEffort,
-        maxParallelToolCalls: config.maxParallelToolCalls,
-        maxReentries: config.maxReentries,
+        maxParallelToolCalls: live.maxParallelToolCalls,
+        maxReentries: live.maxReentries,
         streamIdleTimeoutMs: config.streamIdleTimeoutMs,
-        budgetTokens: config.budgetTokens,
-        selfReadFeedback: config.selfReadFeedback,
-        enableCode: config.enableCode,
+        budgetTokens: live.budgetTokens,
+        selfReadFeedback: live.selfReadFeedback,
+        enableCode: live.enableCode,
         codeTimeoutMs: config.codeTimeoutMs,
         nativeToolSchemas: config.nativeToolSchemas,
         systemPrompt: config.systemPrompt,
@@ -2648,12 +2690,86 @@ export default function apply(ctx: {
     onWarning: warning,
   });
 
-  if (ctx.agents?.setFactory === undefined) {
+  const agents = getService<AgentsRegistryLike & { setFactory?(factory: unknown): () => void }>(ctx, 'agents');
+  if (agents === undefined || typeof agents.setFactory !== 'function') {
     throw new Error('[stream-loop] ctx.agents.setFactory 不可用：无法接管 agent 创建（需要 dsh-agent 服务在位）');
   }
-  const detachFactory = ctx.agents.setFactory(factory);
+  const detachFactory = agents.setFactory(factory);
+  // 接管事实登记：控制栏据此写"接管生效"或"未接管"
+  markTakeover(control.mode);
+
+  // v0.2.1 桌面控制页的宿主面：只暴露"读状态 / 切模式 / 切语言"三件事。
+  // UI 是独立子包（ui/），经同源 HTTP 路由调用本服务；服务不存在时 UI 降级为只读诊断。
+  const controlStatus = (): Record<string, unknown> => {
+    const live = resolveEffective();
+    const persisted = readPersistedControl(config.stateDir);
+    return {
+      version: VERSION,
+      takeover: true,
+      mode: control.mode,
+      modeSource: control.modeSource,
+      modeLocked: control.modeSource === 'config' || control.modeSource === 'env',
+      lang: control.lang,
+      langSource: control.langSource,
+      langLocked: control.langSource === 'config' || control.langSource === 'env',
+      effective: {
+        selfReadFeedback: live.selfReadFeedback,
+        enableCode: live.enableCode === undefined ? 'auto' : live.enableCode,
+        persistFallback: live.persistFallback,
+        maxParallelToolCalls: live.maxParallelToolCalls,
+        maxReentries: live.maxReentries,
+        budgetTokens: live.budgetTokens ?? null,
+      },
+      modes: MODES.map(({ id, order, label, tagline, useWhen, tradeoff }) => ({ id, order, label, tagline, useWhen, tradeoff })),
+      updatedAt: persisted.updatedAt ?? null,
+      stateFile: control.file,
+    };
+  };
+  const applyMode = (next: string): { ok: boolean; code?: string; persisted?: boolean } => {
+    if (!isModeId(next)) return { ok: false, code: 'invalid-mode' };
+    if (control.modeSource === 'config' || control.modeSource === 'env') return { ok: false, code: 'locked' };
+    control.mode = next;
+    markTakeover(next);
+    try {
+      writePersistedControl({ mode: control.mode, lang: control.lang }, config.stateDir);
+      control.modeSource = 'file';
+      return { ok: true, persisted: true };
+    } catch (error) {
+      control.modeSource = 'runtime';
+      warning(`控制栏模式已在本进程生效，但落盘失败（重启后会回到旧值）：${control.file}`, error);
+      return { ok: true, persisted: false };
+    }
+  };
+  const applyLang = (next: string): { ok: boolean; code?: string; persisted?: boolean } => {
+    if (!isLang(next)) return { ok: false, code: 'invalid-lang' };
+    if (control.langSource === 'config' || control.langSource === 'env') return { ok: false, code: 'locked' };
+    control.lang = next;
+    try {
+      writePersistedControl({ mode: control.mode, lang: control.lang }, config.stateDir);
+      control.langSource = 'file';
+      return { ok: true, persisted: true };
+    } catch (error) {
+      control.langSource = 'runtime';
+      warning(`控制栏语言已在本进程生效，但落盘失败（重启后会回到旧值）：${control.file}`, error);
+      return { ok: true, persisted: false };
+    }
+  };
+  // 老式测试桩可能没有 provide（只挂服务不建容器）；真实 Cordis 一定有。
+  // 注册失败也不能影响 loop 本体：桌面控制页只是可选面，降级为只读即可。
+  if (typeof ctx.provide === 'function') {
+    try {
+      ctx.provide('streamAgentRuntime', {
+        status: controlStatus,
+        setMode: applyMode,
+        setLang: applyLang,
+      });
+    } catch (error) {
+      warning('streamAgentRuntime 服务注册失败：桌面控制页降级为只读（loop 本体不受影响）', error);
+    }
+  }
+
   if (config.announceTakeover === true) {
-    console.error('[stream-loop] TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch)');
+    console.error(`[stream-loop] TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch) · mode=${control.mode} (${control.modeSource})`);
   }
 
   // 会话投影注册（桌面端硬依赖，内建 agent-loop 在 Service.init 注册——dsh-agent-loop rc.3:50110）：
@@ -2661,8 +2777,7 @@ export default function apply(ctx: {
   // dsh-client-ui-model-selection 的 syncInputs 永远停在 status:"loading"（"正在加载模型…"），
   // 会话列表/写作工具等也读该投影族。经宿主 loader 取同源 @deepseek-ai/dsh-agent 的导出注册。
   // fail-open（红线 5）：服务/模块/定义任一不可达 → 告警不静默，headless 行为不变。
-  const sessionProjections = (ctx as { sessionProjections?: unknown }).sessionProjections
-    ?? (ctx.get?.('sessionProjections') as { register?(definition: unknown): Promise<unknown> } | undefined);
+  const sessionProjections = getService<{ register?(definition: unknown): Promise<unknown> }>(ctx, 'sessionProjections');
   if (sessionProjections === undefined || typeof sessionProjections.register !== 'function') {
     warning('ctx.sessionProjections.register 不可达：跳过 modelSelection 投影注册（headless 不受影响；桌面端客户端模型选择器会停在加载态）');
   } else {
@@ -2685,12 +2800,14 @@ export default function apply(ctx: {
   const dispose = (): void => {
     try {
       detachFactory?.();
+      clearTakeover();
     } catch (error) {
       warning('[stream-loop] factory 卸载失败', error);
     }
   };
   ctx.effect?.(() => dispose, 'streamAgent.setFactory()');
-  return { factory, dispose };
+  // Cordis 函数式插件契约：返回值必须可调用（cordis-compat.ts 缺陷 2）
+  return asPluginEffect({ factory, dispose });
 }
 
 function detailString(detail: unknown): string {

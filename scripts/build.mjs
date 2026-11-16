@@ -56,7 +56,7 @@ for (const file of files) {
 }
 
 // 冒烟：产物必须能作为 ESM 加载（kernel 零依赖；entry 动态 import 有 try/catch 包裹）
-for (const entry of ['dist/kernel/state.js', 'dist/kernel/obs.js', 'dist/kernel/parser.js', 'dist/kernel/gate.js', 'dist/kernel/render.js', 'dist/entry/mock-provider.js', 'dist/entry/loop.js', 'dist/entry/adapter-kit.js', 'dist/entry/state-handle.js', 'dist/entry/obs-broker.js', 'dist/entry/action-gate.js', 'dist/entry/context-render.js', 'dist/entry/eval-probe.js']) {
+for (const entry of ['dist/kernel/state.js', 'dist/kernel/obs.js', 'dist/kernel/parser.js', 'dist/kernel/gate.js', 'dist/kernel/render.js', 'dist/entry/mock-provider.js', 'dist/entry/loop.js', 'dist/entry/adapter-kit.js', 'dist/entry/state-handle.js', 'dist/entry/obs-broker.js', 'dist/entry/action-gate.js', 'dist/entry/context-render.js', 'dist/entry/eval-probe.js', 'dist/kernel/modes.js', 'dist/kernel/control-bar.js', 'dist/entry/control-state.js', 'dist/entry/control-bar.js', 'dist/entry/control-session.js', 'dist/entry/control-bar-cli.js', 'dist/version.js']) {
   try {
     await import(pathToFileURL(join(pkgRoot, entry)).href);
     console.log(`[build] smoke import OK: ${entry}`);
@@ -66,3 +66,38 @@ for (const entry of ['dist/kernel/state.js', 'dist/kernel/obs.js', 'dist/kernel/
   }
 }
 console.log(`[build] done: ${files.length} files`);
+
+// 桌面控制页的子包完整性：dsh-client-modules 以“包”为单位扫描 dsh.client，
+// 主包已被六个 entry 引用——主包若声明 dsh.client 会直接抛多源错误，整页 boot 失败。
+const rootPkg = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf8'));
+const uiPkg = JSON.parse(readFileSync(join(pkgRoot, 'ui', 'package.json'), 'utf8'));
+if (rootPkg.dsh?.client !== undefined) {
+  console.error('[build] 主包不得声明 dsh.client：会与六个 entry 形成多个 Loader 源，dsh-client-modules 装载期抛错');
+  process.exit(1);
+}
+if (uiPkg.dsh?.client?.platform !== 'web' || uiPkg.exports?.['./client'] === undefined) {
+  console.error('[build] ui/package.json 必须声明 dsh.client.platform = "web" 且导出 "./client"');
+  process.exit(1);
+}
+
+try {
+  await import(pathToFileURL(join(pkgRoot, 'ui', 'index.js')).href);
+  console.log('[build] smoke import OK: ui/index.js');
+} catch (error) {
+  console.error(`[build] smoke import FAILED: ui/index.js\n${error.message}`);
+  process.exit(1);
+}
+
+// 浏览器半边不执行（顶层 window 由客户端提供），只做语法闸门 + 协议标记检查。
+const clientSource = readFileSync(join(pkgRoot, 'ui', 'client.js'), 'utf8');
+try {
+  new Function(clientSource);
+} catch (error) {
+  console.error(`[build] ui/client.js 语法错误（会让整个客户端 boot 失败）\n${error.message}`);
+  process.exit(1);
+}
+if (!clientSource.includes('window.__ModuleLoader__.load') || !clientSource.includes('"@hugesb/dsh-stream-agent-ui"')) {
+  console.error('[build] ui/client.js 缺少 __ModuleLoader__ 包装或模块 id 不匹配');
+  process.exit(1);
+}
+console.log('[build] client bundle OK: ui/client.js');

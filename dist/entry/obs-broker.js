@@ -19,6 +19,7 @@ import { ObservationLedger } from '../kernel/obs.js';
                                                                     
 import { makeWarn, EntryLedger, contentTextOf, wireMessageText } from './adapter-kit.js';
                                                     
+import { asPluginEffect } from './cordis-compat.js';
 
 /** 镜像 dsh-tools/lib/types/contracts.d.ts:163-191 ToolExecution（读子集） */
                         
@@ -165,7 +166,7 @@ export default function apply(ctx             , config                  = {})   
   ctx.on('llm/stream', onStream                                            );
   if (config.announce === true) console.error('[obs-broker] mounted: tools/post-execute + llm/stream listeners');
 
-  return {
+  return asPluginEffect({
     ledger,
     faults,
     counters() {
@@ -173,5 +174,5 @@ export default function apply(ctx             , config                  = {})   
       return { ...c, injectedRatio: ledger.injectedRatio() };
     },
     dispose: () => {},
-  };
+  });
 }

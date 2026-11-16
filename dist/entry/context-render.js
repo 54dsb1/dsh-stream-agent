@@ -18,6 +18,7 @@ import { assertPrefixStable, PrefixBrokenError, renderHash, ContextRenderer } fr
                                                                            
 import { makeWarn, EntryLedger, wireMessageText } from './adapter-kit.js';
                                                           
+import { asPluginEffect } from './cordis-compat.js';
 
 /** 镜像 dsh-llm GenerateOptions（读子集；types.d.ts:538-580） */
                        
@@ -109,10 +110,10 @@ export default function apply(ctx             , config                      = {}
   ctx.on('llm/stream', onStream                                            );
   if (config.announce === true) console.error('[context-render] mounted: llm/stream O6 preflight asserter');
 
-  return {
+  return asPluginEffect({
     preflight,
     freezeDynamics: (dynamics, placement) => freezeRenderer.freezeDynamics(dynamics, placement),
     faults,
     dispose: () => {},
-  };
+  });
 }

@@ -16,6 +16,8 @@
   session 事件流   │  │        适配层（薄壳 entry，只做翻译）        │ │
                   │  │  loop.ts  state-handle.ts  obs-broker.ts   │ │
                   │  │  action-gate.ts  context-render.ts         │ │
+                  │  │  control-bar.ts（v0.2.1）                   │ │
+                  │  │  ui/index.js + ui/client.js（桌面页，独立子包）│ │
                   │  │  mock-provider.ts  eval-probe.ts           │ │
                   │  └────────────────────────────────────────────┘ │
                   └──────────────────────────────────────────────┘
@@ -23,7 +25,7 @@
 
 **这条边界是第一纪律**：`src/kernel/` 不 import 任何 `@deepseek-ai/*`（`obs.ts` / `parser.ts` 连 import 语句都没有），把这个目录单独拷出去就能跑单测。上游 API 漂移只打在 entry 薄壳上，内核资产不受损。
 
-## 内核五个模块
+## 内核七个模块
 
 | 模块 | 职责 | 关键不变量 |
 |---|---|---|
@@ -32,8 +34,10 @@
 | `parser.ts` | `tf-*` 命令的逐 chunk 解析 | 协议语法的唯一权威；命令闭合才派发，不等流结束 |
 | `gate.ts` | 动作准入：read / spec / commit / fatal 四级 + 一次性凭据 | 缺 reversibility 声明在 `registry.freeze()` 就抛错（启动期失败，不是运行期惊喜） |
 | `render.ts` | 上下文三段式装配 + 前缀单调断言 | 动态内容不得进入稳定前缀；hash 不单调即 fail-closed |
+| `modes.ts` | 四个运行模式目录（balanced / lean / compat / power）：只映射既有配置项，附中英双语说明 | 模式是默认值来源，装配里的显式配置永远压过它 |
+| `control-bar.ts` | 控制栏的纯渲染与按键状态机：文案表、宽度计算、面板/引导/帮助/JSON、按键意图 | 中英文案成对存在；结构字符只用 ASCII，CJK 记 2 列 |
 
-## 适配层七个 entry
+## 适配层：十个 entry + 六个库
 
 | entry | 挂载方式 | 作用 |
 |---|---|---|
@@ -42,9 +46,17 @@
 | `obs-broker.ts` | `insert` | 工具结果出口登记 + `llm/stream` 泄漏扫描（依赖 `state`） |
 | `action-gate.ts` | `insert` | `ToolsService` guard：spec 暂存、凭据签发与吊销、deny 层 |
 | `context-render.ts` | `insert` | O6 preflight 前缀断言（第二见证） |
+| `control-bar.ts` | `insert`，排在 loop 前 | 装载横幅（读接管事实）+ `ctx.streamAgentControl` 服务；模式/语言状态与 loop 共用 control.json |
+| `ui/index.js` | `insert`，排在 loop 前 | 桌面控制页宿主半边：同源路由 `/stream-agent/control`、`connection.admit` 鉴权、`streamAgentRuntime` 读写、无 loop 时降级；**独立子包**，不声明在主包 |
+| `ui/client.js` | `dsh.client` 浏览器半边（不单独挂载） | `__ModuleLoader__` bundle：`main` 整页 + `sidebar.panellist` 滑杆图标；四模式、中英切换、409 并发栅栏 |
+| `control-bar-cli.ts` | `bin`（不挂载） | `dsh-stream-agent` 命令：交互栏 / status / mode / lang / help / --json |
 | `mock-provider.ts` | **仅** `patches/test-preset.yml` | 离线假模型，绝不进生产组合 |
 | `eval-probe.ts` | **仅** `patches/eval-*.yml` | 评测探针，只读透传 |
 | `json-persistence.ts` | 被 state-handle / loop 引用的本地持久化兜底库（不单独挂载） | 本地 JSON KvUnit + JSONL 会话日志 + 文件台账（0.2.0，修复限制 3/4） |
+| `cordis-compat.ts` | 被五个 entry 引用的适配纪律库（不单独挂载） | 可选服务只走 ctx.get（裸读会撞 inject 守卫）；句柄经 asPluginEffect 包成合法 effect（0.2.1 装载修复） |
+| `control-session.ts` | 被 CLI 引用的会话状态机（不单独挂载） | 按键 → 状态 → 画面 → 落盘，与终端 IO 解耦；l 键中英往返可单测（无需 pty） |
+| `control-state.ts` | 被 loop / control-bar / CLI 引用的状态库（不单独挂载） | control.json 读写与优先级：装配 config > env > 文件 > 默认；坏文件 fail-open |
+| `takeover-registry.ts` | 被 loop / control-bar 引用的进程内登记（不单独挂载） | 接管事实 + onTakeover 订阅：横幅按事件打印，不靠时序猜 |
 | `ptc-bridge.ts` | 被 loop 引用的 PTC 桥接库（不单独挂载） | `ctx.ptcRuntime` duck-type 镜像 + tf-code 执行器（0.2.0）：bindings 走宿主同一条 executeTools 守卫管线 |
 
 ## 装配顺序
@@ -58,7 +70,11 @@ profile 启动时按层叠加，后者覆盖前者（同 id 整行替换，`conf
 
 `dsh --profile <name> --dump-config` 可以看到每一层的来源与最终结果。
 
-**装载顺序有讲究**：四个 sidecar 先、`loop` 最后。loop 接管后如果单流很快终止，进程退出会截断尚未挂载 entry 的激活。
+**装载顺序有讲究**：四个 sidecar 先，`control-bar` / `ui` 其后，`loop` 最后。loop 接管后如果单流很快终止，进程退出会截断尚未挂载 entry 的激活。控制栏因此排在 loop 之前挂载，但横幅由 `takeover-registry.onTakeover()` 事件触发——**不靠装载时序猜**：loop 先挂载则立即打印，控制栏先挂载则等 `setFactory` 成功后再打印；1.5s 内没有任何接管时兜底打印一次"未接管"，便于定位半装载。
+
+`ui` 必须是独立子包（`ui/package.json` 声明 `dsh.client`）：`dsh-client-modules` 以包为单位扫描，主包已被六个 entry 引用，若主包再声明 `dsh.client` 会抛
+`resolves from multiple active Loader sources`，整个客户端 boot 失败。`scripts/build.mjs` 与
+`test/desktop-ui.test.ts` 都钉住了这条约束。
 
 ## 接管与卸载
 
