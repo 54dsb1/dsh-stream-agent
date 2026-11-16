@@ -22,14 +22,26 @@
 // 唯一例外是"账本/事件落盘失败"：内存 records 永远持有全量事实，onWarning 告警后继续
 // （不因记账毁掉任务本身，但绝不无声）。
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { TfStreamParser } from '../kernel/parser.js';
                                                                   
 import { ContextRenderer, renderHash } from '../kernel/render.js';
                                                          
 import { ObservationLedger } from '../kernel/obs.js';
                                                           
+import {
+  appendLedgerRecord,
+  createJsonlPersistence,
+  ledgerFileOf,
+  loadLedgerRecords,
+  resolveStateDir,
+  withEventCapture,
+} from './json-persistence.js';
+                                                                
+import { createCodeExecutor, looksLikePtcRuntime } from './ptc-bridge.js';
+                                                    
 
 // ---------------------------------------------------------------------------
 // ① 流契约镜像（dsh-llm/lib/types/types.d.ts 与 dsh-tools/lib/types/executor.d.ts，rc.1 npm）
@@ -143,7 +155,7 @@ export const DEFAULT_TOOL_MAPPING              = {
           },
         };
       default:
-        return null; // tf-peek / tf-final 由驱动器内部处理
+        return null; // tf-peek / tf-final / tf-code 由驱动器内部处理（tf-code 走 executeCode 端口）
     }
   },
 };
@@ -169,6 +181,18 @@ export const DEFAULT_TOOL_MAPPING              = {
                         
                       
                             
+                                                 
+                                                     
+                                       
+                                           
+                                        
+                                                           
+                                       
+                       
+                                                                    
+                         
+                                                                 
+                            
  
 
                               
@@ -182,6 +206,8 @@ export const DEFAULT_TOOL_MAPPING              = {
                            
                                                    
                   
+                                                        
+                             
                                        
                                                           
  
@@ -278,6 +304,13 @@ tf-read / tf-bash 成功时结果不回灌，只有句柄进句柄目录；失�
 因此：需要看到内容（文件片段、命令输出、计算结果）时，必须用 tf-peek 按句柄取回——
 handle 从 [tf-stream:observation] 与句柄目录增量中取。答案依赖命令输出时，先 peek 再收尾。
 
+## 回验纪律（省 token 的关键）
+- 你 tf-write 的正文全文就在你的上下文里：不要为了"确认写成功"而 tf-read 自己刚写过的
+  路径——那只会得到回执（行数 + 内容指纹，[tf-stream:receipt]），不会重复回灌全文。
+  写失败一定会有 [tf-stream:error] 注入；没有错误注入就是写成功了。
+- tf-read 留给"读不是你写的文件"（任务要求读的既有文件、命令产出的文件）。
+- 确需局部比对自写文件时，用 tf-peek 按行段取回，不要全文重读。
+
 ## 时序与重发规则
 - 同 id 同内容重复声明 = 幂等：直接返回原回执（含句柄），不重复执行；同 id 不同内容会被
   拒绝（换新 id）；被拒绝（无副作用）的命令可用原 id 修正后重发。
@@ -301,7 +334,30 @@ tf-final 的 summary 必须包含任务要求的最终答案原文（数字、�
 5. 上一请求若报告 [tf-stream:error]，先修复或改道该命令（换路径/换命令），再继续其余任务。
 6. 全部命令成功且无需更多信息时输出 tf-final；收到 tf-final 后本任务收敛，不再有下一请求。`;
 
-export const DEFAULT_INVARIANTS = '不变量：历史消息只增不改（任何"压缩/摘要历史"的请求都会被拒绝）；写文件成功不会有结果回灌（只记台账），失败一定会以 [tf-stream:error] 注入下一请求；不要用原生 tool_call 写文件。回合必须以 <tf-final .../> 收尾：所有命令输出完毕后立即输出 tf-final，不带 tf-final 的回合视为未完成——即使全部工作已做完。';
+export const DEFAULT_INVARIANTS = '不变量：历史消息只增不改（任何"压缩/摘要历史"的请求都会被拒绝）；写文件成功不会有结果回灌（只记台账），失败一定会以 [tf-stream:error] 注入下一请求；tf-read 自己刚写过的文件只会得到回执（[tf-stream:receipt]，行数+指纹），不会回灌全文；不要用原生 tool_call 写文件。回合必须以 <tf-final .../> 收尾：所有命令输出完毕后立即输出 tf-final，不带 tf-final 的回合视为未完成——即使全部工作已做完。';
+
+/**
+ * tf-code 通道的协议段（PTC 桥接）：仅在 executeCode 端口在位时追加到协议文本之后
+ * （稳定前缀，构造期冻结——通道关闭的装配里模型永远看不到 tf-code，不会幻觉调用）。
+ */
+export const DEFAULT_CODE_PROTOCOL_SECTION = `## tf-code 程序化工具调用（PTC 桥接）
+
+<tf-code id="c1" depends_on="w1" timeout="120000" description="一句话说明程序做什么">
+（async TypeScript 函数体，可擦除语法——不用 enum/namespace；顶层 await 与 return 可用）
+const lines = String(await tools.read({ file_path: 'big.log' })).split('\\n');
+const errors = lines.filter((l) => l.includes('ERROR'));
+return { total: lines.length, errorCount: errors.length, samples: errors.slice(0, 20) };
+</tf-code>
+
+- 程序体内可用的绑定（与 tf-write/tf-read/tf-bash 同一条宿主管线，守卫与工作区策略全部生效）：
+  await tools.write({ file_path, content }) / await tools.read({ file_path, offset?, limit? }) /
+  await tools.pwsh({ command, description })。失败的绑定调用会抛错，可 try/catch 后继续或让程序失败。
+- 中间结果不进上下文：只 return 最终值（无损 JSON 进句柄目录）；需要看值时对该命令的句柄发 tf-peek。
+- 独立子调用可用 Promise.all 并行；有顺序依赖的用 await 串行。
+- 什么时候用 tf-code：多步数据加工（过滤/统计/变换/聚合）。单次文件读写用 tf-write/tf-read，
+  单条命令用 tf-bash，不要为一条命令包一层程序。
+- 程序失败会以 [tf-stream:error] 注入（kind: exception/timeout/abort/output-limit/...），
+  修复代码后换新 id 重发；timeout 属性为毫秒数，可省略（用宿主默认）。`;
 
 // ---------------------------------------------------------------------------
 // ② SingleStreamDriver
@@ -356,6 +412,12 @@ export class SingleStreamDriver {
                           
                                                                         
                                
+                                               
+                                         
+                                                                               
+                         
+                                                      
+                           
                              
    ;
            #renderer                 ;
@@ -369,6 +431,10 @@ export class SingleStreamDriver {
   #streamWrites                                     = [];
   /** unknown-handle 的 peek（同流乐观 peek）：流末 drain 后重试一次，仍无此句柄才失败 */
   #deferredPeeks                                                            = [];
+  /** 本任务内 tf-write 已成功写过的路径（规范化分隔符；修复限制 1 的自写回验判定） */
+           #writtenPaths = new Set        ();
+  /** 运行中回合收到的 steer（修复限制 2：下一请求装配时进追加区，对齐内建"注入运行中回合的下一步"） */
+  #pendingSteers                                            = [];
 
   #turnCounter = 0;
   #requestCount = 0;
@@ -407,11 +473,17 @@ export class SingleStreamDriver {
       maxReentries: config.maxReentries ?? 8,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? 30_000,
       budgetTokens: config.budgetTokens,
+      selfReadFeedback: config.selfReadFeedback ?? 'receipt',
+      codeEnabled: config.enableCode !== false && ports.executeCode !== undefined,
+      codeTimeoutMs: config.codeTimeoutMs,
       toolMapping: config.toolMapping ?? DEFAULT_TOOL_MAPPING,
     };
+    // tf-code 协议段只在实际可执行时声明（稳定前缀构造期冻结：通道不存在就不会被模型幻觉调用）
+    const protocolText = (config.protocolText ?? DEFAULT_PROTOCOL_TEXT)
+      + (this.#cfg.codeEnabled ? `\n\n${config.codeProtocolText ?? DEFAULT_CODE_PROTOCOL_SECTION}` : '');
     this.#renderer = renderer ?? new ContextRenderer({
       system: config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
-      protocol: config.protocolText ?? DEFAULT_PROTOCOL_TEXT,
+      protocol: protocolText,
       toolSchemas: config.nativeToolSchemas ?? '（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）',
       invariants: config.invariants ?? DEFAULT_INVARIANTS,
     });
@@ -509,6 +581,46 @@ export class SingleStreamDriver {
     this.#renderer.appendHistory({ role: 'user', content: text });
   }
 
+  /** 运行中回合的 steer 入口（修复限制 2）：下一请求装配时进追加区（对齐内建
+   *  "注入运行中回合的下一步"）；流内不打断的前提不变——当前流跑完才装配。 */
+  pushSteer(text        , message          )       {
+    this.#pendingSteers.push({ text, message });
+  }
+
+  /** 尚未消费（未进装配历史）的 steer 的原始消息（Agent.inbox.nextStep 的如实暴露面）。 */
+  get pendingSteerMessages()                     {
+    return this.#pendingSteers.map((s) => s.message);
+  }
+
+  /**
+   * resume 重放（修复限制 4 的另一半）：把上一会话的 tf-* 台账事实回灌驱动器。
+   * 只回放 'plugin:tf-agent/final'（finalCandidates → 最终答案跨 resume 可用）。
+   * 刻意不回放命令记录：属性不回放则幂等指纹永不匹配，回放反而会占用 id 命名空间
+   * 挡住合法重发；旧失败也不该在新回合里当作重入事由重新上报。finalCandidates
+   * 不进 #commands，因此重放不会让 #finalSeen 立即为真——新回合仍须模型自己收尾。
+   */
+  rehydrateRecords(records                                                )                                       {
+    let applied = 0;
+    let skipped = 0;
+    for (const rec of records) {
+      const data = (rec.data !== null && typeof rec.data === 'object' ? rec.data : undefined)                                       ;
+      if (rec.kind !== 'plugin:tf-agent/final' || data === undefined || typeof data['summary'] !== 'string') {
+        skipped += 1;
+        continue;
+      }
+      const cmdId = typeof data['cmdId'] === 'string' ? data['cmdId'] : `replayed-final-${applied + 1}`;
+      const existing = this.#finalCandidates.find((c) => c.cmdId === cmdId);
+      if (existing !== undefined) {
+        existing.summary = data['summary']; // 同 id 携带新 summary = 覆盖（与运行中 last-wins 语义一致）
+      } else {
+        this.#finalCandidates.push({ cmdId, summary: data['summary'], turn: 0, step: 0 });
+      }
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'final', summary: data['summary'] });
+      applied += 1;
+    }
+    return { applied, skipped };
+  }
+
   /** 外部取消（Agent.cancel 的入口）：中断当前流与在途请求。 */
   cancel(reason         )       {
     this.#aborted = true;
@@ -551,6 +663,17 @@ export class SingleStreamDriver {
     let reason                = { kind: 'blocked', detail: 'turn loop exited without convergence' };
 
     while (true) {
+      // ---- steer 注入（修复限制 2）：运行中到达的 steer 在下一请求（内建的"下一步"）生效
+      // ——进追加区（只追加，前缀单调不破）；流内不打断：当前流早已跑完才会走到这里。
+      if (this.#pendingSteers.length > 0) {
+        const steers = this.#pendingSteers.splice(0);
+        for (const s of steers) {
+          this.#renderer.appendHistory({
+            role: 'user',
+            content: `[tf-stream:steer]\n${s.text}\n（用户在回合进行中插入的指令；与本回合后续工作冲突时，以本指令为准）`,
+          });
+        }
+      }
       const level = this.budgetLevel();
       step += 1;
       try {
@@ -630,7 +753,9 @@ export class SingleStreamDriver {
       }
 
       const finalSeen = this.#finalSeen && prematureFinal === undefined;
-      const needsReentry = issues.length > 0 || injections.blocks.length > 0 || prematureFinal !== undefined;
+      // steer 在本流期间到达 → 不能带着未消费的 steer 收敛（对齐内建：插话必须被下一步看到）
+      const pendingSteerCount = this.#pendingSteers.length;
+      const needsReentry = issues.length > 0 || injections.blocks.length > 0 || prematureFinal !== undefined || pendingSteerCount > 0;
 
       if (prematureFinal !== undefined && lastFinal !== undefined) {
         injections.blocks.push({
@@ -1034,7 +1159,7 @@ export class SingleStreamDriver {
       const verdict = await this.#gate.admit({
         action: cmd.name,
         taskId: this.#taskId,
-        detail: cmd.name === 'tf-write' ? `path=${cmd.attrs['path'] ?? ''}` : cmd.attrs['cmd'] ?? cmd.attrs['path'] ?? '',
+        detail: cmd.name === 'tf-write' ? `path=${cmd.attrs['path'] ?? ''}` : cmd.attrs['cmd'] ?? cmd.attrs['description'] ?? cmd.attrs['path'] ?? '',
       });
       if (verdict.verdict === 'deny') {
         rec.status = 'rejected';
@@ -1075,6 +1200,71 @@ export class SingleStreamDriver {
       rec.detail = `${content.length} chars`;
       this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', handle, detail: rec.detail });
       this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', handle, chars: content.length });
+      return;
+    }
+
+    // ---- tf-code：程序化工具调用（PTC 桥接；缺端口 → 命令级失败并引导改道）----
+    if (cmd.name === 'tf-code') {
+      const executor = this.#ports.executeCode;
+      if (executor === undefined || !this.#cfg.codeEnabled) {
+        rec.status = 'failed';
+        rec.detail = 'no-code-channel: PTC runtime 不可达（需要宿主挂载 @deepseek-ai/dsh-ptc-runtime 并提供 ctx.ptcRuntime）';
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        return;
+      }
+      const timeoutAttr = cmd.attrs['timeout'];
+      const timeoutMs = timeoutAttr !== undefined && /^\d+$/.test(timeoutAttr) ? Number(timeoutAttr) : this.#cfg.codeTimeoutMs;
+      let outcome;
+      try {
+        outcome = await executor({
+          callId: cmd.id,
+          code: cmd.body ?? '',
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+          signal: new AbortController().signal,
+          ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
+        });
+      } catch (error) {
+        // 执行器自身异常（fail-open）：结构化失败 + 告警，不静默吞
+        rec.status = 'failed';
+        rec.detail = `code-executor-error: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500);
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail.slice(0, 200) });
+        this.#warn(`tf-code ${cmd.id} 执行异常`, error);
+        return;
+      }
+      // 观测登记（code 族：成功 high 首次/变化注骨架；失败一律 high）
+      const observation = this.#obs.observe({
+        tool: 'tf-code',
+        ok: outcome.ok,
+        key: observationKey(cmd),
+        content: outcome.ok ? outcome.valueJson : outcome.error,
+        callId: cmd.id,
+      });
+      rec.observation = observation;
+      rec.handle = observation.handle ?? undefined;
+      this.#record({
+        seq: ++DRIVER_SEQ, kind: 'observation',
+        handle: observation.handle, key: observationKey(cmd),
+        infoGain: observation.info_gain, reason: observation.reason,
+      });
+      if (!outcome.ok) {
+        rec.status = 'failed';
+        rec.detail = outcome.logs === undefined ? outcome.error : `${outcome.error} | logs tail: ${outcome.logs.slice(-200)}`;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail.slice(0, 200) });
+        return;
+      }
+      rec.status = 'ok';
+      rec.detail = `${outcome.valueJson.length} chars${outcome.logs === undefined ? '' : ` + logs ${outcome.logs.length} chars`}`;
+      this.#record({
+        seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok',
+        handle: rec.handle, infoGain: observation.info_gain, detail: rec.detail,
+      });
+      this.#ledgerWrite('plugin:tf-agent/command', {
+        cmdId: cmd.id, name: cmd.name, status: 'ok',
+        handle: rec.handle, infoGain: observation.info_gain, chars: outcome.valueJson.length,
+      });
       return;
     }
 
@@ -1135,6 +1325,10 @@ export class SingleStreamDriver {
     rec.status = 'ok';
     rec.detail = `${contentText.length} chars`;
     rec.handle = observation.handle ?? undefined;
+    if (cmd.name === 'tf-write' && typeof cmd.attrs['path'] === 'string') {
+      // 修复限制 1：登记本任务自写路径（tf-read 命中时只注入回执，掐断"写→读回验"循环）
+      this.#writtenPaths.add(normalizeTaskPath(cmd.attrs['path']));
+    }
     this.#record({
       seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok',
       handle: rec.handle, infoGain: observation.info_gain, detail: rec.detail,
@@ -1295,6 +1489,23 @@ export class SingleStreamDriver {
         let body        ;
         if (rec.cmd.name === 'tf-read') {
           const full = this.#obs.peek(obs.handle ?? '', 1, Number.MAX_SAFE_INTEGER);
+          // 修复限制 1：自写回验 receipt——tf-read 命中本任务 tf-write 已写过的路径时，
+          // 全文就在模型上下文里，不再重复回灌（掐断"写→读回验"循环，写批任务的主要 token 开销）。
+          const selfWritten = this.#cfg.selfReadFeedback !== 'full'
+            && typeof rec.cmd.attrs['path'] === 'string'
+            && this.#writtenPaths.has(normalizeTaskPath(rec.cmd.attrs['path']));
+          if (selfWritten) {
+            const lines = full === null ? 'unknown' : String(full.split('\n').length);
+            const fp = full === null ? 'unavailable' : contentFingerprint(full);
+            blocks.push({
+              role: 'user',
+              content: `[tf-stream:receipt handle=${obs.handle ?? ''} path=${rec.cmd.attrs['path']} lines=${lines} sha256=${fp}]`
+                + `\n该路径由你本任务的 tf-write 写入，全文已在你的上下文中，不重复回灌（回验纪律）。`
+                + `写失败会有 [tf-stream:error]；没有错误注入即写成功。确需局部比对用 tf-peek handle="${obs.handle}" from_line=.. to_line=..。`,
+            });
+            highInjected = true;
+            continue;
+          }
           body = readFeedbackBody(full, obs.payload.rendered, this.#cfg.readFeedbackLimit ?? DEFAULT_READ_FEEDBACK_LIMIT);
         } else {
           body = obs.payload.rendered;
@@ -1352,6 +1563,16 @@ function safeToolLog(ports             , turn        , step        )            
   }
 }
 
+/** 任务内路径规范化（自写回验判定用）：统一分隔符；大小写保留（不做平台猜测试）。 */
+function normalizeTaskPath(path        )         {
+  return path.replace(/\\/g, '/');
+}
+
+/** 内容指纹（receipt 行）：sha256 前 16 位十六进制——够对账，不泄露内容。 */
+function contentFingerprint(content        )         {
+  return createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 16);
+}
+
 /** 命令指纹（重复 id 幂等判定）：名称 + 属性 + 正文（tf-write）。确定性序列化。 */
 function commandFingerprint(cmd           )         {
   const attrs = Object.keys(cmd.attrs).sort().map((k) => `${k}=${cmd.attrs[k]}`).join('&');
@@ -1401,11 +1622,22 @@ function suggestFor(cmd           )         {
   if (cmd.name === 'tf-bash') return '请检查命令本身（语法/依赖/工作目录），修正后重发，或改道用 tf-write 落地产物。';
   if (cmd.name === 'tf-read') return '请确认路径存在（可先用 tf-bash ls 查看），或改用其他来源。';
   if (cmd.name === 'tf-peek') return 'handle 必须来自句柄目录增量（obs:<family>:<callId>@v<version>），请核对后重发。';
+  if (cmd.name === 'tf-code') {
+    return '请按错误诊断修复程序体（语法/绑定参数/超时），换新 id 重发；简单场景可改道 tf-bash 或 tf-write。';
+  }
   return '请根据失败原因修正后重发该命令（可换新 id）。';
 }
 
 function observationKey(cmd           )         {
-  return cmd.attrs['path'] ?? cmd.attrs['cmd'] ?? cmd.attrs['handle'] ?? cmd.name;
+  const base = cmd.attrs['path'] ?? cmd.attrs['cmd'] ?? cmd.attrs['handle'];
+  if (base !== undefined) return base;
+  // tf-code 没有稳定目标：description 优先，缺省用程序体指纹（同 id 重复才归并，不同程序各自成 key）
+  if (cmd.name === 'tf-code') {
+    return cmd.attrs['description'] !== undefined
+      ? `code:${cmd.attrs['description']}`
+      : `code:${contentFingerprint(cmd.body ?? '')}`;
+  }
+  return cmd.name;
 }
 
 function blockTextOf(content         )         {
@@ -1651,24 +1883,30 @@ export class StreamLoopAgent {
   }
 
   /** 桌面端 prompt(mode:'steer') 入口（dsh-api-session-controller prompt:38770）。
-   *  单流语义偏离声明：内建 steer 注入运行中回合的下一步；本实现插队到队首，
-   *  在下一回合边界生效（回合运行中不中途打断——与单流协议"流内不打断"一致）。 */
+   *  修复限制 2（对齐内建语义）：回合运行中 → 注入运行中回合的下一步（下一请求装配时
+   *  进追加区，[tf-stream:steer] 用户块）；单流"流内不打断"前提不变——不掐当前流。
+   *  空闲 → 与内建一致按新回合任务处理（插队队首）。 */
   steer(message                                                                                                       )       {
     if (this.#disposed) throw new Error(`agent "${this.id}": steer after dispose`);
     const text = message.content
-      .map((block) => (typeof block === 'object' && block !== null && 'text' in block && typeof (block                      ).text === 'string' ? (block                    ).text : ''))
+      .map((block) => (typeof block === 'object' && block !== null && 'text' in block && typeof (block                      ).text === 'string' ? (block                      ).text : ''))
       .join('\n');
     if (text.trim() === '') throw new Error(`agent "${this.id}": steer 消息没有文本内容`);
-    debugTrace('steer', { id: this.id, chars: text.length });
+    debugTrace('steer', { id: this.id, chars: text.length, running: this.#status === 'running' });
     this.#appendSessionEvent('user/message', message, { surfaceOp: 'append' });
+    if (this.#status === 'running') {
+      this.#driver.pushSteer(text, message);
+      return;
+    }
     this.#inbox.unshift({ text, message });
     if (this.#status === 'idle') this.#startNextTurn();
   }
 
-  /** 桌面端空内容续跑路径读取的 inbox 面（prompt:37548）。单流无 step 级注入，
-   *  恒为空队列——续跑请求按 session/agent-busy 语义被拒（如实降级，不伪造）。 */
+  /** 桌面端空内容续跑路径读取的 inbox 面（prompt:37548）。修复限制 2 后：
+   *  nextStep 如实暴露尚未消费的 steer（已注入装配历史的从队列移除）；
+   *  nextTurn 恒为空（单流没有跨回合排队注入）。 */
   get inbox()                                               {
-    return { nextTurn: [], nextStep: [] };
+    return { nextTurn: [], nextStep: [...this.#driver.pendingSteerMessages] };
   }
 
   /** 桌面端维护包裹（prompt/agent 生命周期路径）。无独立维护面 → 直通透传。 */
@@ -1792,6 +2030,27 @@ function normalizePreparation(raw         )                                     
                       
  
 
+/**
+ * 会话持久化面（宿主 sessionPersistence 与本地 JSONL 降级实现的结构公共面）。
+ * 形状逐字段对应 initialize 内的 duck-type 用法（create/open/append/read/header）。
+ */
+                                         
+                                                                                                   
+                           
+                                                       
+                                                                                       
+                     
+                                 
+     
+                                                                            
+                           
+                                                       
+                                                                                       
+                     
+                                 
+     
+ 
+
                                          
                                                          
         
@@ -1802,6 +2061,12 @@ function normalizePreparation(raw         )                                     
     
                                                                            
                                                                                                                                
+                                                      
+                                                     
+                                                                                    
+                                                     
+                                
+                                                                     
                                                           
  
 
@@ -1920,6 +2185,10 @@ export function createStreamAgentFactory(deps                        )
                                                                                                                    
                                                                                   
                                                                                                                                                               
+                                                                 
+                                    
+                                                                    
+                                                    
                                          
                                     
                                    
@@ -1986,21 +2255,45 @@ export function createStreamAgentFactory(deps                        )
       // preset 层工具（desktop/web 组合的 write/edit/pwsh）永远解析不到）。此处只取同源模块。
       const dshScope = await acquireDshScope(deps.ctx);
 
+      // 修复限制 3：本地 JSONL 持久化路径需要事件镜像——包装会话 append（原型链透传，
+      // snapshotEvents/header 等行为不变）；宿主持久化路径不加包装（checkpoint 机制在宿主侧）。
+      let driverSession          = preparation.session;
+      if (args.persistenceIsFallback === true && stored !== undefined) {
+        const storedHandle = stored.handle;
+        driverSession = withEventCapture(preparation.session, {
+          appendEvents: (events) => {
+            void storedHandle.append?.(events         )?.catch?.((error         ) => {
+              warning('[stream-loop] 会话事件落盘失败（fail-open：内存事实不丢）', error);
+            });
+          },
+        }, warning);
+      }
+
       const { driver } = deps.createDriver({
         sessionId: args.sessionId,
         agentOptions: args.agentOptions,
-        session: preparation.session,
+        session: driverSession,
       });
       debugTrace('driver.created');
       driver.setIdentity(args.sessionId, args.sessionId);
+      // 修复限制 4 的另一半：resume 路径回放 tf-* 台账事实（final 答案 + ok 命令幂等面）。
+      // 来源二选一：宿主路径扫 seed 里的 plugin:tf-agent/* 事件；本地台账路径读 ledger JSONL。
+      if (args.prepareOpts.seed !== undefined || args.fallbackLedger?.file !== undefined) {
+        const records = collectTfAgentRecords(args.prepareOpts.seed, args.fallbackLedger?.file, warning);
+        if (records.length > 0) {
+          const replay = driver.rehydrateRecords(records);
+          debugTrace('ledger.rehydrated', replay);
+        }
+      }
       // 探针 C 定案：ledger 走 plugin:tf-agent/* 私有记录（appendPluginRecord 自动 ignorable:true）。
-      // 动态 import 失败（类身份/解析不可达）→ 降级内存台账，告警不静默。
-      await attachSessionLedger(driver, preparation.session, warning);
+      // 宿主模块不可达（bundle 形态 bare import 解析不到同一副本）→ 降级本地文件台账（可重放，
+      // 修复限制 4）；连本地台账都不可用才降级内存，告警不静默。
+      await attachSessionLedger(driver, driverSession, warning, deps.ctx, args.fallbackLedger);
       debugTrace('ledger.attached');
 
       const agent = new StreamLoopAgent({
         id: args.sessionId,
-        session: preparation.session,
+        session: driverSession,
         driver,
         ctx: ownerCtx,
         scopeModule: dshScope,
@@ -2088,9 +2381,18 @@ export function createStreamAgentFactory(deps                        )
   return {
     async createAgent(ownerCtx, options) {
       assertSessionId(options.sessionId);
-      const persistence = deps.ctx.get?.('sessionPersistence')   
-                                                                                                                                         
-                   ;
+      // 修复限制 3：宿主 sessionPersistence 缺位 → 本地 JSONL 持久化（会话事件落盘，
+      // resume 真正可用）；两者都缺 → create 不落盘（v0.1 行为）。
+      let persistence = deps.ctx.get?.('sessionPersistence')                                      ;
+      let persistenceIsFallback = false;
+      if ((persistence === undefined || typeof (persistence                        ).create !== 'function') && deps.createFallbackPersistence !== undefined) {
+        const fallback = deps.createFallbackPersistence(options.sessionId);
+        if (fallback !== undefined && typeof fallback.create === 'function') {
+          persistence = fallback;
+          persistenceIsFallback = true;
+          debugTrace('persistence.fallback.jsonl', { sessionId: options.sessionId });
+        }
+      }
       return initialize(ownerCtx, {
         sessionId: options.sessionId,
         prepareOpts: {
@@ -2099,6 +2401,8 @@ export function createStreamAgentFactory(deps                        )
           ...(options.inheritedEventCount === undefined ? {} : { inheritedEventCount: options.inheritedEventCount }),
         },
         persistence,
+        persistenceIsFallback,
+        fallbackLedger: deps.fallbackLedger?.(options.sessionId),
         agentOptions: options.agentOptions ?? {},
         setup: options.setup,
         source: 'startup',
@@ -2109,18 +2413,19 @@ export function createStreamAgentFactory(deps                        )
 
     async resume(ownerCtx, options) {
       assertSessionId(options.resumeSessionId);
-      const persistence = deps.ctx.get?.('sessionPersistence')   
-           
-                                                                                      
-                                     
-                                                                                                
-                              
-                                           
-               
-           
-                   ;
+      // 修复限制 3：宿主 sessionPersistence 缺位 → 本地 JSONL 持久化 resume（不再直接报错）。
+      let persistence = deps.ctx.get?.('sessionPersistence')                                      ;
+      let persistenceIsFallback = false;
+      if ((persistence === undefined || typeof persistence.open !== 'function') && deps.createFallbackPersistence !== undefined) {
+        const fallback = deps.createFallbackPersistence(options.resumeSessionId);
+        if (fallback !== undefined && typeof fallback.open === 'function') {
+          persistence = fallback;
+          persistenceIsFallback = true;
+          debugTrace('resume.persistence.fallback.jsonl', { sessionId: options.resumeSessionId });
+        }
+      }
       if (persistence === undefined || typeof persistence.open !== 'function') {
-        throw new Error('[stream-loop] cannot resume: session persistence is not configured（需要 dsh-session-persistence 后端）');
+        throw new Error('[stream-loop] cannot resume: session persistence is not configured（需要 dsh-session-persistence 后端，或启用本地 JSONL 持久化降级）');
       }
       const id = options.resumeSessionId;
       const handle = await persistence.open(id, 'write', options.signal === undefined ? {} : { signal: options.signal });
@@ -2136,6 +2441,8 @@ export function createStreamAgentFactory(deps                        )
             ...(coldRead.eventState === undefined ? {} : { eventState: coldRead.eventState }),
           },
           stored: { handle, storedCount: events.length },
+          persistenceIsFallback,
+          fallbackLedger: deps.fallbackLedger?.(id),
           agentOptions: options.agentOptions ?? {},
           setup: options.setup,
           source: 'resume',
@@ -2150,24 +2457,64 @@ export function createStreamAgentFactory(deps                        )
   };
 }
 
-/** 探针 C 通道：经宿主同一模块副本调用 appendPluginRecord（动态 import；失败降级内存台账 + 告警）。 */
+/** 从 seed 事件与本地台账文件收集 plugin:tf-agent/* 记录（resume 重放入口）。 */
+function collectTfAgentRecords(
+  seed                                ,
+  ledgerFile                    ,
+  warn                                              ,
+)                                         {
+  const records                                         = [];
+  if (seed !== undefined) {
+    for (const event of seed) {
+      if (event === null || typeof event !== 'object') continue;
+      const e = event                                      ;
+      if (typeof e.type === 'string' && e.type.startsWith('plugin:tf-agent/')) {
+        records.push({ kind: e.type, data: e.data });
+      }
+    }
+  }
+  if (ledgerFile !== undefined) {
+    const loaded = loadLedgerRecords(ledgerFile);
+    if (loaded.skipped > 0) warn?.(`[stream-loop] 本地台账坏行跳过 ${loaded.skipped} 条（${ledgerFile}）`);
+    for (const rec of loaded.records) records.push({ kind: rec.type, data: rec.data });
+  }
+  return records;
+}
+
+/**
+ * 探针 C 通道（修复限制 4）：优先经宿主 loader 取同源 @deepseek-ai/dsh-session 副本调用
+ * appendPluginRecord（bundle 形态 bare import 不走宿主解析，必须走 loader 的 internal 通道——
+ * 与 dsh-scope 同款三级降级）；仍不可达且提供了本地台账 → 降级 JSONL 文件台账（可重放，
+ * 非易失内存）；两者都不可用才降级内存台账。每级降级都告警，绝不静默。
+ */
 export async function attachSessionLedger(
   driver                    ,
   session         ,
   warn                                              ,
+  ctx          ,
+  fallback                     ,
 )                {
   try {
-    const mod = (await import('@deepseek-ai/dsh-session'))     
+    const mod = (await acquireHostModule(ctx, '@deepseek-ai/dsh-session'))     
                                                                                  
-     ;
-    if (typeof mod.appendPluginRecord !== 'function') throw new Error('appendPluginRecord 导出缺失');
+                 ;
+    if (mod === undefined || typeof mod.appendPluginRecord !== 'function') throw new Error('appendPluginRecord 导出缺失');
     driver.attachLedger({
       record(type, data) {
         mod.appendPluginRecord (session, type, data);
       },
     });
   } catch (error) {
-    // 类身份/解析失败 → 内存台账降级（driver 内存 records 永远有全量事实），告警不静默
+    if (fallback !== undefined) {
+      driver.attachLedger({
+        record(type, data) {
+          fallback.appendRecord(type, data);
+        },
+      });
+      warn?.('[stream-loop] plugin:tf-agent ledger 的 plugin record 通道不可达，降级本地文件台账（JSONL 落盘，resume 可重放）', error);
+      return;
+    }
+    // 类身份/解析失败且无本地台账 → 内存台账降级（driver 内存 records 永远有全量事实），告警不静默
     warn?.('[stream-loop] plugin:tf-agent ledger 落 plugin record 失败，降级内存台账（resume 后 tf-* 状态不可重放）', error);
   }
 }
@@ -2188,6 +2535,17 @@ export async function attachSessionLedger(
                         
                         
                       
+                                                                                      
+                                        
+                                                                   
+                       
+                                             
+                         
+                                                                         
+                                                                     
+                            
+                                                                        
+                    
                                                                         
                              
  
@@ -2235,8 +2593,29 @@ export default function apply(ctx
   // 硬编码 deepseek-official/deepseek-chat 会请求到无凭据的路由。
   const agentDefaultModel = (ctx.get?.('agentDefaultModel') ?? null)                                                                                                   ;
   const defaultSelection = agentDefaultModel?.currentSelection?.() ?? {};
+  // 修复限制 3/4：本地持久化兜底（默认开启；config.persistFallback === false 关闭）
+  const persistFallbackEnabled = config.persistFallback !== false;
+  const stateRoot = resolveStateDir(config.stateDir);
+  // 0.2.0 PTC 桥接：ctx.ptcRuntime 在位（形状校验通过）→ tf-code 通道可用；
+  // 形状不符或缺失 → 通道关闭（协议文本不声明 tf-code），告警不静默（红线 5）。
+  const ptcRuntime = (ctx                            ).ptcRuntime ?? ctx.get?.('ptcRuntime');
+  const codeExecutor = looksLikePtcRuntime(ptcRuntime)
+    ? createCodeExecutor(ptcRuntime, { executeTools: (input) => tools.execute(input         ) })
+    : undefined;
+  if (ptcRuntime !== undefined && codeExecutor === undefined) {
+    warning('ctx.ptcRuntime 形状不符（缺 resolve/run），tf-code 通道关闭（fail-open，其余行为不变）', ptcRuntime);
+  }
   const factory = createStreamAgentFactory({
     ctx: ctx                                            ,
+    createFallbackPersistence: persistFallbackEnabled
+      ? (sessionId) => createJsonlPersistence(join(stateRoot, 'sessions'), sessionId, warning)
+      : undefined,
+    fallbackLedger: persistFallbackEnabled
+      ? (sessionId) => {
+          const file = ledgerFileOf(stateRoot, sessionId);
+          return { file, appendRecord: (type        , data         ) => appendLedgerRecord(file, type, data) };
+        }
+      : undefined,
     createDriver({ agentOptions, session }) {
       const cfg                     = {
         provider: agentOptions.provider || config.provider || defaultSelection.provider || '',
@@ -2246,6 +2625,9 @@ export default function apply(ctx
         maxReentries: config.maxReentries,
         streamIdleTimeoutMs: config.streamIdleTimeoutMs,
         budgetTokens: config.budgetTokens,
+        selfReadFeedback: config.selfReadFeedback,
+        enableCode: config.enableCode,
+        codeTimeoutMs: config.codeTimeoutMs,
         nativeToolSchemas: config.nativeToolSchemas,
         systemPrompt: config.systemPrompt,
         protocolText: config.protocolText,
@@ -2255,6 +2637,7 @@ export default function apply(ctx
         {
           stream: (options) => llm.stream(options),
           executeTools: (input) => tools.execute(input),
+          ...(codeExecutor === undefined ? {} : { executeCode: codeExecutor }),
           events: createSessionEventWriter(session),
           onWarning: warning,
         },

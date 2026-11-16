@@ -87,13 +87,15 @@ function readWorkspace(path: string, root: string): string {
   }
 }
 
-/** 默认声明（配置可覆盖）；受治理集合 = 声明集合 ∪ tf-* 前缀。 */
+/** 默认声明（配置可覆盖）；受治理集合 = 声明集合 ∪ tf-* 前缀。
+ *  tf-code 本体按 read 级准入（程序内的 tools.write 绑定走宿主管线，各自受原生守卫治理）。 */
 function defaultActions(): Record<string, Reversibility> {
   return {
     'tf-write': 'spec', write: 'spec',
     'tf-read': 'read', read: 'read',
     'tf-peek': 'read', 'tf-final': 'read',
     'tf-bash': 'read', bash: 'read',
+    'tf-code': 'read',
   };
 }
 

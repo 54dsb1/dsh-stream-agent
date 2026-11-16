@@ -7,10 +7,11 @@
 | 命令 | 属性 | 语义 | 结果处理 |
 |---|---|---|---|
 | `tf-write` | `path`、`content`/`patch` | 写或改文件 | 成功只记 ledger，**绝不注入** |
-| `tf-read` | `path`，可选 `offset`/`limit`（1 基行号） | 读文件 | 成功完整反馈一次（≤8000 字符，超限留头尾）；补充走 `tf-peek` |
+| `tf-read` | `path`，可选 `offset`/`limit`（1 基行号） | 读文件 | 读**外部文件**完整反馈一次（≤8000 字符，超限留头尾）；读**本任务 `tf-write` 写过的路径**只注入回执（`[tf-stream:receipt]`，行数 + sha256 指纹，0.2.0 O7）；补充走 `tf-peek` |
 | `tf-bash` | `command`、`description` | 执行命令（Windows 宿主映射到 `pwsh`） | 失败注入，成功只记 ledger |
 | `tf-peek` | `handle`、`from`/`to` | 从句柄取回行段 | 按需注入 |
 | `tf-final` | `id`、`summary` | 声明任务完成 | 触发收束判定；同 id 携带新 summary = 覆盖最终答案（last-wins） |
+| `tf-code` | `description`，可选 `timeout`（毫秒）；body = async TS 函数体（可擦除语法） | 程序化工具调用（PTC 桥接）：绑定 `tools.write/read/pwsh` 走宿主管线 | 返回值（无损 JSON）句柄化进 `code` 族，首/变化注骨架；失败结构化注入。需宿主 `ctx.ptcRuntime`，缺失时命令级失败（`no-code-channel`）引导改道 |
 
 命令可带 `depends_on` 声明依赖，驱动器据此决定派发时机。
 
@@ -26,6 +27,8 @@
 | **`tf-final` last-wins** | final 无副作用，同 id 携带新 summary 视为更新答案 | 模型从不换 id 却想改答案 |
 | **过早 final 检测** | final 带未满足依赖或未完成命令时，注入引导让模型重发 | 提前收工 |
 | **错误取因** | 逐层解包 `ToolBatchExecutionError.cause` | 失败 detail 不可定位 |
+| **tf-code 隔离执行（0.2.0）** | 程序体闭合即派发到宿主 PTC runtime（resolve→run）；返回值无损 JSON 句柄化，中间结果与日志不进上下文；绑定失败对齐 ToolCallError 语义（程序内 try/catch 可续） | 重型数据加工（过滤/统计/变换）只回结论不回过程；模型代码无直接 IO，全部经宿主守卫管线 |
+| **自写回验 receipt（O7）** | `tf-read` 命中本任务 `tf-write` 已写过的路径（分隔符规范化后比对）→ 回执注入，不回灌全文；`selfReadFeedback: 'full'` 关闭 | 写批任务"写 → 读回验"循环烧 token |
 
 ## 上下文装配
 

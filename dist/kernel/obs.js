@@ -26,6 +26,7 @@
 /** 工具族：分类器的输入粒度 */
                         
                                                                    
+                                                                                          
                                                                    
                                                                                        
                                                           // 未识别工具：默认按 low（默认不回灌）
@@ -61,7 +62,7 @@
 // ---------------------------------------------------------------------------
 
 const HIGH_GAIN_FAMILIES                          = new Set([
-  'read', 'grep', 'glob', 'web', 'test', 'build',
+  'read', 'grep', 'glob', 'web', 'test', 'build', 'code',
 ]);
 const LOW_RECEIPT_FAMILIES                          = new Set([
   'write', 'append', 'mkdir', 'bash',
@@ -74,6 +75,7 @@ export function classifyTool(tool        )             {
   if (t === 'tf-write' || t === 'write' || t === 'write_file' || t === 'edit') return 'write';
   if (t === 'tf-peek' || t === 'peek') return 'read';
   if (t === 'tf-bash' || t === 'bash' || t === 'shell') return 'bash';
+  if (t === 'tf-code' || t === 'run_code') return 'code';
   if (t === 'append') return 'append';
   if (t === 'mkdir') return 'mkdir';
   if (t === 'grep' || t === 'search' || t === 'grep_search') return 'grep';

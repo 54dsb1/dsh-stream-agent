@@ -35,7 +35,7 @@
 // 协议 schema（显式定义；解析失败产出 malformed，绝不静默丢弃）
 // ---------------------------------------------------------------------------
 
-                                                                                        
+                                                                                                    
 
                          
                               
@@ -52,10 +52,12 @@ const COMMAND_SCHEMAS                                                 = {
   'tf-bash': { required: ['cmd'], optional: [], hasBody: false },
   'tf-peek': { required: ['handle'], optional: ['from_line', 'to_line'], hasBody: false },
   'tf-final': { required: [], optional: ['summary'], hasBody: false },
+  // 程序体 = PTC 的 async TS 函数体（可擦除语法）；description 只进台账，timeout 为毫秒数
+  'tf-code': { required: [], optional: ['timeout', 'description'], hasBody: true },
 };
 
 const COMMAND_NAMES                           =
-  ['tf-write', 'tf-read', 'tf-bash', 'tf-peek', 'tf-final'];
+  ['tf-write', 'tf-read', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code'];
 
                             
                       
@@ -63,7 +65,7 @@ const COMMAND_NAMES                           =
              
                                                            
                                           
-                              
+                                                           
                 
                              
                                 

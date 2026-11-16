@@ -26,6 +26,7 @@
 /** 工具族：分类器的输入粒度 */
 export type ToolFamily =
   | 'read' | 'grep' | 'glob' | 'web' | 'test' | 'build'   // 高增益候选族
+  | 'code'                                                // tf-code 程序化结果（高增益：首个/变化结果注骨架）
   | 'write' | 'append' | 'mkdir'                          // 低增益回执族
   | 'bash'                                                // 成功记 ledger、失败注入（README §5）
   | 'other';                                              // 未识别工具：默认按 low（默认不回灌）
@@ -61,7 +62,7 @@ export interface ClassificationContext {
 // ---------------------------------------------------------------------------
 
 const HIGH_GAIN_FAMILIES: ReadonlySet<ToolFamily> = new Set([
-  'read', 'grep', 'glob', 'web', 'test', 'build',
+  'read', 'grep', 'glob', 'web', 'test', 'build', 'code',
 ]);
 const LOW_RECEIPT_FAMILIES: ReadonlySet<ToolFamily> = new Set([
   'write', 'append', 'mkdir', 'bash',
@@ -74,6 +75,7 @@ export function classifyTool(tool: string): ToolFamily {
   if (t === 'tf-write' || t === 'write' || t === 'write_file' || t === 'edit') return 'write';
   if (t === 'tf-peek' || t === 'peek') return 'read';
   if (t === 'tf-bash' || t === 'bash' || t === 'shell') return 'bash';
+  if (t === 'tf-code' || t === 'run_code') return 'code';
   if (t === 'append') return 'append';
   if (t === 'mkdir') return 'mkdir';
   if (t === 'grep' || t === 'search' || t === 'grep_search') return 'grep';

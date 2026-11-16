@@ -13,7 +13,7 @@ Verified against the real API (10 tasks, two arms, same model `deepseek-flash`):
 |---|---|
 | Host | DeepSeek Harness `0.2.2-rc.1` (type anchor) / `rc.3` (runtime-tested) |
 | Dependencies | Zero npm dependencies; Node ≥ 22.18 (native type stripping) |
-| Tests | 187 cases green, zero API calls (full mock pipeline + 20 scenarios) |
+| Tests | 208 cases green, zero API calls (full mock pipeline + 20 scenarios) |
 | Shape | One bundle package — install/remove with a single `dsh plugin add`; uninstall restores the native loop |
 | Release | npm [`@hugesb/dsh-stream-agent`](https://www.npmjs.com/package/@hugesb/dsh-stream-agent) · GitHub [Releases](https://github.com/54dsb1/dsh-stream-agent/releases) |
 
@@ -62,7 +62,7 @@ Real API, 10 tasks, two arms with the same model on the same day; failures and t
 
 Per-task token ratio (ours / baseline): W1 55% · W2 35% · W3 **5%** · R1 35% · R2 36% (checks ✗) · R3 55% · R4 **32%** · C1 **29%** · C2 41% · C3 **22%**.
 
-Read/lookup and composite tasks improve across the board; **write-batch tasks get heavier** — with full feedback, the model spontaneously runs read-back verification loops. That is an explicit "correctness first" trade-off, not a free win.
+Read/lookup and composite tasks improve across the board; write-batch tasks are the weak spot of the 0.1.0 measurement — v0.2.0's O7 self-write receipt targets exactly that loop (fresh two-arm numbers pending).
 
 ## How it works
 
@@ -74,9 +74,10 @@ Read/lookup and composite tasks improve across the board; **write-batch tasks ge
 | `tf-read` | Read a file (optional `offset`/`limit`, 1-based) | Full feedback once on success (≤8000 chars, head/tail kept beyond that); top-ups via `tf-peek` |
 | `tf-bash` | Run a command (Windows host uses `pwsh`) | Failures injected; successes ledger-only |
 | `tf-peek` | Fetch a line range from a handle | Injected on demand |
+| `tf-code` | Programmatic tool call (PTC bridge; body = async TS function body) | Return value (lossless JSON) handle-ized into the `code` family, first/changed results inject a skeleton; failures inject structured errors. Requires host `ctx.ptcRuntime`; degrades to a command-level failure with reroute guidance when absent |
 | `tf-final` | Declare completion | Triggers convergence; same id with a new summary updates the final answer |
 
-**Six token optimizations**:
+**Seven token optimizations**:
 
 | # | Optimization | One-liner |
 |---|---|---|
@@ -86,6 +87,9 @@ Read/lookup and composite tasks improve across the board; **write-batch tasks ge
 | O4 | Dynamic context freeze | Timestamps and directory snapshots always live in the volatile tail — nothing per-request-varying enters the stable prefix |
 | O5 | Budget ladder | <70% normal / 70–90% high-only / >90% only `tf-final` with degraded delivery |
 | O6 | Preflight assertion | Prefix hash verified before every request; any non-monotonic change refuses to send |
+| O7 | Self-write receipt | Reading back a file this task wrote returns only a receipt (lines + fingerprint), cutting the write→read-back loop |
+
+**PTC bridge (0.2.0)**: orthogonal to the official PTC mode (`run_code` tool) — PTC changes the tool-calling medium, this package changes the loop layer. When the host `ctx.ptcRuntime` is present, the model can write `<tf-code>` programs inside the single stream for heavy data processing (filter/aggregate/transform); return values are handle-ized and intermediate results never enter context; the bound `tools.write/read/pwsh` go through the same host guard pipeline. When the channel is absent it shuts off automatically and the protocol never declares it — zero residue.
 
 **Lifecycle of one turn**:
 
@@ -118,7 +122,7 @@ dsh-stream-agent/
 │   ├── kernel/           # zero framework deps: state / obs / parser / gate / render
 │   └── entry/            # Cordis thin shells: translation only, no business logic
 ├── dist/                 # build output (committed; patches reference it directly)
-├── test/                 # 187 cases + 20 mock scenarios
+├── test/                 # 208 cases + 20 mock scenarios
 ├── patches/              # composition patches for development and evaluation
 ├── docs/                 # architecture, protocol, limitations
 ├── scripts/build.mjs     # zero-dependency build (Node native type stripping)
@@ -130,7 +134,7 @@ dsh-stream-agent/
 ## Development
 
 ```bash
-npm test          # 187/187, zero API calls
+npm test          # 208/208, zero API calls
 npm run build     # emits dist/ (13 files) + full smoke imports
 ```
 
@@ -153,16 +157,24 @@ Full history in [`CHANGELOG.md`](CHANGELOG.md) (follows [Keep a Changelog](https
 
 | Version | Date | Highlights |
 |---|---|---|
+| 0.2.0 | 2026-11-16 | Targeted fixes for the four known limitations (O7 self-write receipt, mid-turn steer injection, local persistence fallback, local file ledger) + PTC bridge: new `tf-code` command brings the host `ctx.ptcRuntime` into the single-stream execution channels (programmatic data processing, intermediate results stay out of context; declared only when the channel is available, degrades automatically otherwise). |
 | 0.1.0 | 2026-11-15 | First installable release: single-stream kernel (five `tf-*` commands) + O1–O6 token optimizations + upstream semantic alignment (implicit write ordering / idempotent ids / optimistic peek / resume reconciliation) + desktop (Electron) real-API adaptation. Verified at 28.9% tokens / checks 10/10. |
 
 ## Known limitations
 
-The full list with evidence is in [`docs/limitations.md`](docs/limitations.md). The four you most need to know up front:
+The full list with evidence is in [`docs/limitations.md`](docs/limitations.md). v0.2.0 fixes the original four in a targeted way:
 
-1. **Write-batch tasks get heavier** — full feedback + read-back verification loops buy correctness; the big wins are on read/lookup and composite tasks.
-2. **`steer` deviates from the built-in** — this implementation queues at the front and takes effect at a turn boundary (single stream: "never interrupt mid-stream"), rather than injecting into the running turn's next step.
-3. **Persistence depends on host storage** — without a storage backend (headless), it degrades to in-memory by design (no functional loss, but cross-session resume is unavailable); adding `@deepseek-ai/dsh-storage-json` restores it.
-4. **The plugin-record channel may degrade in bundle form** — when host modules are unreachable it falls back to an in-memory ledger (stderr warning, never silent); the cost is that `tf-*` state cannot be replayed after resume.
+1. ~~**Write-batch tasks get heavier**~~ → **O7 self-write receipt**: reading back a file this task just wrote returns only a receipt (line count + fingerprint) instead of the full content; full feedback for external files is unchanged (`selfReadFeedback: 'full'` restores the old behavior).
+2. ~~**`steer` deviates from the built-in**~~ → **mid-turn injection**: steer is injected into the running turn's next request (appended `[tf-stream:steer]` user block); "never interrupt mid-stream" remains a structural premise of the single-stream protocol.
+3. ~~**Persistence depends on host storage**~~ → **local fallback**: without a storage backend / sessionPersistence, it falls back to local JSON files (`~/.dsh-stream-agent`, override with `STREAM_AGENT_STATE_DIR`); cross-session resume works. Set `persistFallback: false` to restore in-memory degradation.
+4. ~~**plugin-record channel may degrade to memory**~~ → **local file ledger**: when host modules are unreachable, the ledger degrades to a replayable JSONL file, and on resume the final answer is rehydrated into the new driver; command records are deliberately not replayed (idempotent fingerprints cannot be recomputed).
+
+Still worth knowing:
+
+- **Write-batch gains need a fresh eval run** — the 28.9% figure in `eval/` is the 0.1.0 measurement (before the receipt); O7 should improve write-heavy tasks, but the numbers must come from a new two-arm run.
+- **The local fallback creates a state directory** — enabled by default (`~/.dsh-stream-agent/{sessions,ledger,storage}`); opt out with `persistFallback: false`.
+- **`tf-code` depends on the host PTC runtime** — when `ctx.ptcRuntime` is missing or malformed, the channel shuts off automatically (never declared in the protocol); declared `<tf-code>` commands fail at command level with reroute guidance; see [`docs/limitations.md`](docs/limitations.md).
+- **`dsh plugin` needs pnpm**, **the replay tool has 0 hits on real session logs**, **`injected_ratio` measurement bias** — see [`docs/limitations.md`](docs/limitations.md) 4 / 8 / 9.
 
 ## Acknowledgements
 

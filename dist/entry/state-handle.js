@@ -9,10 +9,12 @@
 // fail-open（红线 5）：storage 不可用 → 内存实现降级 + 告警（durable=false），服务照常提供。
 
 import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 import { StateStore, parseHandle, formatHandle } from '../kernel/state.js';
                                                  
 import { makeWarn, EntryLedger, DurableBlobSink, bytesToB64, b64ToBytes, hydrateFromUnit, openKvUnit } from './adapter-kit.js';
                                                                              
+import { JsonFileKvUnit, resolveStateDir, safeFileName } from './json-persistence.js';
 
                                       
                                                 
@@ -52,6 +54,11 @@ import { makeWarn, EntryLedger, DurableBlobSink, bytesToB64, b64ToBytes, hydrate
                 
                                                     
                      
+                                                                            
+                                     
+                          
+                                                                             
+                    
  
 
 /** 句柄字符串 → 内核 put 的 ref（重放用；解析失败抛 UnknownHandleError → 上层计入 mismatches）。 */
@@ -166,18 +173,31 @@ export default function apply(ctx             , config                    = {}) 
     flush: () => sink.flush(),
   };
 
-  // storage 异步接驳（open → 水合 → attach）；失败降级内存（fail-open，不静默）
+  // storage 异步接驳（open → 水合 → attach）；宿主 backend 缺位 → 本地文件 KvUnit 兜底
+  // （修复限制 3，durable 不再是易失内存）；连本地兜底也失败才降级内存（fail-open，不静默）
   const storage = (ctx.get?.('storage') ?? (ctx                             ).storage)                           ;
-  openKvUnit(storage, config.unit ?? 'tfAgentState', ['blobs', 'handles'])
+  const unitName = config.unit ?? 'tfAgentState';
+  openKvUnit(storage, unitName, ['blobs', 'handles'])
+    .catch(() => undefined) // 宿主 storage 异常 → 走本地兜底，最终降级由下级 catch 统一记账
     .then(async (opened) => {
-      if (opened === undefined) throw new Error('storage backend "json" 不可用或无 kv facet');
+      if (opened === undefined && config.localFallback !== false) {
+        // 修复限制 3：本地 JSON 文件 KvUnit（JsonFileKvUnit 构造即做可写性探针，失败抛错）
+        const local = new JsonFileKvUnit(join(resolveStateDir(config.stateDir), 'storage'), unitName, warn);
+        await local.putRecord('blobs', '__open_probe__', { at: Date.now() });
+        sink.attach(local, await hydrateFromUnit(local));
+        unit = local;
+        ledger.push('storage-local-fallback', { unit: unitName, file: local.file });
+        warn(`宿主 storage backend "json" 不可用，降级本地文件 KvUnit（${local.file}；durable，跨会话 resume 可用）`);
+        return;
+      }
+      if (opened === undefined) throw new Error('storage backend "json" 不可用或无 kv facet（本地兜底已关闭或失败）');
       sink.attach(opened, await hydrateFromUnit(opened));
       unit = opened;
-      ledger.push('storage-attached', { unit: config.unit ?? 'tfAgentState' });
+      ledger.push('storage-attached', { unit: unitName });
     })
     .catch((error) => {
       ledger.push('storage-degraded', { error: String(error) });
-      warn('storage 接驳失败，降级内存 BlobSink（服务照常提供）', error);
+      warn('storage 接驳失败（宿主与本地兜底均不可用），降级内存 BlobSink（服务照常提供）', error);
     });
 
   if (typeof ctx.provide !== 'function') throw new Error('[state-handle] ctx.provide 不可用：无法提供服务 ctx.state');

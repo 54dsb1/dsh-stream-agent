@@ -2,14 +2,21 @@
 
 按"你会不会踩到"排序，每条都给出取证位置与缓解方式。**判定不过就写不过**——这份清单不做美化。
 
+> 0.2.0 已定向修复原 1 / 3 / 5 / 7 四条（自写回验 receipt、steer 运行中注入、本地持久化兜底、
+> 本地文件台账）。原条目保留修复说明，新增限制排在对应位置。
+
 ## 一、成本与正确性的取舍
 
-### 1. 写批任务 token 偏重
+### 1. 写批任务 token 偏重（0.2.0 已修复）
 
-- **现象**：写多文件的任务（W1 / W2 / W3 / C2 / C3）收益不稳定，W1 只到 55%，R2 甚至 checks 不过。
-- **原因**：`tf-read` 成功会完整反馈一次，模型拿到内容后倾向做"写 → 读回验 → 再改"的循环。这是把正确率从 6/10 拉到 9/10 的代价。
-- **影响**：写比重越大，收益越接近 1；读查（R1/R3/R4）、复合（C1/C3）才有 5%–32% 的显著收益。
-- **缓解**：如果你只做读查类任务，收益最稳；写批任务请以正确率为先，不建议为了 token 关掉完整反馈。
+- **原现象**：写多文件的任务收益不稳定，模型拿到完整反馈后自发做"写 → 读回验 → 再改"循环。
+- **修复**：自写回验 receipt（O7）——`tf-read` 命中本任务 `tf-write` 已写过的路径时只注入回执
+  （行数 + sha256 指纹），不重复回灌全文（全文就在模型上下文里）；协议文本新增"回验纪律"。
+  读**外部文件**的完整反馈保持不变，正确率路径不受影响。
+- **取证**：`src/entry/loop.ts` 的 `#writtenPaths` 与 `#buildInjections` receipt 分支；
+  `test/fix-limits.test.ts` R1–R3。
+- **余留**：真连收益需重跑两臂评测确认（本仓库 eval 数据是 0.1.0 口径）；`selfReadFeedback: 'full'`
+  可回退旧行为。
 
 ### 2. W1 / C2 退出码 1，但产物正确
 
@@ -20,11 +27,16 @@
 
 ## 二、行为语义偏离
 
-### 3. `steer` 与内建语义不同
+### 3. `steer` 语义（0.2.0 已对齐内建）
 
-- **内建**：注入到运行中回合的下一步。
-- **本包**：插队到队首，在回合边界生效——因为单流协议"流内不打断"是它的前提。
-- **影响**：依赖"立即插话"的交互脚本体感会有差异。桌面端已如实声明，不做静默兼容。
+- **原偏离**：插队到队首，在回合边界生效。
+- **修复**：回合运行中收到 steer → 注入运行中回合的**下一请求**（追加区 `[tf-stream:steer]`
+  用户块；带未消费 steer 时不允许收敛），对齐内建"注入运行中回合的下一步"；单流
+  "流内不打断"（不掐当前流）前提不变。空闲时保持原语义（插队队首、当新回合任务）。
+- **取证**：`src/entry/loop.ts` 的 `pushSteer` / `#pendingSteers` 与 `StreamLoopAgent.steer`；
+  `test/fix-limits.test.ts` S1–S2。
+- **余留**：内建 steer 会在流间立即接管下一步；本实现保证"下一请求可见"，不保证
+  "当前流中途打断"——这是单流协议的结构性前提，不是缺陷。
 
 ## 三、环境依赖
 
@@ -32,10 +44,26 @@
 
 - PATH 里没有 `pnpm` 时安装/卸载会失败。按 dsh-plugin-manager 配置 `pnpmCommand` 可绕开。
 
-### 5. 持久化依赖宿主 storage
+### 5. 持久化依赖宿主 storage（0.2.0 已修复）
 
-- headless profile 未注册 storage backend 时，`state-handle` 按设计降级内存：服务照常提供、功能不损，但**跨会话 resume 不可用**。
-- 缓解：补挂 `@deepseek-ai/dsh-storage-json`。
+- **原现象**：headless 未挂 storage backend / sessionPersistence 时降级内存，跨会话 resume 不可用。
+- **修复**：本地持久化兜底（`src/entry/json-persistence.ts`，零依赖）——
+  ① state-handle 降级本地 JSON 文件 KvUnit（durable，resume 可重建句柄目录）；
+  ② AgentFactory 降级本地 JSONL 会话日志（create 落盘、resume 冷读）。
+  状态根目录：`STREAM_AGENT_STATE_DIR` env → `~/.dsh-stream-agent`（子目录 `storage/`、`sessions/`、`ledger/`）。
+- **取证**：`test/adapters.test.ts` A4（KvUnit 兜底 + 跨"重启" resume）、`test/fix-limits.test.ts` P1–P2。
+- **余留**：本地兜底的会话日志格式是插件私有的 JSONL，与宿主 zstd session log 不互通；
+  宿主持久化在位时优先宿主。`persistFallback: false` / `localFallback: false` 可关闭（回内存降级）。
+
+### 5b. `tf-code` 依赖宿主 PTC runtime（0.2.0 新增，fail-open）
+
+- **现象**：宿主未挂 `@deepseek-ai/dsh-ptc-runtime`（`ctx.ptcRuntime` 缺失）或形状不符时，tf-code 通道整体关闭。
+- **行为**：关闭是**装配期**的——协议文本不声明 tf-code（稳定前缀里不存在这个命令，模型不会幻觉调用）；
+  若模型仍输出 `<tf-code>`（跨装配漂移），命令级失败注入 `no-code-channel` 并建议改道 tf-bash。告警不静默。
+- **缓解**：挂载 PTC runtime 后端（如 `@deepseek-ai/dsh-ptc-runtime-node`）；或 `enableCode: false` 显式关闭。
+- **安全面**：程序体自身不做任何直接 IO——唯一绑定命名空间 `tools`（write/read/pwsh）走驱动器同一条
+  `executeTools` 通道，宿主 guard/工作区策略/凭据全部生效；沙箱能力（文件策略/超时）按宿主 runtime 装配为准。
+- **取证**：`src/entry/ptc-bridge.ts`、`src/entry/loop.ts` 的 tf-code 分支；`test/ptc-bridge.test.ts`。
 
 ### 6. `tf-bash` 可能被沙箱拒
 
@@ -44,12 +72,17 @@
 
 ## 四、降级通道（有告警，不静默）
 
-### 7. bundle 形态下 plugin record 可能降级内存
+### 7. bundle 形态下 plugin record 通道降级（0.2.0 已修复为文件台账）
 
-- **现象**：通过 `dsh plugin add` 安装时，bare import `@deepseek-ai/dsh-session` 可能拿不到宿主同一模块实例，`appendPluginRecord` 不可达。
-- **行为**：降级为内存台账，stderr 打告警（`[stream-loop] plugin:tf-agent ledger ...`）。
-- **代价**：resume 后 `tf-*` 状态不可重放；session log 里仍有 turn / step / assistant 事件。
-- **取证**：`src/entry/loop.ts` 的 `attachSessionLedger`。
+- **原现象**：bare import `@deepseek-ai/dsh-session` 拿不到宿主同一模块实例 → 降级易失内存台账，
+  resume 后 `tf-*` 状态不可重放。
+- **修复**：`attachSessionLedger` 先走宿主 loader 三级同源解析（`loader.import` →
+  `loader.internal.import` → 动态 import）；仍不可达时降级**本地 JSONL 文件台账**（可重放），
+  resume 时 `rehydrateRecords` 把 final 答案回灌新驱动器。每级降级都告警，不静默。
+- **取证**：`src/entry/loop.ts` 的 `attachSessionLedger` / `collectTfAgentRecords` /
+  `SingleStreamDriver.rehydrateRecords`；`test/fix-limits.test.ts` L1–L3。
+- **余留**：命令记录刻意不回放（属性不回放则幂等指纹永不匹配，回放反而占用 id 命名空间）；
+  final 答案与句柄目录可跨 resume 续用。
 
 ## 五、评测工具自身的缺陷
 

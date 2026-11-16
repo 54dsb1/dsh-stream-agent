@@ -249,16 +249,17 @@ describe('A. mock E2E（验收核心）', () => {
       assert.ok(finalSeq > raDispatched, 'tf-final 在读之后（waitTools(3) 挂起点证明：挂起-重入发生在同一流内）');
       assert.equal(readFileSync(join(harness.sandboxDir, 'a.txt'), 'utf8'), '内容A');
 
-      // 请求 2 注入行骨架（O1），模型确认后再次 tf-final 收敛
+      // 请求 2 注入自写回验 receipt（修复限制 1：a.txt 由本任务 tf-write 写过，不再回灌全文），
+      // 模型确认后再次 tf-final 收敛
       // （句柄版本号按 obs key=path 计：a.txt 的写回执是 v1，read 观测是 v2）
       const req2 = harness.wireRequests[1]!;
-      assert.ok(
-        req2.contentTexts.some((t) => t.includes('[tf-stream:observation') && /obs:read:ra@v\d+/.test(t)),
-        '请求 2 应注入 read 骨架',
-      );
+      const receiptBlock = req2.contentTexts.find((t) => t.includes('[tf-stream:receipt') && t.includes('path=a.txt'));
+      assert.ok(receiptBlock !== undefined, `请求 2 应注入自写回验 receipt，实际消息：\n${req2.contentTexts.join('\n---\n').slice(0, 2000)}`);
+      assert.ok(receiptBlock.includes('lines=') && /sha256=[0-9a-f]{16}/.test(receiptBlock), 'receipt 应携带行数与内容指纹');
+      assert.ok(!receiptBlock.includes('内容A'), 'receipt 不得回灌自写文件全文');
       const counters = snap.counters();
       assert.equal(counters.produced, 3);
-      assert.equal(counters.injected, 2, 'v0.2：read 完整反馈（obs.peek 计 1）+ 原 high 注入口径（骨架位）合计 2');
+      assert.equal(counters.injected, 2, 'receipt 路径计数口径不变：骨架位 + receipt peek 合计 2');
       assert.equal(lastReasonOf(snap), 'completed');
     } finally {
       harness.cleanup();

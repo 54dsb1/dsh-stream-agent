@@ -210,14 +210,43 @@ describe('07 state-handle', () => {
     assert.equal(two.service.store, storeBefore, '失配时不许切换 store');
   });
 
-  it('A4: storage 不可用 → 内存降级（durable=false），服务照常提供且告警不静默', async () => {
-    const { ctx, warnings } = makeFakeCtx(); // 无 storage 服务
-    const { service } = applyStateHandle(ctx as never, {});
-    await tick();
-    assert.equal(service.durable, false);
-    const h = service.store.put('in-memory-only');
-    assert.equal(service.store.get(h), 'in-memory-only');
-    assert.equal(warnings.some((w) => w.includes('state-handle')), true, '降级必须告警');
+  it('A4: storage 不可用 → 本地文件 KvUnit 兜底（durable=true，跨会话 resume 可用；修复限制 3）；localFallback 关闭 → 内存降级', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tf-state-'));
+    try {
+      // ① 默认：宿主 storage 缺位 → 本地 JSON 文件 KvUnit（durable），且降级路径告警不静默
+      const { ctx, warnings } = makeFakeCtx(); // 无 storage 服务
+      const first = applyStateHandle(ctx as never, { stateDir: dir });
+      await tick();
+      assert.equal(first.service.durable, true, '本地文件兜底后必须 durable');
+      const h = first.service.store.put('local-fallback-durable');
+      assert.equal(first.service.store.get(h), 'local-fallback-durable');
+      assert.equal(warnings.some((w) => w.includes('state-handle')), true, '宿主 storage 缺位必须告警');
+      await first.service.persist();
+      await first.dispose();
+      const handleStr = `${h.kind}:${h.path}@v${h.version}`;
+
+      // ② "重启"：全新内存 + 同一 stateDir → 快照读回、resume 重建（跨会话，无宿主 storage）
+      const second = makeFakeCtx();
+      const two = applyStateHandle(second.ctx as never, { stateDir: dir });
+      await tick();
+      assert.equal(two.service.durable, true);
+      const report = await two.service.resume();
+      assert.equal(report.ok, true, `mismatches: ${report.mismatches.join('; ')}`);
+      const restored = two.service.store.handles().map((x) => `${x.kind}:${x.path}@v${x.version}`);
+      assert.ok(restored.includes(handleStr), `resume 应重建句柄 ${handleStr}`);
+      assert.equal(two.service.store.get(two.service.store.handles().find((x) => `${x.kind}:${x.path}@v${x.version}` === handleStr)!), 'local-fallback-durable');
+      await two.dispose();
+
+      // ③ localFallback:false → 维持 v0.1 内存降级行为（durable=false）
+      const third = makeFakeCtx();
+      const mem = applyStateHandle(third.ctx as never, { stateDir: dir, localFallback: false });
+      await tick();
+      assert.equal(mem.service.durable, false);
+      assert.equal(third.warnings.some((w) => w.includes('state-handle')), true, '内存降级必须告警');
+      await mem.service.persist();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('A5: announce 路径——装载横幅可输出且 apply 不抛（宿主冒烟曾在此抓到 ReferenceError）', async () => {

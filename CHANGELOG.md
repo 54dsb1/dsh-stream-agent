@@ -2,6 +2,59 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-11-16
+
+四个已知限制的定向修复（README「已知限制」1–4 ↔ `docs/limitations.md` 1/3/5/7），
+外加 `tf-code` 程序化执行通道（PTC 桥接）。
+
+### Added
+
+- **自写回验 receipt（O7，修「写批任务 token 偏重」）**：`tf-read` 命中本任务 `tf-write`
+  已写过的路径时，不再回灌全文——全文本来就在模型上下文里，改为注入回执
+  （`[tf-stream:receipt]`，行数 + sha256 指纹），掐断"写 → 读回验 → 再改"循环；
+  协议文本新增"回验纪律"。读外部文件的完整反馈保持不变；`selfReadFeedback: 'full'`
+  可恢复 v0.1 行为。默认开启。
+- **steer 语义对齐内建（修"插队队首、回合边界生效"）**：回合运行中收到 steer → 注入
+  运行中回合的**下一请求**（追加区 `[tf-stream:steer]` 用户块，前缀单调不破；带未消费
+  steer 时不允许收敛）；单流"流内不打断"（不掐当前流）前提不变。空闲时保持原语义
+  （插队队首、当新回合任务）。`inbox.nextStep` 如实暴露未消费 steer。
+- **本地持久化兜底（修"持久化依赖宿主 storage"）**：新增 `entry/json-persistence.ts`
+  （零依赖）——宿主缺 storage backend 时 state-handle 降级本地 JSON 文件 KvUnit
+  （durable，跨会话 resume 可用）；宿主缺 `sessionPersistence` 时 AgentFactory 用本地
+  JSONL 会话日志（create 落盘、resume 冷读，事件经 `withEventCapture` 镜像），headless
+  跨会话 resume 真正可用。状态根目录：`STREAM_AGENT_STATE_DIR` env → `~/.dsh-stream-agent`；
+  `persistFallback: false` / `localFallback: false` 可关闭（回 v0.1 内存降级）。
+- **本地文件台账（修"bundle 形态 plugin record 降级内存"）**：`attachSessionLedger` 改走
+  宿主 loader 三级同源解析（`loader.import` → `loader.internal.import` → 动态 import，
+  与 dsh-scope 同款）；仍不可达时降级**本地 JSONL 文件台账**（可重放，不再是易失内存），
+  resume 时 `rehydrateRecords` 把 final 答案回灌新驱动器（同 id 新 summary 覆盖，
+  last-wins 语义与运行中一致）。
+- **`tf-code` 程序化工具调用（PTC 桥接）**：把宿主 PTC runtime（`ctx.ptcRuntime` 服务缝，
+  `@deepseek-ai/dsh-ptc-runtime`）收编为单流协议的执行通道——模型在流里写
+  `<tf-code id="c1" description="...">（async TS 函数体）</tf-code>`，闭合即派发到 runtime
+  沙箱执行，返回值（无损 JSON）句柄化进 obs 账本（新 `code` 族：首个/变化结果注骨架，
+  失败一律 high），中间结果不进上下文。
+- 绑定命名空间 `tools`（write/read/pwsh）走驱动器同一条 `executeTools` 通道——宿主
+  guard/工作区策略/凭据全部生效（安全面与 PTC 模式等权：程序自身不做任何直接 IO）。
+- 协议文本按通道可用性声明：`executeCode` 端口在位才追加 tf-code 段（稳定前缀构造期
+  冻结，通道不存在就不会被模型幻觉调用）；`enableCode: false` 强制关闭。
+- 通道缺失/形状不符时 tf-code 命令级失败（`no-code-channel`）并引导改道 tf-bash，
+  告警不静默（fail-open，红线 5）。
+- 测试 208 用例（新增 `test/fix-limits.test.ts` 11 例 + `test/ptc-bridge.test.ts` 10 例 +
+  A2/A4 更新为修复后语义）。
+
+### Changed
+
+- `apply` 配置新增 `selfReadFeedback` / `persistFallback` / `stateDir`；
+  `state-handle` 配置新增 `localFallback` / `stateDir`。
+- 本地兜底默认开启：首次使用会在状态目录创建 `sessions/`、`ledger/`、`storage/` 子目录。
+
+### Design
+
+- 与官方 PTC 模式（`run_code` 工具，`dsh-tool-executor-ptc`）正交互补：PTC 改"工具调用
+  介质"，tf-code 改"循环层"——单流协议负责编排（depends_on / 隐式写序 / 前缀单调），
+  重型数据加工下沉到 PTC runtime，两层优势叠加而非二选一。
+
 ## [0.1.1] - 2026-11-15
 
 首次发布到 npm（`@hugesb/dsh-stream-agent`）。
@@ -74,5 +127,6 @@
 其中需重点注意：写批任务 token 偏重、`replay` 对真连 session log 0 命中、
 bundle 形态下 plugin record 通道可能降级内存。
 
+[0.2.0]: https://github.com/54dsb1/dsh-stream-agent/releases/tag/v0.2.0
 [0.1.1]: https://github.com/54dsb1/dsh-stream-agent/releases/tag/v0.1.1
 [0.1.0]: https://github.com/54dsb1/dsh-stream-agent/releases/tag/v0.1.0
