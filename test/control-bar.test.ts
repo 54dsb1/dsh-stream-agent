@@ -13,7 +13,17 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DEFAULT_MODE, MODES, getMode, isModeId, modeByOrder, modeConfig } from '../src/kernel/modes.ts';
+import {
+  AVAILABILITY_TEXT,
+  DEFAULT_MODE,
+  MODES,
+  SAVING_TEXT,
+  getMode,
+  isModeId,
+  modeByOrder,
+  modeConfig,
+  publicModeCatalog,
+} from '../src/kernel/modes.ts';
 import {
   DEFAULT_LANG,
   createControlState,
@@ -162,6 +172,62 @@ test('渲染：状态条是单行且不超过面板宽度', () => {
   }
 });
 
+test('模式目录：四个模式都标了省 token 档位与可用性，默认模式只有一个', () => {
+  const savings = new Set(['most', 'more', 'baseline', 'least']);
+  const availabilities = new Set(['default', 'ready', 'needs-ptc']);
+
+  for (const mode of MODES) {
+    assert.ok(savings.has(mode.saving), `${mode.id}.saving 取值非法：${mode.saving}`);
+    assert.ok(availabilities.has(mode.availability), `${mode.id}.availability 取值非法：${mode.availability}`);
+    for (const lang of ['zh', 'en'] as const) {
+      assert.ok(SAVING_TEXT[mode.saving][lang].trim() !== '', `${mode.id} 缺 ${lang} 省 token 文案`);
+      assert.ok(AVAILABILITY_TEXT[mode.availability][lang].trim() !== '', `${mode.id} 缺 ${lang} 可用性文案`);
+      assert.ok(mode.note[lang].trim().length >= 20, `${mode.id}.note.${lang} 太短，讲不清口径`);
+    }
+  }
+
+  // 默认模式必须且只能标一个 default，否则"装好即用"这句话就自相矛盾。
+  assert.deepEqual(MODES.filter((m) => m.availability === 'default').map((m) => m.id), [DEFAULT_MODE]);
+  // 四张卡的标注不能全一样，否则这列没有信息量。
+  assert.ok(new Set(MODES.map((m) => m.saving)).size >= 3, '省 token 档位区分度不足');
+  assert.ok(new Set(MODES.map((m) => m.availability)).size >= 2, '可用性区分度不足');
+});
+
+test('模式目录：对外投影一次生成，CLI --json 与桌面路由共用同一份字段', () => {
+  const catalog = publicModeCatalog();
+  assert.equal(catalog.length, 4);
+  for (const mode of catalog) {
+    assert.ok(mode.savingLabel.zh && mode.savingLabel.en, `${mode.id} 缺省 token 标签`);
+    assert.ok(mode.availabilityLabel.zh && mode.availabilityLabel.en, `${mode.id} 缺可用性标签`);
+    assert.ok(mode.note.zh && mode.note.en, `${mode.id} 缺标注`);
+    assert.equal((mode as Record<string, unknown>).config, undefined, '投影不应把 config 发到网络上');
+  }
+  const parsed = JSON.parse(renderJson(createControlState({ mode: 'power', lang: 'zh' }), { version: VERSION }));
+  assert.deepEqual(parsed.modes, catalog);
+});
+
+test('渲染：帮助页逐模式带"省多少 / 能不能用"，面板展开当前模式的标注全文', () => {
+  for (const lang of ['zh', 'en'] as const) {
+    const state = createControlState({ mode: 'power', lang });
+    const help = renderHelp(state, { version: VERSION }).join('\n');
+    for (const mode of MODES) {
+      assert.ok(
+        help.includes(SAVING_TEXT[mode.saving][lang]),
+        `${lang} 帮助页缺 ${mode.id} 的省 token 标注`,
+      );
+    }
+    assert.ok(help.includes(AVAILABILITY_TEXT['needs-ptc'][lang]), `${lang} 帮助页缺 PTC 前提标注`);
+
+    const panel = renderPanel(state, { version: VERSION }).join('\n');
+    const flat = panel.replace(/\s+/g, ' ');
+    assert.ok(flat.includes(t('saving', lang)), `${lang} 面板缺"省 token"标签`);
+    assert.ok(flat.includes(SAVING_TEXT[getMode('power').saving][lang]), `${lang} 面板缺当前模式档位`);
+    assert.ok(flat.includes(AVAILABILITY_TEXT['needs-ptc'][lang]), `${lang} 面板缺可用性`);
+    const noteHead = getMode('power').note[lang].replace(/\s+/g, ' ').slice(0, 16);
+    assert.ok(flat.includes(noteHead), `${lang} 面板缺标注全文`);
+  }
+});
+
 test('渲染：--json 结构稳定，含四个模式与当前配置', () => {
   const parsed = JSON.parse(renderJson(createControlState({ mode: 'power', lang: 'en' }), { version: VERSION })) as {
     version: string; active: boolean; mode: { id: string; config: { enableCode: boolean } }; lang: string; modes: unknown[];
@@ -216,6 +282,30 @@ test('文本工具：truncate 与 wrapText 按显示列宽工作（CJK 记 2 列
   const wrapped = wrapText('中文中文中文', 4);
   assert.deepEqual(wrapped, ['中文', '中文', '中文']);
   assert.deepEqual(wrapText('short', 10), ['short']);
+});
+
+test('折行：填满整行、不切英文单词、行首不放标点、末行不留孤字', () => {
+  // 中文里夹 ASCII token 时，旧实现会在空格处提前回退，行尾剩十几列空白。
+  const mixed = '宿主没有 ctx.ptcRuntime 时 tf-code 通道自动关闭（协议不声明）；协议段更长，固定成本略高。';
+  const lines = wrapText(mixed, 66);
+  assert.ok(lines.length >= 2, '应当折行');
+  for (const line of lines.slice(0, -1)) {
+    assert.ok(displayWidth(line) > 66 - 12, `非末行没填满：${displayWidth(line)} 列 -> ${line}`);
+  }
+  // 英文单词/路径不能被从中间切开
+  for (const token of ['ctx.ptcRuntime', 'tf-code']) {
+    assert.ok(lines.some((line) => line.includes(token)), `${token} 被切开了：${lines.join(' | ')}`);
+  }
+  // 行首不能是闭合标点（避头点）
+  for (const line of lines.slice(1)) {
+    assert.equal(/^[。，、；：！？）】,.;:!?]/.test(line), false, `行首出现标点：${line}`);
+  }
+  // 末行不留孤字：只剩 1 个单位时，从上一行借一个下来
+  const orphan = wrapText('数据加工类任务省最多（结果句柄化，中间结果不进上下文）；普通读写任务反而略高于默认。宿主无 PTC 时自动回落为默认参数。未单独实测。', 66);
+  const tail = orphan[orphan.length - 1];
+  assert.ok(displayWidth(tail) >= 4, `末行只剩 ${displayWidth(tail)} 列：${tail}`);
+  // 折行不丢字：拼回去等于原文（行尾空白裁掉是唯一允许的差异）
+  assert.equal(lines.join('').replace(/\s+/g, ''), mixed.replace(/\s+/g, ''));
 });
 
 test('状态落盘：写入 → 读取往返（原子替换，字段齐全）', () => {

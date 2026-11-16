@@ -14,7 +14,7 @@
 //
 // 与宿主无关：本文件不 import 任何东西，node --test 直接可测。
 
-import { DEFAULT_MODE, MODES, getMode, isModeId, modeByOrder } from './modes.js';
+import { AVAILABILITY_TEXT, DEFAULT_MODE, MODES, SAVING_TEXT, getMode, isModeId, modeByOrder, publicModeCatalog } from './modes.js';
                                                    
 
                                
@@ -50,6 +50,9 @@ const TEXT = {
   current: { zh: '当前', en: 'Current' },
   fits: { zh: '适合', en: 'Use when' },
   cost: { zh: '代价', en: 'Trade-off' },
+  saving: { zh: '省 token', en: 'Token saving' },
+  availability: { zh: '可用性', en: 'Availability' },
+  note: { zh: '标注', en: 'Note' },
   steps: { zh: '上手', en: 'Start' },
   keys: { zh: '按键', en: 'Keys' },
   commands: { zh: '命令', en: 'Commands' },
@@ -174,34 +177,113 @@ export function padRight(text        , width        )         {
   return gap <= 0 ? text : `${text}${' '.repeat(gap)}`;
 }
 
-/** 按显示列宽折行：优先在空格处断（英文），中文逐字符断。 */
+/**
+ * 断行单位：宽字符（CJK/全角）逐字可断；ASCII 连续非空白算一个整体，不切开单词。
+ *
+ * 旧实现按字符贪心、遇空格回退，英文短句没问题，但中文里夹着 `ctx.ptcRuntime`
+ * 这种 token 时会在空格处提前回退，行尾留下十几列空白——一屏里好几行右端参差，
+ * 看着像表格没对齐。改成"先切单位再贪心填充"：中文能填满整行，英文单词不被打断。
+ *
+ * 闭合标点额外粘到前一个单位上：中文逐字断行时 `。` 极易被挤到下一行行首，
+ * 一屏里出现一个孤零零的句号。粘上之后，装不下就整对一起换行，最多让上一行
+ * 少 2 列，不会出现行首标点。
+ */
+const CLOSING_PUNCT = new Set([...'。，、；：！？）〕］｝》」』〉】,.;:!?)]}']);
+
+function breakUnits(text        )           {
+  const units           = [];
+  let word = '';
+  for (const ch of text) {
+    // 闭合标点必须先判：中文标点本身也是宽字符，放到下面会被当成独立单位。
+    if (CLOSING_PUNCT.has(ch)) {
+      if (word !== '') {
+        // 英文标点本来就贴着单词，直接并进 word。
+        word += ch;
+        continue;
+      }
+      const last = units.length > 0 ? units[units.length - 1] : undefined;
+      if (last !== undefined && last !== ' ') {
+        units[units.length - 1] = last + ch;
+        continue;
+      }
+      units.push(ch);
+      continue;
+    }
+    if (ch === ' ' || charWidth(ch) > 1) {
+      if (word !== '') {
+        units.push(word);
+        word = '';
+      }
+      units.push(ch);
+      continue;
+    }
+    word += ch;
+  }
+  if (word !== '') units.push(word);
+  return units;
+}
+
+/** 按显示列宽折行：中文逐字断，英文按词断，行尾不留空白，末行不留孤字。 */
 export function wrapText(text        , width        )           {
   if (width <= 0) return [text];
   if (displayWidth(text) <= width) return [text];
-  const lines           = [];
-  let line = '';
+  const lines             = [];
+  let current           = [];
   let lineWidth = 0;
-  let lastSpace = -1;
-  for (const ch of text) {
-    const w = charWidth(ch);
-    if (lineWidth + w > width) {
-      if (lastSpace > 0) {
-        lines.push(line.slice(0, lastSpace));
-        line = line.slice(lastSpace + 1);
-        lineWidth = displayWidth(line);
-      } else {
-        lines.push(line);
-        line = '';
-        lineWidth = 0;
-      }
-      lastSpace = -1;
+  const flush = ()       => {
+    if (current.length > 0) lines.push(current);
+    current = [];
+    lineWidth = 0;
+  };
+  for (const unit of breakUnits(text)) {
+    const w = displayWidth(unit);
+    if (unit === ' ') {
+      if (lineWidth === 0) continue; // 行首空格丢掉（上一条已 trimEnd）
+      current.push(unit);
+      lineWidth += w;
+      continue;
     }
-    line += ch;
+    if (lineWidth > 0 && lineWidth + w > width) flush();
+    if (w > width) {
+      // 单个单位比整行还宽（超长路径/无空格长串）：按列硬切，避免撑破盒子。
+      let piece = '';
+      let pieceWidth = 0;
+      for (const ch of unit) {
+        const cw = charWidth(ch);
+        if (pieceWidth > 0 && pieceWidth + cw > width) {
+          current.push(piece);
+          flush();
+          piece = '';
+          pieceWidth = 0;
+        }
+        piece += ch;
+        pieceWidth += cw;
+      }
+      if (piece !== '') {
+        current.push(piece);
+        lineWidth += pieceWidth;
+      }
+      continue;
+    }
+    current.push(unit);
     lineWidth += w;
-    if (ch === ' ') lastSpace = line.length - 1;
   }
-  if (line !== '') lines.push(line);
-  return lines;
+  flush();
+  // 末行只剩一个单位时从上一行借一个下来：中文逐字断行很容易把"测。"单独留成
+  // 一行 4 列，一屏里出现这种孤字比行尾差几列更扎眼。
+  if (lines.length >= 2) {
+    const last = lines[lines.length - 1];
+    const prev = lines[lines.length - 2];
+    const borrow = prev[prev.length - 1];
+    if (last.length === 1 && prev.length > 2 && borrow !== undefined
+      && displayWidth(borrow) + displayWidth(last[0]) <= width) {
+      prev.pop();
+      last.unshift(borrow);
+    }
+  }
+  return lines
+    .map((line) => line.join('').replace(/\s+$/, ''))
+    .filter((line) => line !== '');
 }
 
 /** 终端列数 → 面板宽度（留 2 列边距；窄终端保底 56，宽终端最多 92）。 */
@@ -228,8 +310,16 @@ export function box(title        , lines                   , width        )     
 }
 
 /** 标签块：label + 折行正文（首行带标签，续行对齐缩进）。 */
-function labeled(label        , value        , width        )           {
-  const prefix = `${label}  `;
+/**
+ * 渲染"标签 + 值"的行，超宽按词折行，续行与首行的值列左对齐。
+ *
+ * `labelWidth` 传进来时把标签右补空格到该显示宽度：一屏里多个标签长度不同（中文
+ * "当前/合适/省 token"，英文 "Note/Token saving"），不补空格右侧数值就会参差，
+ * 80 列下看起来像没对齐的表格。调用方用它传同一块里最长的标签宽度。
+ */
+function labeled(label        , value        , width        , labelWidth         )           {
+  const pad = labelWidth === undefined ? 0 : Math.max(0, labelWidth - displayWidth(label));
+  const prefix = `${label}${' '.repeat(pad)}  `;
   const room = Math.max(12, width - displayWidth(prefix));
   const parts = wrapText(value, room);
   const indent = ' '.repeat(displayWidth(prefix));
@@ -263,6 +353,16 @@ export function modeSummary(mode          , lang      )         {
     parts.push(`${t('budget', lang)} ${Math.round(mode.config.budgetTokens / 1000)}k`);
   }
   return parts.join(' | ');
+}
+
+/**
+ * 模式的"省多少 + 能不能用"一句话标注（引导面板 / 帮助页每模式一行）。
+ *
+ * 这两件事是新人选模式时最先问的，所以放在同一行；定量口径与"未单独实测"写在
+ * `mode.note` 里，只在面板（当前模式详情）展开，避免帮助页变成一屏论文。
+ */
+export function modeBadges(mode          , lang      )         {
+  return `${SAVING_TEXT[mode.saving][lang]} | ${AVAILABILITY_TEXT[mode.availability][lang]}`;
 }
 
 /** 模式选择条：[1]*均衡  [2] 精简  [3] 兼容  [4] 增强（* = 已应用，> = 焦点） */
@@ -317,6 +417,7 @@ export function renderBanner(state              , options               )       
     ...(statusLine === undefined ? [] : [statusLine]),
     `${t('mode', lang)}: ${mode.order} ${mode.label[lang]} (${mode.id}) | ${modeSummary(mode, lang)}`,
     ...labeled(t('fits', lang), mode.useWhen[lang], width - 4),
+    ...labeled(t('saving', lang), modeBadges(mode, lang), width - 4),
     '',
     t('stepTitle', lang),
     `  ${t('step1', lang)}`,
@@ -340,16 +441,30 @@ export function renderPanel(state              , options               )        
   const statusLine = options.active === undefined
     ? []
     : [`${t('status', lang)}: ${options.active ? t('active', lang) : t('inactive', lang)}`];
+  // 整块共用同一标签宽度：中文最长是"省 token"，英文是 "Token saving"。
+  const labelWidth = Math.max(
+    displayWidth(t('current', lang)),
+    displayWidth(t('fits', lang)),
+    displayWidth(t('cost', lang)),
+    displayWidth(t('saving', lang)),
+    displayWidth(t('availability', lang)),
+    displayWidth(t('note', lang)),
+    displayWidth(t('commands', lang)),
+    displayWidth(t('keys', lang)),
+  );
   const lines = [
     ...statusLine,
     `${t('mode', lang)}: ${modeStrip(state, options.focus)}`,
-    ...labeled(t('current', lang), `${focus.order} ${focus.label[lang]} (${focus.id}) | ${modeSummary(focus, lang)}`, width - 4),
-    ...labeled(t('fits', lang), focus.useWhen[lang], width - 4),
-    ...labeled(t('cost', lang), focus.tradeoff[lang], width - 4),
+    ...labeled(t('current', lang), `${focus.order} ${focus.label[lang]} (${focus.id}) | ${modeSummary(focus, lang)}`, width - 4, labelWidth),
+    ...labeled(t('fits', lang), focus.useWhen[lang], width - 4, labelWidth),
+    ...labeled(t('cost', lang), focus.tradeoff[lang], width - 4, labelWidth),
+    ...labeled(t('saving', lang), SAVING_TEXT[focus.saving][lang], width - 4, labelWidth),
+    ...labeled(t('availability', lang), AVAILABILITY_TEXT[focus.availability][lang], width - 4, labelWidth),
+    ...labeled(t('note', lang), focus.note[lang], width - 4, labelWidth),
     '',
-    ...labeled(t('commands', lang), 'dsh-stream-agent bar | status | mode <id> | lang <zh|en>', width - 4),
+    ...labeled(t('commands', lang), 'dsh-stream-agent bar | status | mode <id> | lang <zh|en>', width - 4, labelWidth),
     '',
-    ...labeled(t('keys', lang), t('panelHint', lang), width - 4),
+    ...labeled(t('keys', lang), t('panelHint', lang), width - 4, labelWidth),
     `${t('langLabel', lang)}: ${state.lang} | ${t('docs', lang)}: README.md#control-bar`,
   ];
   return box(`dsh-stream-agent v${options.version} - ${t('barTitle', lang)}`, lines, width);
@@ -361,12 +476,19 @@ export function renderHelp(state              , options               )         
   const width = panelWidth(options.columns);
   const inner = width - 4;
   const lines           = [t('helpTitle', lang), ''];
+  // 四个模式共用同一标签宽度，纵向扫视时"适合/代价/省 token"的值列才在同一列。
+  const labelWidth = Math.max(
+    displayWidth(`  ${t('fits', lang)}`),
+    displayWidth(`  ${t('cost', lang)}`),
+    displayWidth(`  ${t('saving', lang)}`),
+  );
   for (const mode of MODES) {
     const mark = mode.id === state.mode ? '*' : ' ';
     lines.push(`[${mode.order}]${mark}${mode.label[lang]} (${mode.id}) | ${modeSummary(mode, lang)}`);
     lines.push(...labeled('', mode.tagline[lang], inner).map((line) => `  ${line.trimStart()}`));
-    lines.push(...labeled(`  ${t('fits', lang)}`, mode.useWhen[lang], inner));
-    lines.push(...labeled(`  ${t('cost', lang)}`, mode.tradeoff[lang], inner));
+    lines.push(...labeled(`  ${t('fits', lang)}`, mode.useWhen[lang], inner, labelWidth));
+    lines.push(...labeled(`  ${t('cost', lang)}`, mode.tradeoff[lang], inner, labelWidth));
+    lines.push(...labeled(`  ${t('saving', lang)}`, modeBadges(mode, lang), inner, labelWidth));
     lines.push('');
   }
   lines.push(t('helpHint', lang));
@@ -381,7 +503,7 @@ export function renderJson(state              , options               )         
     active: options.active !== false,
     mode: { id: mode.id, order: mode.order, label: mode.label[state.lang], config: mode.config },
     lang: state.lang,
-    modes: MODES.map((m) => ({ id: m.id, order: m.order, label: m.label, tagline: m.tagline })),
+    modes: publicModeCatalog(),
   }, null, 2);
 }
 

@@ -61,6 +61,8 @@ window.__ModuleLoader__.load({
 				applying: "应用中…",
 				useWhen: "什么时候选",
 				tradeoff: "代价",
+				saving: "省 token",
+				availability: "可用性",
 				saved: "已保存，对新会话生效。",
 				noticeConflict: "状态已被其他窗口或 CLI 修改，已刷新为最新值。",
 				writeFailed: "写入失败",
@@ -122,6 +124,8 @@ window.__ModuleLoader__.load({
 				applying: "Applying…",
 				useWhen: "When to choose",
 				tradeoff: "Trade-off",
+				saving: "Token saving",
+				availability: "Availability",
 				saved: "Saved. Applies to new sessions.",
 				noticeConflict: "Another window or the CLI changed the state; refreshed to the latest value.",
 				writeFailed: "Write failed",
@@ -297,6 +301,17 @@ window.__ModuleLoader__.load({
 					h("span", { className: "sa-mode-row-label" }, t.tradeoff),
 					h("span", null, mode.tradeoff[lang]),
 				),
+				h("div", { className: "sa-mode-row sa-mode-saving" },
+					h("span", { className: "sa-mode-row-label" }, t.saving),
+					h("span", null, mode.savingLabel?.[lang] ?? mode.saving),
+				),
+				h("div", { className: "sa-mode-row" },
+					h("span", { className: "sa-mode-row-label" }, t.availability),
+					h("span", null, mode.availabilityLabel?.[lang] ?? mode.availability),
+				),
+				mode.note?.[lang]
+					? h("div", { className: "sa-mode-note" }, mode.note[lang])
+					: null,
 			);
 		}
 
@@ -501,6 +516,8 @@ window.__ModuleLoader__.load({
 .sa-mode-row{display:grid;grid-template-columns:minmax(64px,max-content) minmax(0,1fr);gap:8px;font-size:12px;color:var(--dsw-alias-label-primary,#1a1a1a);}
 .sa-mode-row-label{color:var(--dsw-alias-label-tertiary,#80868b);}
 .sa-mode-cost{color:var(--dsw-alias-label-secondary,#5f6368);}
+.sa-mode-saving{color:var(--dsw-alias-label-primary,#1a1a1a);}
+.sa-mode-note{margin-top:2px;padding:6px 8px;border-radius:6px;background:var(--dsw-alias-bg-layer-2,#f4f5f7);color:var(--dsw-alias-label-tertiary,#80868b);font-size:11px;line-height:1.5;text-align:left;}
 .sa-params{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;}
 .sa-param{display:flex;flex-direction:column;gap:2px;padding:9px 11px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,#f7f8f9);}
 .sa-param-key{color:var(--dsw-alias-label-tertiary,#80868b);font-size:11px;}

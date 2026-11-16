@@ -13,7 +13,7 @@ Verified against the real API (10 tasks, two arms, same model `deepseek-flash`):
 |---|---|
 | Host | DeepSeek Harness `0.2.2-rc.1` (type anchor) / `rc.3` (runtime-tested) |
 | Dependencies | Zero npm dependencies; Node ≥ 22.18 (native type stripping) |
-| Tests | 250 cases green, zero API calls (full mock pipeline + 20 scenarios + activation/desktop-page regression) |
+| Tests | 255 cases green, zero API calls (full mock pipeline + 20 scenarios + activation/desktop-page regression) |
 | Shape | One bundle package — install/remove with a single `dsh plugin add`; uninstall restores the native loop |
 | Control bar | `dsh-stream-agent bar`: four modes + zh/en switching, with a startup guide on activation |
 | Desktop page | Left-rail **Control bar**: status + four modes + zh/en switch, **without touching the Electron shell** |
@@ -146,6 +146,21 @@ equivalent to the 0.2.0 factory default.
 One-line decision: **default to `balanced`; switch to `lean` when the bill matters; `compat` to debug
 and compare; `power` to process data programmatically.**
 
+How much it saves, and whether it can run here — the same annotations shown in the
+`dsh-stream-agent bar` panel and on the desktop page (one source: `kernel/modes.ts`):
+
+| Mode | Token saving | Availability | Note |
+|---|---|---|---|
+| `balanced` | baseline (29% of native loop) | Default, works out of the box | This is what you get without touching any config; this version keeps those defaults |
+| `lean` | higher (more than default) | Ready, no prerequisites | 60k ladder, parallelism 2, no tf-code — the gap widens in long sessions |
+| `compat` | lowest (above default) | Ready, no prerequisites | Full read-back is back and parallelism drops to 1; even so it stays below the native loop |
+| `power` | highest (best on data tasks) | Needs a host PTC runtime, otherwise falls back to default parameters | Pays off on data-processing tasks only; on plain read/write work it costs slightly more than the default |
+
+**Be precise about the basis**: only "default parameters vs the native loop" has a two-arm
+measurement (10 tasks, ~29% of native, i.e. ~70% saved). The other three tiers are directional
+judgements that were not benchmarked separately — printing an unmeasured percentage would mislead
+budgeting, so we only give a tier.
+
 How modes map to config (changing a mode changes these values; explicit config in the composition
 still wins):
 
@@ -188,7 +203,7 @@ What the page does:
 |---|---|
 | Header | Version, **takeover active / not taking over**, current mode, current language |
 | Current state | Mode, source (composition config / environment / state file / default), language, updated time, state-file path |
-| Runtime mode | Four cards: `balanced` / `lean` / `compat` / `power`, each with "when to choose" and "trade-off"; one click applies |
+| Runtime mode | Four cards: `balanced` / `lean` / `compat` / `power`, each with "when to choose", "trade-off", a **token-saving tier** and an **availability** note (host PTC required or not); one click applies |
 | Effective parameters | Self-read feedback, tf-code, local fallback, parallel commands, max re-entries, token budget |
 | Language | Chinese / English, persisted to `control.json` immediately |
 | Footer | Equivalent CLI commands for scripting |
@@ -336,7 +351,7 @@ dsh-stream-agent/
 │   └── entry/            # Cordis thin shells: translation only (+ cordis-compat discipline)
 ├── ui/                   # desktop page subpackage: Host route + browser bundle (own dsh.client)
 ├── dist/                 # build output (committed; patches reference it directly)
-├── test/                 # 250 cases (activation regression + control-bar i18n/layout + desktop route) + 20 mock scenarios
+├── test/                 # 255 cases (activation regression + control-bar i18n/layout + desktop route) + 20 mock scenarios
 ├── patches/              # composition patches for development and evaluation
 ├── docs/                 # architecture, protocol, limitations
 ├── scripts/build.mjs     # zero-dependency build (Node native type stripping)
@@ -348,7 +363,7 @@ dsh-stream-agent/
 ## Development
 
 ```bash
-npm test          # 250/250, zero API calls
+npm test          # 255/255, zero API calls
 npm run build     # emits dist/ (24 files) + full smoke imports
 ```
 

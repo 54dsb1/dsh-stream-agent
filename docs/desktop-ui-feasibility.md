@@ -91,8 +91,8 @@ ctx.slots.register({ name: 'main', key: 'plugins', ... }, Page)
 |---|---|---|
 | `ui/package.json` | 独立子包；声明 `dsh.client`（web）、`exports["./client"]`、`external: ["react"]` | ~25 行 |
 | `ui/index.js` | 宿主半边：`/stream-agent/control` 同源路由、鉴权、读写、降级 | ~300 行 |
-| `ui/client.js` | 浏览器半边：`__ModuleLoader__` bundle、整页 React、左侧栏图标、样式 | ~560 行（26 KB） |
-| `test/desktop-ui.test.ts` | 包声明、bundle 契约、中英文案对称、路由 7 组用例 | ~344 行 |
+| `ui/client.js` | 浏览器半边：`__ModuleLoader__` bundle、整页 React、左侧栏图标、样式 | ~580 行（27 KB） |
+| `test/desktop-ui.test.ts` | 包声明、bundle 契约、中英文案对称、模式标注、路由 7 组用例 | ~359 行 |
 | `docs/desktop-ui-feasibility.md` | 本文 | — |
 
 ### 3.2 修改
@@ -101,6 +101,7 @@ ctx.slots.register({ name: 'main', key: 'plugins', ... }, Page)
 |---|---|
 | `src/entry/loop.ts` | `resolveEffective()` 改为每次创建 driver 时重算；提供 `streamAgentRuntime` 服务（status/setMode/setLang）；服务注册失败只告警，不影响 loop |
 | `src/entry/control-state.ts` | 增加 `langSource`、`updatedAt`（并发栅栏）；来源联合类型增加 `runtime`（本次运行未落盘） |
+| `src/kernel/modes.ts` / `control-bar.ts` | 每模式新增 `saving` / `availability` / `note` 标注（三处渲染同源）；模式目录收敛为 `publicModeCatalog()`，CLI 与页面共用一份字段 |
 | `cordis.patch.yml` | 第 7 个 entry `stream-agent-ui`（`./ui/index.js`） |
 | `preset.yml` / `patches/takeover.yml` | 同步第 7 个 entry；`preset.yml` 行序调回 `sidecar → control-bar → ui → loop`；顺手修掉 preset 里一处 `config:/n` 的坏 YAML |
 | `package.json` | `files` 加 `ui/` |
@@ -227,7 +228,7 @@ control.json           ─┼─→ resolveControlState() → control { mode, la
 3. **`setMode('lean')` 返回 `{ok:true, persisted:true}`**，再次读状态为 `lean`；
 4. **真实 `dsh-client-modules` 扫描**：7 个 Loader 行 + UI 子包 → boot 图里**恰好 1 条**
    `@hugesb/dsh-stream-agent-ui`，无多源错误；
-5. **250/250 测试通过**，含 10 条桌面页用例（鉴权/跨站/JSON/非法值/锁定/409/首次写入/降级/中英文案对称）；
+5. **255/255 测试通过**，含 11 条桌面页用例（鉴权/跨站/JSON/非法值/锁定/409/首次写入/降级/中英文案对称/模式标注）；
 6. **构建闸门**：主包无 `dsh.client`、UI 包声明合规、`ui/client.js` 语法可编译。
 
 复现命令（工作区根目录）：
@@ -235,7 +236,7 @@ control.json           ─┼─→ resolveControlState() → control { mode, la
 ```bash
 node scratch/repro-all-entries.mjs     # 7 entry + 路由 + setMode
 node scratch/repro-client-scan.mjs     # 真实 client-modules 扫描
-npm test                               # 250 用例
+npm test                               # 255 用例
 npm run build                          # 含 UI 闸门
 ```
 

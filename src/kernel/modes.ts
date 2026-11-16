@@ -17,6 +17,32 @@ export type ModeId = (typeof MODE_IDS)[number];
 
 export const DEFAULT_MODE: ModeId = 'balanced';
 
+/**
+ * 相对省 token 幅度（定性档位，不是百分比）。
+ *
+ * 为什么不写死百分比：只有"默认参数 vs 原生 loop"有过两臂实测（v0.1.0，十任务，
+ * 约 29%），其余模式没有单独评测。把没测过的幅度写成百分比比不写更糟——用户会拿它
+ * 做预算。所以这里只给方向与档位，定量证据在 note 里注明来源与"未单独实测"。
+ */
+export type ModeSaving = 'most' | 'more' | 'baseline' | 'least';
+
+/** 可用性：默认模式 / 开箱可用 / 依赖宿主能力。 */
+export type ModeAvailability = 'default' | 'ready' | 'needs-ptc';
+
+export const SAVING_TEXT: Record<ModeSaving, { zh: string; en: string }> = {
+  most: { zh: '最高档（数据加工最省）', en: 'highest (best on data tasks)' },
+  more: { zh: '较高（比默认更省）', en: 'higher (more than default)' },
+  // 29% 是"用了原生 loop 的 29%"，不是"省了 29%"；行内写全，避免被反读。
+  baseline: { zh: '基准（约为原生 loop 的 29%）', en: 'baseline (29% of native loop)' },
+  least: { zh: '最低档（比默认略高）', en: 'lowest (above default)' },
+};
+
+export const AVAILABILITY_TEXT: Record<ModeAvailability, { zh: string; en: string }> = {
+  default: { zh: '默认模式，装好即用', en: 'Default, works out of the box' },
+  ready: { zh: '开箱可用，无前置', en: 'Ready, no prerequisites' },
+  'needs-ptc': { zh: '需宿主 PTC（无则回落）', en: 'Needs host PTC (falls back)' },
+};
+
 /** 一个模式对驱动器配置的落点（字段名与 LoopEntryConfig / StreamDriverConfig 对齐）。 */
 export interface ModeConfigPatch {
   /** O7 自写回验：'receipt' = 读自己刚写过的文件只回回执；'full' = v0.1 全文回灌 */
@@ -44,6 +70,12 @@ export interface ModeSpec {
   useWhen: { zh: string; en: string };
   /** 代价 / 需要注意什么 */
   tradeoff: { zh: string; en: string };
+  /** 相对省 token 幅度（档位） */
+  saving: ModeSaving;
+  /** 可用性：默认 / 开箱 / 依赖宿主 PTC */
+  availability: ModeAvailability;
+  /** 额外标注：把"省多少、在什么前提下成立"讲清楚（含实测口径） */
+  note: { zh: string; en: string };
   config: ModeConfigPatch;
 }
 
@@ -63,6 +95,12 @@ export const MODES: readonly ModeSpec[] = [
     tradeoff: {
       zh: '写批任务仍会出现"读自己刚写的文件只回回执"，需要全文时用 tf-peek 按行段取。',
       en: 'Write-batch tasks get a receipt instead of full echo when re-reading your own file; use tf-peek for line ranges.',
+    },
+    saving: 'baseline',
+    availability: 'default',
+    note: {
+      zh: '不动任何配置就是它。相对原生 loop 实测约 29% token（v0.1.0 十任务两臂），本版参数与之一致。',
+      en: 'This is what you get without touching any config. Measured at ~29% of the native loop tokens (v0.1.0, 10 tasks, two arms); this version keeps those defaults.',
     },
     config: {
       selfReadFeedback: 'receipt',
@@ -87,6 +125,12 @@ export const MODES: readonly ModeSpec[] = [
     tradeoff: {
       zh: '预算 60k 触发降级：70% 后只注高增益观测，90% 后只收 tf-final，可能牺牲细节。',
       en: 'A 60k budget triggers degradation: after 70% only high-gain observations, after 90% only tf-final. Detail may suffer.',
+    },
+    saving: 'more',
+    availability: 'ready',
+    note: {
+      zh: '比默认更省：60k 阶梯 + 并行 2 + 不声明 tf-code，长会话差距最明显。未单独实测，属方向性判断。',
+      en: 'Saves more than the default: 60k ladder, parallelism 2, no tf-code. The gap widens in long sessions. Not separately benchmarked — this is a directional call.',
     },
     config: {
       selfReadFeedback: 'receipt',
@@ -113,6 +157,12 @@ export const MODES: readonly ModeSpec[] = [
       zh: 'token 最高：写后回验恢复全文注入，并行度降到 1，速度也更慢。',
       en: 'Highest token cost: self-write read-back returns full text again and parallelism drops to 1, so it is slower.',
     },
+    saving: 'least',
+    availability: 'ready',
+    note: {
+      zh: '省得最少：恢复全文回验、并行降到 1；即使如此仍低于原生 loop，因为单流协议本身在省。未单独实测。',
+      en: 'Saves least: full read-back is back and parallelism drops to 1. Even so it stays below the native loop — the single-stream protocol itself is where the saving comes from. Not separately benchmarked.',
+    },
     config: {
       selfReadFeedback: 'full',
       enableCode: false,
@@ -137,6 +187,12 @@ export const MODES: readonly ModeSpec[] = [
       zh: '宿主没有 ctx.ptcRuntime 时 tf-code 通道自动关闭（协议不声明）；协议段更长，固定成本略高。',
       en: 'Without ctx.ptcRuntime the tf-code channel stays off and is not declared; the protocol section is longer, so fixed cost is higher.',
     },
+    saving: 'most',
+    availability: 'needs-ptc',
+    note: {
+      zh: '数据加工类任务省最多（结果句柄化，中间结果不进上下文）；普通读写任务反而略高于默认。宿主无 PTC 时自动回落为默认参数。未单独实测。',
+      en: 'Saves most on data-processing tasks (results are handle-ized, intermediates never enter context); on plain read/write tasks it costs slightly more than the default. Falls back to default parameters without a host PTC runtime. Not separately benchmarked.',
+    },
     config: {
       selfReadFeedback: 'receipt',
       enableCode: true,
@@ -148,6 +204,28 @@ export const MODES: readonly ModeSpec[] = [
 ];
 
 const BY_ID = new Map<string, ModeSpec>(MODES.map((m) => [m.id, m]));
+
+/**
+ * 对外模式目录（终端 --json / 桌面页路由 / 页面渲染共用**同一份投影**）。
+ *
+ * 之前 loop 与 ui/index.js 各写一份 map，加字段时漏一处就会出现"CLI 有标注、页面没有"
+ * 的错位。投影只放展示需要的字段，`config` 不进网络载荷（页面不靠它推断行为）。
+ */
+export function publicModeCatalog() {
+  return MODES.map(({ id, order, label, tagline, useWhen, tradeoff, saving, availability, note }) => ({
+    id,
+    order,
+    label,
+    tagline,
+    useWhen,
+    tradeoff,
+    saving,
+    savingLabel: SAVING_TEXT[saving],
+    availability,
+    availabilityLabel: AVAILABILITY_TEXT[availability],
+    note,
+  }));
+}
 
 export function isModeId(value: unknown): value is ModeId {
   return typeof value === 'string' && BY_ID.has(value);

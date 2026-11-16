@@ -13,7 +13,7 @@
 // 刻意不引入任何 npm 依赖：只 import 本包 dist/ 里已有的内核模块。
 
 import { readPersistedControl, writePersistedControl } from '../dist/entry/control-state.js';
-import { MODES, isModeId, modeConfig } from '../dist/kernel/modes.js';
+import { isModeId, modeConfig, publicModeCatalog } from '../dist/kernel/modes.js';
 import { isLang } from '../dist/kernel/control-bar.js';
 import { VERSION } from '../dist/version.js';
 
@@ -34,7 +34,7 @@ function sendJson(res, status, body) {
 }
 
 function publicModes() {
-  return MODES.map(({ id, order, label, tagline, useWhen, tradeoff }) => ({ id, order, label, tagline, useWhen, tradeoff }));
+  return publicModeCatalog();
 }
 
 /** 可读的降级状态：loop 没接管时仍让用户看到文件里的值与 CLI 指引。 */

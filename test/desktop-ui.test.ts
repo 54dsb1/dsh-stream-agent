@@ -189,6 +189,21 @@ test('路由 GET：运行时在位时返回接管状态与四模式目录', asyn
   assert.equal(body.status.modeSource, 'file');
 });
 
+test('路由 GET：模式目录带省 token 档位、可用性与标注（页面据此渲染，不自己编）', async () => {
+  // 运行时缺席时走 fallbackStatus()，它自己拼 modes——这条路径以前漏过字段，
+  // 所以专门在降级分支上断言，避免"有 loop 时页面有标注、没 loop 时没有"。
+  const res = await invoke(ctxWith({}), makeReq());
+  const body = JSON.parse(res.payload);
+  assert.equal(body.status.modes.length, 4);
+  for (const mode of body.status.modes) {
+    assert.ok(['most', 'more', 'baseline', 'least'].includes(mode.saving), `${mode.id} 缺省 token 档位`);
+    assert.ok(mode.savingLabel.zh && mode.savingLabel.en, `${mode.id} 缺双语档位标签`);
+    assert.ok(['default', 'ready', 'needs-ptc'].includes(mode.availability), `${mode.id} 缺可用性`);
+    assert.ok(mode.availabilityLabel.zh && mode.availabilityLabel.en, `${mode.id} 缺双语可用性标签`);
+    assert.ok(mode.note.zh && mode.note.en, `${mode.id} 缺双语标注`);
+  }
+});
+
 test('路由 POST：切模式/语言走运行时服务，并回报 persisted', async () => {
   const runtime = runtimeStub();
   const ctx = ctxWith({ streamAgentRuntime: runtime });

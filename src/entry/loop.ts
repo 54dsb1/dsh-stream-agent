@@ -46,7 +46,7 @@ import { asPluginEffect, getService } from './cordis-compat.ts';
 import { readPersistedControl, resolveControlState, writePersistedControl } from './control-state.ts';
 import type { ControlStateWithSource } from './control-state.ts';
 import { clearTakeover, markTakeover } from './takeover-registry.ts';
-import { MODES, isModeId, modeConfig } from '../kernel/modes.ts';
+import { isModeId, modeConfig, publicModeCatalog } from '../kernel/modes.ts';
 import { isLang } from '../kernel/control-bar.ts';
 import { VERSION } from '../version.ts';
 
@@ -2720,7 +2720,7 @@ export default function apply(ctx: {
         maxReentries: live.maxReentries,
         budgetTokens: live.budgetTokens ?? null,
       },
-      modes: MODES.map(({ id, order, label, tagline, useWhen, tradeoff }) => ({ id, order, label, tagline, useWhen, tradeoff })),
+      modes: publicModeCatalog(),
       updatedAt: persisted.updatedAt ?? null,
       stateFile: control.file,
     };

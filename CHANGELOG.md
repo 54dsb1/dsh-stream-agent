@@ -37,6 +37,13 @@
 - **四个运行模式**（`kernel/modes.ts`，只映射既有配置项）：`balanced` 均衡（默认）、
   `lean` 精简（60k 预算阶梯）、`compat` 兼容（全文回验 + 串行）、`power` 增强（显式开 tf-code）。
   模式只提供默认值，装配里显式写的配置永远压过模式。
+- **每个模式标注「省多少 token / 能不能用」**：`saving`（most / more / baseline / least，四档）
+  + `availability`（默认模式 / 开箱可用 / 需宿主 PTC）+ 一段 `note` 说明口径。四处渲染同源
+  （`modeBadges()`）：装载引导面板一行、交互面板展开当前模式全文、`?` 帮助页逐模式一行、
+  桌面模式卡两行 + 标注块。**口径如实**：只有「默认参数 vs 原生 loop」有十任务两臂实测
+  （约 29%），其余三档是方向性判断并明写"未单独实测"——不把没测过的数字写成百分比。
+- **模式目录单一投影**（`publicModeCatalog()`）：此前 loop 与 `ui/index.js` 各写一份 map，
+  加字段必漏一处；现在 CLI `--json`、控制路由、桌面页共用同一份字段（`config` 不进网络载荷）。
 - **中英双语**（`kernel/control-bar.ts`）：面板、引导、帮助、状态条、`--json` 全量双语；
   `l` 键或 `dsh-stream-agent lang en` 即时切换，落盘到 `control.json`，三个面（装载横幅 /
   CLI / 桌面控制页）共用同一份状态与文案表——不存在"横幅中文、命令英文"的错位。
@@ -54,10 +61,11 @@
   绝不让"配置文件坏了"阻断装载。
 - **接管事实登记**（`entry/takeover-registry.ts`）：控制栏横幅的"接管生效 / 未接管"读实时事实，
   不靠时序猜测；`onTakeover` 订阅保证控制栏排在 loop 前后挂载都能正确显示。
-- 测试 +42 例（`test/activation.test.ts` 10 例 + `test/control-bar.test.ts` 22 例 +
-  `test/desktop-ui.test.ts` 10 例），含"严格 inject 守卫 ctx"的装载回归与
-  "主包不得声明 dsh.client / UI bundle 语法 / 路由鉴权与 409 / 首次写入语义 / 中英文案键集对齐"的桌面页回归。
-  全量 250/250。
+- 测试 +47 例（`test/activation.test.ts` 10 例 + `test/control-bar.test.ts` 26 例 +
+  `test/desktop-ui.test.ts` 11 例），含"严格 inject 守卫 ctx"的装载回归与
+  "主包不得声明 dsh.client / UI bundle 语法 / 路由鉴权与 409 / 首次写入语义 / 中英文案键集对齐 /
+  模式标注与投影一致 / 折行不切英文单词且行首无标点"的桌面页回归。
+  全量 255/255。
 
 ### Changed
 
@@ -77,6 +85,10 @@
 - `scripts/build.mjs`：增加桌面页构建闸门（主包禁止 `dsh.client`、UI 包声明、
   `ui/index.js` 可导入、`ui/client.js` 语法与模块 id）。
 - 接管横幅追加 `mode=<id> (<来源>)`，排障时一眼看出模式从哪来。
+- `wrapText()` 重写为"先切单位再贪心填充"：宽字符逐字可断、ASCII 单词/路径不切开、
+  闭合标点粘住前一个字（行首不出现标点）、末行不留孤字；`labeled()` 支持统一标签宽度，
+  同一块里"当前/适合/省 token/可用性/标注"的值列左对齐。旧实现遇空格回退，中文里夹
+  `ctx.ptcRuntime` 这类 token 时行尾会留十几列空白，一屏里好几行右端参差。
 
 ## [0.2.0] - 2026-11-16
 
