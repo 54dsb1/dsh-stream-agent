@@ -225,11 +225,13 @@ describe('tf-code：驱动器 E2E', () => {
     ],
   };
 
-  it('E1. 成功：命令 ok + code 族句柄 + 骨架注入下一请求；协议文本声明 tf-code', async () => {
+  it('E1. 成功：命令 ok + code 族句柄 + 值注入下一请求；协议文本声明 tf-code（显式开启，K1）', async () => {
     harness = makeHarness({
       task: 'code 演练：统计日志错误。',
       scenarios: [codeScenario],
       executeCode: async () => ({ ok: true, valueJson: '{"errorCount":42}' }),
+      // K1：通道默认关闭，opt-in 显式开启；F3：值 17 字符 ≤ 4000 上限 → 完整注入
+      config: { enableCode: true },
     });
     try {
       const reason = await harness.driver.runTurn();
@@ -252,7 +254,7 @@ describe('tf-code：驱动器 E2E', () => {
     }
   });
 
-  it('E2. 程序失败：结构化错误注入（kind + 建议改道），模型重发后收敛', async () => {
+  it('E2. 程序失败：结构化错误注入（kind + retry 结论 + 建议改道），模型重发后收敛', async () => {
     let calls = 0;
     harness = makeHarness({
       task: 'code 演练：统计日志错误。',
@@ -272,9 +274,10 @@ describe('tf-code：驱动器 E2E', () => {
       ],
       executeCode: async (input) => {
         calls += 1;
-        if (input.callId === 'c1') return { ok: false, error: 'exception: TypeError: x is not a function' };
+        if (input.callId === 'c1') return { ok: false, kind: 'exception', retryable: true, advice: '修复后换新 id 重发。', error: 'exception: TypeError: x is not a function' };
         return { ok: true, valueJson: '{"errorCount":42}' };
       },
+      config: { enableCode: true },
     });
     try {
       const reason = await harness.driver.runTurn();
@@ -290,7 +293,7 @@ describe('tf-code：驱动器 E2E', () => {
     }
   });
 
-  it('E3. 无 executeCode 端口 → no-code-channel 命令级失败；协议文本不声明 tf-code', async () => {
+  it('E3. 默认关闭（K1）：无端口/未显式开启 → no-code-channel 命令级失败；协议文本不声明 tf-code', async () => {
     harness = makeHarness({
       task: 'code 演练：统计日志错误。',
       scenarios: [

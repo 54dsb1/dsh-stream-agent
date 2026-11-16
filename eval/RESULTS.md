@@ -206,3 +206,39 @@ node eval/tools/gen-results.cjs --stamp 2026-11-15-v02                         #
 - 标题旁路请求已剔除（METRICS.md E5），剔除计数见 metrics.json M2.titleExcluded。
 - 泄漏扫描 leak 记账（原生 tool_call 全文回灌）对应 06 号 §3.2 v1 限制，单列不计入命题判定。
 - 原始证据链：tasks.json（任务文本写死）→ fixtures（逐字节固定）→ probe/session log（原样存档）→ metrics.json（初算）→ 本文件。
+
+## 6. 0.3.0 复算（M1/M3，2026-11-17 追加；脚本为权威计算器）
+
+> 本节由 0.3.0 的 M1/M3 交付脚本对既有 probe/session log 复算得出；0.3.0 自身的 R3 重跑
+> （新协议/新命令面）待真机批次，跑完由 `summarize.cjs` 回填，不用本节数字顶替。
+
+### 6.1 M1 四分量复算（summarize.cjs，逐请求 usage 原文求和）
+
+| 臂 | 输入 | 缓存读 | 缓存写 | 输出 | 全量合计 | 请求数 | checks |
+|---|---|---|---|---|---|---|---|
+| baseline（原生 loop） | 33,028 | 393,728 | 0 | 19,654 | **446,410** | 50 | 29/36 |
+| stream（本插件） | 42,782 | 58,112 | 0 | 28,284 | **129,178** | 59 | 33/36 |
+
+- 全量口径 T1 = 129,178 / 446,410 = **28.9%**（本 stamp）；缓存写分量两臂均为 0（深航缓存未触发写）。
+- 复算命令：`node eval/tools/summarize.cjs --stamp 2026-11-15-v02 --md`（summary.json 逐任务留档）。
+- 如实说明：v0.2.0-baseline.md 记的 22.3%（840,138 → 187,290）来自更早批次；两批数字不可混用，
+  R3 重跑时以同批双臂复算为准（同一 `summarize.cjs` 口径）。
+
+### 6.2 M3 回放一致性（replay-check.cjs 修复后，v02 stamp）
+
+- 修复的两个根因（对照臂 replay 0/10 → 10/10）：
+  1. 提取正则要求 `path` 属性在 `id` 之前——模型输出属性序无关时 0 命中；改为引号感知头部扫描 + 通用属性解析；
+  2. `text-delta` 增量字段按 `text` 读取（旧代码读 `textDelta` 永远命不中）。
+- 对照臂（stream）：**10/10 通过**（树哈希 == 实跑，含 W3 的 64 次写入回放）——M3 交付目标 ≥9/10 达成。
+- 基线臂（原生 loop）：4/10 —— v4 session log 中原生 write 调用未以可解析形态出现在
+  assistant/attempt 流（取证面受限，如实标注"不可回放"，不做假通过）；基线臂写入正确性
+  由 checks 直接判定。
+- 零写入任务（R3/R4 等）：种子树 == 结果树即通过，不再因 0 操作判失败（alpha.1 语义）。
+
+### 6.3 M2 T3 三格（工具就绪，数字待同批真机）
+
+- 采集脚本：`eval/tools/t3-cells.cjs --stamp <新批> [--cell-a1b <目录>]`；
+  A-1a 臂 patch：`patches/eval-stream-code-on.yml`；A-1b 臂 patch：`patches/eval-stream-code-off.yml`；
+  B 格用 v0.2.1 tag 产物 + `patches/eval-stream.yml`。三格同批跑，禁止拼历史数字。
+- 代码事实：tf-code 协议段（DEFAULT_CODE_PROTOCOL_SECTION）实测 1,175 字符；
+  K1 主张门槛 = 该段占 B 首请求 ≥10% 才可写"下降"，否则如实写"持平"。

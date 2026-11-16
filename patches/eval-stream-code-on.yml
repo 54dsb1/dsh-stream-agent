@@ -1,0 +1,47 @@
+# M2 三格对照 · A-1a 臂：0.3.0 装配 + 显式开启 tf-code（复现 0.2.x 的 code 现状）
+#
+#   dsh --profile headless --patch <本文件> headless "<任务文本>"
+#   env DSH_EVAL_PROBE_DIR=<每任务目录>（runner 设置）
+#
+# 与 eval-stream.yml 的唯一差异：enableCode: true（K2-K6 收口后的显式开启路径）。
+# A-1b 臂见 patches/eval-stream-code-off.yml；B 格用 v0.2.1 tag 产物 + eval-stream.yml。
+# 三格必须同批跑（同模型/同任务/同参数），禁止拿历史数字拼表（beta.1 M2 约束）。
+
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  config:
+    agents: []
+    maxParallelToolCalls: 10
+  disabled: true
+- insert:
+    - id: stream-agent-eval-probe
+      name: ../dist/entry/eval-probe.js
+      inject: []
+      config:
+        announce: true
+    - id: stream-agent-state
+      name: ../dist/entry/state-handle.js
+      inject: [storage]
+      config:
+        unit: tfAgentState
+    - id: stream-agent-obs-broker
+      name: ../dist/entry/obs-broker.js
+      inject: [tools, state]
+      config: {}
+    - id: stream-agent-action-gate
+      name: ../dist/entry/action-gate.js
+      inject: [tools, storage]
+      config: {}
+    - id: stream-agent-context-render
+      name: ../dist/entry/context-render.js
+      inject: []
+      config: {}
+    - id: stream-agent
+      name: ../dist/entry/loop.js
+      inject: [llm, tools, agents, sessions, sessionProjections]
+      config:
+        announceTakeover: true
+        maxParallelToolCalls: 3
+        maxReentries: 8
+        streamIdleTimeoutMs: 60000
+        enableCode: true

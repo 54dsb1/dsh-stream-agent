@@ -1,9 +1,9 @@
 {
   "name": "@hugesb/dsh-stream-agent",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "license": "Apache-2.0",
   "type": "module",
-  "description": "单流协议 DSH 插件：内核层零框架依赖，适配层接入 @deepseek-ai/dsh（v0.2.1 含控制栏与装载修复）",
+  "description": "单流协议 DSH 插件（独立模式）：专用 profile + 计量治理 + tf-code 收口 + 编辑/搜索/计划/恢复/段边界（0.3.0，含 0.4.0 规划内容）",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -30,6 +30,8 @@
   "scripts": {
     "test": "node --test \"test/*.test.ts\" \"test/kernel/*.test.ts\"",
     "build": "node scripts/build.mjs",
+    "check": "node scripts/check-consistency.mjs",
+    "gate": "node scripts/gate.mjs",
     "release": "node scripts/release.mjs",
     "release:dry": "node scripts/release.mjs --dry-run"
   },
@@ -59,6 +61,8 @@
     "eval/RESULTS.md",
     "eval/tasks/",
     "eval/tools/",
+    "profiles/",
+    "preset/",
     "preset.yml",
     "cordis.patch.yml",
     "patches/"

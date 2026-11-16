@@ -111,3 +111,18 @@ prefix_hit (M4):
 |---|---|---|---|---|
 | v1.0 | 2026-11-14 | 初稿（08 号任务书 yaml 定义 + E3 缓存三分量修正 + E5 标题请求剔除 + 06/07 交接事项裁定） | 勘察 E1-E5 实测事实 | 待项目负责人确认 |
 | v1.1 | 2026-11-14 | M2 主口径从"session log request/header 数"改为"eval-probe 逐请求计数"；request/header 降为基线臂对账口径 | smoke 实测 E6：request/header 由内建 loop 写入，对照臂为 0（数据源缺失非口径偏好）；实测发生在任何真连之前，不影响已采集数据 | 待项目负责人确认（随 v1.0 一并） |
+
+---
+
+## 7. 0.3.0 计量工具（M1/M3 交付；口径不变，计算器收敛）
+
+- **M1**：`eval/tools/summarize.cjs` —— 四分量逐请求求和（输入/缓存读/缓存写/输出），
+  标题旁路剔除（E5），缺失分量标"不可得"（不按 0 计，E3 纪律的落地）；产出
+  `summary.json`（逐任务可复算的权威形态）与 Markdown 表。RESULTS.md 的数字一律由它出。
+- **M3**：`eval/tools/replay-check.cjs` —— 0.3.0 修复对照臂提取器两个根因
+  （属性序敏感、`text-delta` 字段名），对照臂回放一致性 10/10（树哈希 == 实跑）；
+  基线臂 v4 session log 的 write 调用不可解析（如实标注"不可回放"，checks 才是判定）。
+- **M2**：`eval/tools/t3-cells.cjs` —— T3 三格采集（B / A-1a / A-1b 首请求四段拆分 +
+  逐字节相等判定 + 差值 == tf-code 段长度判定）；三臂 patch：`eval-stream.yml`（B，
+  v0.2.1 tag 产物）/ `eval-stream-code-on.yml`（A-1a）/ `eval-stream-code-off.yml`（A-1b）。
+  三格必须同批跑，禁止拼历史数字。

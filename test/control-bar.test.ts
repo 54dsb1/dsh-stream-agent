@@ -82,10 +82,10 @@ test('模式双语：每一条面向用户的文案两种语言都有，且语�
   }
 });
 
-test('模式只映射既有配置项：默认模式与 v0.2.0 出厂默认等价（除显式写死项）', () => {
+test('模式只映射既有配置项：默认模式与 0.3.0 出厂默认等价（K1：tf-code 默认关闭）', () => {
   const balanced = modeConfig('balanced');
   assert.equal(balanced.selfReadFeedback, 'receipt');
-  assert.equal(balanced.enableCode, 'auto', 'balanced 不改变"宿主有 PTC 就开"的既有语义');
+  assert.equal(balanced.enableCode, false, 'K1（0.3.0）：balanced 不再自动开 tf-code，协议段默认 0 字符');
   assert.equal(balanced.persistFallback, true);
   assert.equal(balanced.maxParallelToolCalls, 3);
   assert.equal(balanced.maxReentries, 8);

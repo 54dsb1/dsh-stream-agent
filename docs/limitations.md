@@ -55,15 +55,48 @@
 - **余留**：本地兜底的会话日志格式是插件私有的 JSONL，与宿主 zstd session log 不互通；
   宿主持久化在位时优先宿主。`persistFallback: false` / `localFallback: false` 可关闭（回内存降级）。
 
-### 5b. `tf-code` 依赖宿主 PTC runtime（0.2.0 新增，fail-open）
+### 5b. `tf-code` 依赖宿主 PTC runtime（0.2.0 新增；0.3.0 默认关闭，fail-open）
 
+- **0.3.0 起（K1）**：`enableCode` 默认 **false**——默认装配的协议段 0 字符，模型不会幻觉调用；
+  开启必须显式（`power` 模式或装配 `enableCode: true`），且以 K2–K6 收口为前提。
+  不做会话级动态开关（协议段构造期冻结，动态切换会破坏前缀单调）。
 - **现象**：宿主未挂 `@deepseek-ai/dsh-ptc-runtime`（`ctx.ptcRuntime` 缺失）或形状不符时，tf-code 通道整体关闭。
 - **行为**：关闭是**装配期**的——协议文本不声明 tf-code（稳定前缀里不存在这个命令，模型不会幻觉调用）；
   若模型仍输出 `<tf-code>`（跨装配漂移），命令级失败注入 `no-code-channel` 并建议改道 tf-bash。告警不静默。
-- **缓解**：挂载 PTC runtime 后端（如 `@deepseek-ai/dsh-ptc-runtime-node`）；或 `enableCode: false` 显式关闭。
-- **安全面**：程序体自身不做任何直接 IO——唯一绑定命名空间 `tools`（write/read/pwsh）走驱动器同一条
-  `executeTools` 通道，宿主 guard/工作区策略/凭据全部生效；沙箱能力（文件策略/超时）按宿主 runtime 装配为准。
+- **缓解**：挂载 PTC runtime 后端（如 `@deepseek-ai/dsh-ptc-runtime-node`）+ 显式 `enableCode: true`；
+  关闭路径 `enableCode: false`（默认）。
 - **取证**：`src/entry/ptc-bridge.ts`、`src/entry/loop.ts` 的 tf-code 分支；`test/ptc-bridge.test.ts`。
+
+### 5b-1. tf-code 沙箱的事实边界（0.3.0 K2/K6 声明，如实陈述）
+
+只声明"文件效果边界 + 事实记账"，**不承诺隔离/等权**：
+
+1. **只覆盖文件效果**：宿主 `SandboxMode` 不包含网络与进程可见性——程序仍可联网、可见进程；
+   把"沙箱"理解成"隔离"是错误的使用方式。
+2. **Windows 只部分强制**：ACL 档报告 `enforcement=partial`（硬链接别名、读取不受限、
+   AppContainer 边界）。需要绝对边界的任务必须显式拒绝或提示；插件不做"绝对只读"承诺。
+   `partial` 在账本与协议错误里**显式可见**（K2：`mode` / `denied` / `enforcement` 逐次记账）。
+3. **`danger-full-access` 无约束力**：全权限模式下插件没有任何文件边界；账本与 UI 如实标注
+   "无约束"，使用前自己确认后果。
+4. **preset/profile 不是安全边界**：它们只是组合边界，YAML 与插件仍执行宿主代码；安全声明
+   只能引用 sandbox 事实（`docs/disabled-lines-audit.md`），不能引用"独立模式"。
+5. **插件级配额（K5）**：子调用次数 / 输出字节 / 墙钟三项硬限制（缺省 64 次 / 256KiB / 300s），
+   超限结构化终止（`kind: quota-exceeded`）——配额是插件侧护栏，不是宿主沙箱的一部分。
+6. **取消窗口（K4）**：回合取消直通 resolve 与绑定调用（回合 signal）；abort 后 drain 等待
+   在途清理再收束（0 后置写是验收目标）；kill -9 级强杀的窗口语义见 5b-2。
+
+### 5b-2. 写前意图与强杀窗口（0.3.0 F6，零注入）
+
+- 变更类命令（tf-write/tf-edit/tf-append）派发**之前**把意图落盘并 fsync
+  （`<stateRoot>/intents/<sessionId>.jsonl`：op/path/内容指纹）；命令落定即写回执。
+- **强杀（kill -9）三时点语义**：写入前杀 = 文件不在（oracle 可证"未发生"）；
+  写入中杀 = 磁盘可能有半个文件（三态判"不确定"）；写入后回执前杀 = 文件已全量落盘
+  但账面"有意图无回执"——同样判"不确定"，**不自动重放**。
+- **resume 停机核对**：恢复会话时发现"有意图无回执"→ `runTurn` 直接 blocked（不发请求、
+  零注入），人工核对文件后 `dsh-stream-agent intents --ack <session>` 闭合。
+  零注入纪律：意图与回执永不进入模型上下文。
+- 回退点：`enableIntents: false`（不落盘、不核对）/ `resumeIntentPolicy: 'ignore'`（只告警）。
+- 取证：`src/entry/intent-log.ts`、`eval/tools/f6-kill-drill.cjs`（10 轮强杀演练，0 重放 0 重复写）。
 
 ### 5c. 桌面控制页依赖动态客户端插件机制（0.2.1 新增）
 
@@ -83,6 +116,18 @@
 - 部分目录下 pwsh grant 失败（Win32 5）。基线臂同样受限，属环境因素而非插件缺陷。
 - 缓解：把工作区放到 DSH 已授权的目录下。
 
+### 7b. 长会话段边界的缓存重置（0.3.0 F7，ADR-001）
+
+- **行为**：追加区超过 `segmentMaxChars`（缺省 160k 字符 ≈ 40k tokens；0/负数关闭）时，
+  在**新回合开始处**把旧段整块丢弃（ADR-001 整块丢弃路线；原文句柄化 `obs:read:seg-*` 可
+  tf-peek 回取，绝不摘要改写）。
+- **代价（如实陈述）**：丢弃后的第一条请求是缓存冷请求（cacheWrite 重新计费）——这是
+  "整块丢弃"路线的固有代价；阈值越高重置越少。发生时 policyLog + 台账显式记录，不是静默修复。
+- **边界纪律**：丢弃只落在完整回合边界（当前回合的块永不丢弃，工具调用与结果不被拆开）；
+  preflight 对"未记录的"前缀不一致仍然 fail-closed。
+- 取证：`docs/adr-001-segment-boundary.md`、`src/kernel/render.ts` 的 `dropAppendHead`、
+  `test/f7-segment.test.ts`（50 回合 × 2 请求，0 前缀违规）。
+
 ## 四、降级通道（有告警，不静默）
 
 ### 7. bundle 形态下 plugin record 通道降级（0.2.0 已修复为文件台账）
@@ -99,11 +144,14 @@
 
 ## 五、评测工具自身的缺陷
 
-### 8. replay 一致性对真连 session log 0 命中
+### 8. replay 一致性对真连 session log 0 命中（0.3.0 对照臂已修复）
 
-- **现象**：`replay-check.cjs` 在真连产出的 zstd session log 上提取不到工具调用（smoke 造数场景正常）。
-- **判定**：**工具缺陷，不是回放机制失败**。所以 `eval/RESULTS.md` 里 replay 列全是 FAIL，请以 probe log + metrics 为准。
-- **影响**：想用 replay 做零成本回归前，得先修提取器。
+- **0.2.x 现象**：`replay-check.cjs` 对照臂提取 0 命中 → replay 列全 FAIL。
+- **0.3.0 修复（M3）**：两个根因——①提取正则要求 `path` 在 `id` 之前（属性序敏感）；
+  ②`text-delta` 增量字段读错（`textDelta` → 实际是 `text`）。修复后对照臂 10/10 通过
+  （树哈希 == 实跑，`eval/RESULTS.md` §6.2）；基线臂（原生 loop 的 v4 session log）
+  write 调用未以可解析形态出现，如实标注"不可回放"（4/10），写入正确性由 checks 判定。
+- **取证**：`eval/tools/replay-check.cjs`、`eval/runs/2026-11-15-v02/*/metrics.json` 的 replay 字段。
 
 ### 9. `injected_ratio` 口径偏差
 

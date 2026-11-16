@@ -23,6 +23,9 @@
         maxParallelToolCalls: 3
         maxReentries: 8
         streamIdleTimeoutMs: 60000
+        # K1（0.3.0）：评测对照臂随默认装配（tf-code 关闭）。三格对照另用
+        # eval-stream-code-on.yml（A-1a）/ eval-stream-code-off.yml（A-1b）。
+        enableCode: false
     - id: stream-agent-state
       name: ../dist/entry/state-handle.js
       inject: [storage]

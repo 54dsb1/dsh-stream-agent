@@ -46,12 +46,13 @@ import { createHash } from 'node:crypto';
 
                                                                
 
-/** "压缩历史"等策略违规的记录（红线：不许静默）。 */
+/** 策略事件记录（红线：不许静默）。compress-history-request = 违规拒绝（accepted:false）；
+ *  segment-drop = F7 显式段边界（accepted:true——整块丢弃、前缀基线重置并记录）。 */
                                         
              
-                                   
+                                                    
                   
-                  
+                    
                                          
                         
                  
@@ -304,6 +305,18 @@ export class ContextRenderer {
 
   // ------------------------------------------------------------------- 装配
 
+  /** 追加区块数（F7 段边界判定用）。 */
+  get appendBlockCount()         {
+    return this.#appendBlocks.length;
+  }
+
+  /** 追加区总字符数（段边界只看增长部分；system 前缀恒定不计入）。 */
+  get appendChars()         {
+    return this.#appendBlocks.reduce((n, b) => n + b.content.length, 0);
+  }
+
+  // ------------------------------------------------------------------- 装配
+
   /** 稳定段 = 稳定前缀 ++ 追加区（不含易变尾）。 */
   stableMessages()                  {
     return [
@@ -368,6 +381,34 @@ export class ContextRenderer {
     assertPrefixStable(after, before, { allowTailDrop: true });
     this.#lastStable = after;
     return actual;
+  }
+
+  /**
+   * F7 段边界：从追加区**头部**整块丢弃 n 个块（只落在完整回合边界上——调用方保证；
+   * 块不拆开，工具调用与结果同块进出）。被丢弃内容整块返回，调用方负责句柄化登记
+   * （原文可按句柄 tf-peek 回取，绝不做摘要改写）。
+   *
+   * 这是"整块丢弃"路线的显式缓存重置点：下一请求的稳定段与上一请求不再共享前缀，
+   * 因此本方法重置前缀基线（#lastStable = null）并写入 policyLog——未记录的前缀
+   * 不一致仍会被 render() preflight fail-closed 拦下，这条通道是唯一合法入口。
+   */
+  dropAppendHead(dropCount        , opts                    )                                                       {
+    const n = Math.max(0, Math.min(dropCount, this.#appendBlocks.length));
+    const dropped = this.#appendBlocks.slice(0, n).map((b) => b.content);
+    this.#appendBlocks = this.#appendBlocks.slice(n);
+    this.#lastStable = null;
+    const record                        = {
+      at: this.#clock.now(),
+      kind: 'segment-drop',
+      request: opts.reason,
+      accepted: true,
+      degradedTo: 'none',
+      droppedBlocks: n,
+      detail: `F7 段边界：整块丢弃 ${n} 块（${dropped.reduce((s, t) => s + t.length, 0)} 字符），前缀基线重置（显式缓存重置点；被丢弃原文已句柄化，不做摘要改写）`,
+    };
+    this.#policyLog.push(record);
+    if (this.#policySink) this.#policySink(record);
+    return { dropped, record };
   }
 
   /**

@@ -25,7 +25,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { TfStreamParser } from '../kernel/parser.ts';
+import { TfStreamParser, splitEditBody } from '../kernel/parser.ts';
 import type { TfCommand, ParserEvent } from '../kernel/parser.ts';
 import { ContextRenderer, renderHash } from '../kernel/render.ts';
 import type { RenderMessage } from '../kernel/render.ts';
@@ -40,11 +40,12 @@ import {
   withEventCapture,
 } from './json-persistence.ts';
 import type { FileLedgerFallback } from './json-persistence.ts';
-import { createCodeExecutor, looksLikePtcRuntime } from './ptc-bridge.ts';
-import type { CodeExecutor } from './ptc-bridge.ts';
+import { createCodeExecutor, DEFAULT_CODE_QUOTA, looksLikePtcRuntime } from './ptc-bridge.ts';
+import type { CodeExecutor, CodeQuota, SandboxFacts } from './ptc-bridge.ts';
 import { asPluginEffect, getService } from './cordis-compat.ts';
 import { readPersistedControl, resolveControlState, writePersistedControl } from './control-state.ts';
 import type { ControlStateWithSource } from './control-state.ts';
+import { appendIntentRecord, intentFileOf, loadIntentRecords, pendingIntents } from './intent-log.ts';
 import { clearTakeover, markTakeover } from './takeover-registry.ts';
 import { isModeId, modeConfig, publicModeCatalog } from '../kernel/modes.ts';
 import { isLang } from '../kernel/control-bar.ts';
@@ -137,6 +138,9 @@ export interface ToolMapping {
 export const DEFAULT_TOOL_MAPPING: ToolMapping = {
   toToolCall(cmd) {
     // 原生工具 schema：write(file_path, content)、read(file_path, ...)（dsh-tool-fs/lib/index.js:249-560）、
+    // edit(file_path, old_string, new_string, replace_all?)（dsh-tool-fs/lib/index.js，0.3.0 F1 映射）、
+    // apply_patch(input)（同上，*** End of File 锚实现 EOF 追加）、
+    // grep(pattern, path?, include?) / glob(pattern, path?)（dsh-tool-fs-search/lib/index.js，F2 映射）、
     // bash(command)（dsh-tool-bash/lib/index.js:493）。参数名以真连实测为准（results 文档记录）。
     switch (cmd.name) {
       case 'tf-write':
@@ -149,6 +153,52 @@ export const DEFAULT_TOOL_MAPPING: ToolMapping = {
         if (offset !== undefined && /^\d+$/.test(offset)) args['offset'] = Number(offset);
         if (limit !== undefined && /^\d+$/.test(limit)) args['limit'] = Number(limit);
         return { name: 'read', arguments: args };
+      }
+      case 'tf-edit': {
+        // F1：精确替换映射宿主 edit（old → new；replace_all=false 时宿主要求恰好出现一次）。
+        // body 用 OLD/NEW 标记行分隔两段字面量；解析失败回结构化失败，绝不静默改成全文重写。
+        const split = splitEditBody(cmd.body ?? '');
+        if (split === null) return null;
+        const args: Record<string, unknown> = {
+          file_path: cmd.attrs['path'] ?? '',
+          old_string: split.old,
+          new_string: split.new,
+        };
+        if (cmd.attrs['replace_all'] === 'true') args['replace_all'] = true;
+        return { name: 'edit', arguments: args };
+      }
+      case 'tf-append': {
+        // F1：只追加，不修改既有内容。
+        // - anchor 属性给定时：映射宿主 edit，在唯一锚点字面量之后插入（锚点行末补一个换行；
+        //   换行规则确定：new_string = anchor + '\n' + body）。
+        // - 无 anchor：EOF 追加映射宿主 apply_patch 的 `*** End of File` 锚（宿主原生支持，
+        //   不自建文件 IO）；正文逐行加 '+' 前缀成补丁。
+        const body = cmd.body ?? '';
+        if (body === '') return null;
+        const anchor = cmd.attrs['anchor'];
+        if (anchor !== undefined && anchor !== '') {
+          return {
+            name: 'edit',
+            arguments: { file_path: cmd.attrs['path'] ?? '', old_string: anchor, new_string: `${anchor}\n${body}` },
+          };
+        }
+        const lines = body.split('\n');
+        if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop(); // 末尾换行不产生空补丁行
+        const patch = ['*** Begin Patch', `*** Update File: ${cmd.attrs['path'] ?? ''}`, '*** End of File', ...lines.map((l) => `+${l}`), '*** End Patch'].join('\n');
+        return { name: 'apply_patch', arguments: { input: patch } };
+      }
+      case 'tf-grep': {
+        // F2：搜索只回匹配行（宿主 grep 自带行号与按文件分组），不回全文；
+        // 权限与工作区边界由宿主决定（不自建遍历）。
+        const args: Record<string, unknown> = { pattern: cmd.attrs['pattern'] ?? '' };
+        if (cmd.attrs['path'] !== undefined && cmd.attrs['path'] !== '') args['path'] = cmd.attrs['path'];
+        if (cmd.attrs['include'] !== undefined && cmd.attrs['include'] !== '') args['include'] = cmd.attrs['include'];
+        return { name: 'grep', arguments: args };
+      }
+      case 'tf-glob': {
+        const args: Record<string, unknown> = { pattern: cmd.attrs['pattern'] ?? '' };
+        if (cmd.attrs['path'] !== undefined && cmd.attrs['path'] !== '') args['path'] = cmd.attrs['path'];
+        return { name: 'glob', arguments: args };
       }
       case 'tf-bash':
         // DSH Windows 宿主的 shell 工具是 pwsh（dsh-tool-pwsh：command 与 description 双必填，
@@ -193,13 +243,28 @@ export interface StreamDriverConfig {
    *  不重复回灌全文——全文本就在模型上下文里，掐断"写→读回验"循环；
    *  'full' = v0.1 行为（完整反馈，读外部文件仍走此路径）。 */
   selfReadFeedback?: 'receipt' | 'full';
-  /** tf-code 程序化通道（PTC 桥接，0.2.0）：缺省 = 有 executeCode 端口即启用；
-   *  false = 强制关闭（协议文本不声明 tf-code）。 */
+  /** tf-code 程序化通道（PTC 桥接）。K1（0.3.0）：**默认关闭**——只有显式
+   *  `enableCode: true` 且 executeCode 端口在位才启用（协议文本才声明 tf-code 段）；
+   *  缺省/false 都关闭。不做会话级动态开关（协议段构造期冻结，动态切换会破坏前缀单调）。 */
   enableCode?: boolean;
   /** tf-code 默认超时（毫秒）；缺省 = 宿主 provider 默认（Node 后端 120s，上限 600s）。 */
   codeTimeoutMs?: number;
   /** tf-code 协议段覆盖（缺省 DEFAULT_CODE_PROTOCOL_SECTION；仅通道启用时追加） */
   codeProtocolText?: string;
+  /** K5：tf-code 配额三项硬限制（子调用次数 / 输出字节 / 墙钟毫秒）；缺省 DEFAULT_CODE_QUOTA。 */
+  codeQuota?: CodeQuota;
+  /** F3：tf-code 首成功/变化结果的完整注入上限（字符）；≤ 上限整值注入，超限转骨架 + 句柄。
+   *  仅通道显式开启时生效；缺省 DEFAULT_CODE_VALUE_INJECT_LIMIT。 */
+  codeValueInjectLimit?: number;
+  /** F4：原生 tool_call 结果的单块注入上限（字符）；仅声明了 nativeToolSchemas 时生效。
+   *  超限块转骨架 + 句柄（obs 登记，可 tf-peek 取回）；缺省 DEFAULT_NATIVE_RESULT_LIMIT。 */
+  nativeResultLimit?: number;
+  /** F5：计划与验收（tf-plan + accepts 回执判定 + tf-final 过早拦截）。默认 true；
+   *  false = 关闭（回退点）：tf-plan 命令级失败，accepts 属性忽略，tf-final 不做验收校验。 */
+  enablePlan?: boolean;
+  /** F7 长会话段边界：追加区超过该字符数时，在新回合开始处整块丢弃旧段（保留当前任务块起
+   *  的所有块），被丢弃原文句柄化可回取。0/负数 = 关闭（回退点）。缺省 DEFAULT_SEGMENT_MAX_CHARS。 */
+  segmentMaxChars?: number;
 }
 
 export interface DriverPorts {
@@ -215,6 +280,11 @@ export interface DriverPorts {
   gate?: GatePort;
   /** tf-code 程序化执行通道（PTC 桥接；缺省 = tf-code 命令级失败并引导改道） */
   executeCode?: CodeExecutor;
+  /** F6 恢复意图：写前意图落盘（实现在 fsync 意图日志；缺省 = 不落盘，F6 关闭——回退点）。
+   *  在变更类命令（tf-write/tf-edit/tf-append）派发到宿主工具**之前**调用。 */
+  onIntent?: (intent: { cmdId: string; op: 'write' | 'edit' | 'append'; path: string; fingerprint: string }) => void;
+  /** F6 写后回执：变更类命令落定（成功或失败）即调用；与 onIntent 按 cmdId 关联。 */
+  onIntentReceipt?: (receipt: { cmdId: string; ok: boolean; detail?: string }) => void;
   /** 驱动器自身异常/账本落盘失败的告警出口（红线 5：不许静默） */
   onWarning?: (message: string, detail?: unknown) => void;
 }
@@ -267,10 +337,16 @@ export type DriverRecord =
   | { seq: number; kind: 'final'; summary?: string }
   | { seq: number; kind: 'fault'; fault: string; detail?: string }
   | { seq: number; kind: 'observation'; handle: string | null; key: string; infoGain: string; reason: string }
+  /** K2 沙箱事实记账（tf-code 每次运行一条；宿主未报告的字段缺省） */
+  | { seq: number; kind: 'sandbox'; cmdId: string; mode?: string; enforcement?: string; deniedCount: number }
+  /** F5 计划与验收（tf-plan 每次声明/修订一条） */
+  | { seq: number; kind: 'plan'; revision: number; open: number; total: number }
+  /** F5 验收项验证回执（accepts 命中且命令成功时一条） */
+  | { seq: number; kind: 'plan-accept'; acceptId: string; cmdId: string; evidence: string }
   | { seq: number; kind: 'turn-end'; reason: TurnEndReason };
 
 /** plugin record 通道（真实宿主）。类型语法 plugin:tf-agent/<record>（dsh-session types.d.ts:527）。 */
-export type TfAgentRecordType = 'plugin:tf-agent/command' | 'plugin:tf-agent/final' | 'plugin:tf-agent/fault' | 'plugin:tf-agent/step';
+export type TfAgentRecordType = 'plugin:tf-agent/command' | 'plugin:tf-agent/final' | 'plugin:tf-agent/fault' | 'plugin:tf-agent/step' | 'plugin:tf-agent/plan' | 'plugin:tf-agent/intent';
 
 export interface LedgerSink {
   record(type: TfAgentRecordType, data: unknown): void;
@@ -298,18 +374,46 @@ export const DEFAULT_PROTOCOL_TEXT = `## tf-* 单流协议（本回合唯一工�
 文件正文原文（原样输出，直到闭合标签）
 </tf-write>
 <tf-read path="相对/绝对路径" id="r1" depends_on="w1,w2" offset="100" limit="50"/>
+<tf-edit path="src/app.ts" id="e1" depends_on="r1">
+<<<<<<< OLD
+被替换的原文（精确字面量，全文唯一；不做模糊匹配）
+=======
+替换后的新文
+>>>>>>> NEW
+</tf-edit>
+<tf-append path="notes.md" id="a1" anchor="锚点原文（可选；缺省=追加到文件末尾）">
+追加正文（原样输出，直到闭合标签；不改既有内容）
+</tf-append>
+<tf-grep pattern="正则" path="src" include="*.ts" id="g1"/>
+<tf-glob pattern="**/*.md" id="gl1"/>
 <tf-bash cmd="命令行" id="b1"/>
 <tf-peek handle="obs:read:c3@v1" from_line="10" to_line="20" id="p1"/>
 <tf-final id="f1" summary="一句话完成说明"/>
+
+（改既有文件用 tf-edit（精确替换）或 tf-append（只追加），不要整文件重写；
+找内容用 tf-grep（回匹配行）/tf-glob（回路径），不要用 tf-bash 调 shell 搜索，
+也不要把搜索当"读文件"用——grep 结果超长会截断并提示 tf-peek。）
 
 （tf-read 可选 offset/limit：1 基行号起点与行数，大文件按行段取，省 token。）
 
 （收尾纪律：命令全部闭合后，本流必须以 tf-final 结束；写完文件、执行完命令不等于任务结束。）
 
+## 计划与验收（复合任务推荐）
+<tf-plan id="p1">
+- [a1] 验收项描述
+- [a2] 验收项描述
+</tf-plan>
+- 计划只声明一次；修订时重发 tf-plan（新计划整体替换旧计划，请求里只注差分）。
+- 完成某验收项对应的命令时，在该命令上加 accepts 属性，如 <tf-write path="out.md" id="w1" accepts="a1">...</tf-write>。
+- 全部验收项都有命令成功回执后 tf-final 才会通过；缺项/未验证会被判为过早并注入提示——
+  模型自述"已完成"不构成验收证据。
+
 ## 结果获取（关键）
-tf-read / tf-bash 成功时结果不回灌，只有句柄进句柄目录；失败才以 [tf-stream:error] 注入。
-因此：需要看到内容（文件片段、命令输出、计算结果）时，必须用 tf-peek 按句柄取回——
-handle 从 [tf-stream:observation] 与句柄目录增量中取。答案依赖命令输出时，先 peek 再收尾。
+tf-read 首次/内容变化的结果会完整注入下一请求（超长文件截断为中段省略，用 tf-peek 精确取回）；
+tf-bash / tf-write / tf-edit / tf-append 成功只记台账（回执），不回灌输出。
+失败一律以 [tf-stream:error] 注入，没有错误注入就是成功了。
+因此：要看命令输出或计算结果时，用 tf-peek 按句柄取回——handle 从 [tf-stream:observation]
+与句柄目录增量中取。答案依赖命令输出时，先 peek 再收尾。
 
 ## 回验纪律（省 token 的关键）
 - 你 tf-write 的正文全文就在你的上下文里：不要为了"确认写成功"而 tf-read 自己刚写过的
@@ -336,8 +440,10 @@ tf-final 的 summary 必须包含任务要求的最终答案原文（数字、�
 2. id 建议显式给出且全任务唯一；depends_on 是逗号分隔的依赖 id 列表，可省略。
    依赖只能指向本任务里已出现或将要出现的命令 id。
 3. 命令闭合即开始执行（独立命令并行，上限 3 个），不必等流结束再发后续命令。
-4. tf-read / tf-bash 的产出默认只句柄化；tf-read 首次结果会以行骨架注入下一请求。
+4. tf-read 首次/变化结果完整注入下一请求；其余成功产出只句柄化（见"结果获取"）。
    需要某句柄的细节时发 tf-peek（handle 用句柄目录里的值，行段 1-based 闭区间）。
+   tf-edit 匹配失败（原文不唯一/不存在）会以结构化错误注入：核对后修正 OLD 段重发，
+   不要扩大替换范围改全文。tf-grep/tf-glob 只回匹配行/路径，超长会截断并提示 tf-peek。
 5. 上一请求若报告 [tf-stream:error]，先修复或改道该命令（换路径/换命令），再继续其余任务。
 6. 全部命令成功且无需更多信息时输出 tf-final；收到 tf-final 后本任务收敛，不再有下一请求。`;
 
@@ -363,8 +469,23 @@ return { total: lines.length, errorCount: errors.length, samples: errors.slice(0
 - 独立子调用可用 Promise.all 并行；有顺序依赖的用 await 串行。
 - 什么时候用 tf-code：多步数据加工（过滤/统计/变换/聚合）。单次文件读写用 tf-write/tf-read，
   单条命令用 tf-bash，不要为一条命令包一层程序。
-- 程序失败会以 [tf-stream:error] 注入（kind: exception/timeout/abort/output-limit/...），
-  修复代码后换新 id 重发；timeout 属性为毫秒数，可省略（用宿主默认）。`;
+- 程序失败会以 [tf-stream:code-error] 注入（kind + 可重试结论，kind: exception/timeout/abort/
+  worker-exit/invalid-output/output-limit/protocol/sandbox-unavailable/quota-exceeded），
+  修复代码后换新 id 重发；timeout 属性为毫秒数，可省略（用宿主默认）。
+- 每次运行的子调用次数、输出字节、墙钟有插件级配额（超限结构化终止 kind: quota-exceeded）；
+  沙箱事实（mode/enforcement）逐次记账，enforcement=partial 只覆盖文件效果、不是隔离。`;
+
+/** F3：tf-code 首成功/变化结果完整注入的默认上限（字符）。4000 ≈ 2k tokens：
+ *  上限内值直接可见（省一次 tf-peek 往返），超限转骨架 + 句柄（中间结果不回灌的红线不破）。 */
+export const DEFAULT_CODE_VALUE_INJECT_LIMIT = 4000;
+
+/** F4：原生 tool_call 结果单块注入的默认上限（字符），仅声明 nativeToolSchemas 时生效。
+ *  6000 ≈ 3k tokens：首成功/短结果完整注入，超限转骨架 + 句柄，杜绝原生通道全量回灌。 */
+export const DEFAULT_NATIVE_RESULT_LIMIT = 6000;
+
+/** F7：长会话段边界阈值（追加区字符数）。160k 字符 ≈ 40k tokens：超过即在新回合开始处
+ *  整块丢弃旧段（ADR-001：整块丢弃路线，显式缓存重置点，原文句柄化可回取）。 */
+export const DEFAULT_SEGMENT_MAX_CHARS = 160_000;
 
 // ---------------------------------------------------------------------------
 // ② SingleStreamDriver
@@ -381,6 +502,29 @@ interface CommandRecord {
   output?: string;
   /** 执行产出的观测（供 high 骨架注入判定） */
   observation?: ObservationResult;
+}
+
+/** F5：验收项（计划状态放驱动器=宿主侧；请求只注差分）。 */
+interface PlanAcceptItem {
+  text: string;
+  status: 'open' | 'verified';
+  /** 验证证据：命令 id + 回执（句柄/指纹）；模型自述"已完成"不算证据 */
+  evidence?: string;
+}
+
+/** F5：解析 tf-plan body 的验收项行（`- [id] 描述`；无有效行时调用方判结构化失败）。 */
+export function parsePlanItems(body: string): Array<{ id: string; text: string }> {
+  const items: Array<{ id: string; text: string }> = [];
+  const seen = new Set<string>();
+  for (const line of body.split('\n')) {
+    const m = line.match(/^\s*[-*]?\s*\[([A-Za-z0-9_-]{1,64})\]\s+(.+?)\s*$/);
+    if (m === null) continue;
+    const id = m[1]!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    items.push({ id, text: m[2]! });
+  }
+  return items;
 }
 
 interface StructuredIssue {
@@ -421,11 +565,23 @@ export class SingleStreamDriver {
     readFeedbackLimit?: number;
     /** 自写回验策略（修复限制 1）：'receipt'（默认）| 'full' */
     selfReadFeedback: 'receipt' | 'full';
-    /** tf-code 通道是否启用（enableCode 配置 && executeCode 端口在位；决定协议文本是否声明 tf-code） */
+    /** tf-code 通道是否启用（K1：仅显式 enableCode:true 且端口在位；决定协议文本是否声明 tf-code） */
     codeEnabled: boolean;
     /** tf-code 默认超时（毫秒）；undefined = 宿主 provider 默认 */
     codeTimeoutMs?: number;
-    toolMapping: ToolMapping;
+    /** K5：tf-code 配额三项硬限制 */
+    codeQuota: Required<CodeQuota>;
+    /** F3：tf-code 结果完整注入上限（字符） */
+    codeValueInjectLimit: number;
+    /** F4：原生结果单块注入上限（字符） */
+    nativeResultLimit: number;
+  /** F4：原生通道是否启用（声明了 nativeToolSchemas 才算；决定结果上限策略是否生效） */
+  nativeToolSchemasEnabled: boolean;
+  /** F5：计划与验收是否启用（默认 true；false 时 tf-plan 命令级失败、accepts 忽略——回退点） */
+  enablePlan: boolean;
+  /** F7：段边界阈值（追加区字符数；≤0 = 关闭） */
+  segmentMaxChars: number;
+  toolMapping: ToolMapping;
   };
   readonly #renderer: ContextRenderer;
   readonly #obs: ObservationLedger;
@@ -440,10 +596,18 @@ export class SingleStreamDriver {
   #deferredPeeks: Array<{ rec: CommandRecord; turn: number; step: number }> = [];
   /** 本任务内 tf-write 已成功写过的路径（规范化分隔符；修复限制 1 的自写回验判定） */
   readonly #writtenPaths = new Set<string>();
+  /** F5 计划与验收：计划状态放驱动器（宿主侧）；请求只注差分。
+   *  items 为当前 revision 的验收项全集；announced 保存上次注入时各验收项的状态，
+   *  差分 = 两次状态之差（新增 / 变已验证 / 移除）。 */
+  #plan: { revision: number; items: Map<string, PlanAcceptItem> } | null = null;
+  #planAnnounced: Map<string, PlanAcceptItem['status']> | null = null;
   /** 运行中回合收到的 steer（修复限制 2：下一请求装配时进追加区，对齐内建"注入运行中回合的下一步"） */
   #pendingSteers: Array<{ text: string; message: unknown }> = [];
 
   #turnCounter = 0;
+  /** K4 取消链路：回合级 signal（runTurn 创建，cancel 时 abort）。所有工具派发
+   *  （executeTools / executeCode）共用它——不再用独立且永不触发的 AbortController。 */
+  #turnController: AbortController | null = null;
   #requestCount = 0;
   #reentryCount = 0;
   #finalNudges = 0;
@@ -467,6 +631,14 @@ export class SingleStreamDriver {
   #reportedPeeks = new Set<string>();
   /** 当前 agent 引用（executeTools 带上 agent；fs 工具 session 解析依赖，见 ToolBatchInputLike） */
   #agentRef: unknown = undefined;
+  /** K2：会话工作区（factory 从 session header / workingDirectory 服务解析后回填；
+   *  tf-code resolve 透传，与 tf-write/tf-read 的路径解析语义一致）。 */
+  #sessionCwd: string | undefined = undefined;
+  /** F6：resume 停机核对标记（"有意图无回执"时由 factory 置位；置位后 runTurn 直接 blocked，
+   *  不发任何请求、零注入——由用户核对后重启/清除意图，不自动重放）。 */
+  #resumeHalt: string | null = null;
+  /** F7：当前任务块在追加区的起始下标（pushUserTask 时刻的块数）——段丢弃只丢它之前的旧段。 */
+  #segmentKeepFrom = 0;
   /** ok 的 tf-final 候选（解析序）；任务最终答案取最后一个（过早 final 可被后继覆盖） */
   #finalCandidates: Array<{ cmdId: string; summary: string; turn: number; step: number }> = [];
 
@@ -481,8 +653,16 @@ export class SingleStreamDriver {
       streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? 30_000,
       budgetTokens: config.budgetTokens,
       selfReadFeedback: config.selfReadFeedback ?? 'receipt',
-      codeEnabled: config.enableCode !== false && ports.executeCode !== undefined,
+      // K1（0.3.0）：默认关闭——只有显式 enableCode:true 且端口在位才启用。
+      // 0.2.0 的"端口在位即启用"（auto）语义已按 M2/K1 结论收口：协议段默认 0 字符。
+      codeEnabled: config.enableCode === true && ports.executeCode !== undefined,
       codeTimeoutMs: config.codeTimeoutMs,
+      codeQuota: { ...DEFAULT_CODE_QUOTA, ...(config.codeQuota ?? {}) },
+      codeValueInjectLimit: config.codeValueInjectLimit ?? DEFAULT_CODE_VALUE_INJECT_LIMIT,
+      nativeResultLimit: config.nativeResultLimit ?? DEFAULT_NATIVE_RESULT_LIMIT,
+      nativeToolSchemasEnabled: config.nativeToolSchemas !== undefined,
+      enablePlan: config.enablePlan ?? true,
+      segmentMaxChars: config.segmentMaxChars ?? DEFAULT_SEGMENT_MAX_CHARS,
       toolMapping: config.toolMapping ?? DEFAULT_TOOL_MAPPING,
     };
     // tf-code 协议段只在实际可执行时声明（稳定前缀构造期冻结：通道不存在就不会被模型幻觉调用）
@@ -520,6 +700,47 @@ export class SingleStreamDriver {
   /** Agent 构造完成后回填引用：工具批的 agent 字段（fs 工具 session 解析依赖）。 */
   setAgent(agent: unknown): void {
     this.#agentRef = agent;
+  }
+
+  /** K2：回填会话工作区（tf-code resolve 透传用；factory 在 createDriver 闭包里解析）。 */
+  setSessionCwd(cwd: string | undefined): void {
+    this.#sessionCwd = cwd;
+  }
+
+  /** F6：置位 resume 停机核对（"有意图无回执"；零注入——只阻断，不进上下文）。 */
+  setResumeHalt(detail: string): void {
+    this.#resumeHalt = detail;
+  }
+
+  /** F6：清除停机核对（人工核对完成后的出口）。 */
+  clearResumeHalt(): void {
+    this.#resumeHalt = null;
+  }
+
+  /** F7：按句柄取回观测原文（段边界丢弃的旧段原文、命令产出等）；未知句柄返回 null。
+   *  只读通道，不进上下文——供排障/回取与评测断言使用。 */
+  peekHandle(handle: string, fromLine = 1, toLine = Number.MAX_SAFE_INTEGER): string | null {
+    return this.#obs.peek(handle, fromLine, toLine);
+  }
+
+  /**
+   * F5：命令成功回执 → 标记其 accepts 声明的验收项为已验证。
+   * 证据 = `cmdId(handle=…,fp=…)`——模型自述"已完成"不产生任何条目（无回执不验证）。
+   * 每次标记落台账；注入差分在 #buildInjections 里统一生成。
+   */
+  #markAccepts(cmd: TfCommand, handle: string | undefined, fingerprint: string): void {
+    const accepts = cmd.attrs['accepts'];
+    if (accepts === undefined || this.#plan === null || !this.#cfg.enablePlan) return;
+    for (const rawId of accepts.split(',')) {
+      const id = rawId.trim();
+      if (id === '') continue;
+      const item = this.#plan.items.get(id);
+      if (item === undefined || item.status === 'verified') continue;
+      item.status = 'verified';
+      item.evidence = `${cmd.id}(handle=${handle ?? '-'} fp=${fingerprint})`;
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'plan-accept', acceptId: id, cmdId: cmd.id, evidence: item.evidence });
+      this.#ledgerWrite('plugin:tf-agent/plan', { revision: this.#plan.revision, verified: id, cmdId: cmd.id, evidence: item.evidence });
+    }
   }
 
   /** Agent 作用域的工具执行器重绑（桌面端 preset 层）：
@@ -583,8 +804,10 @@ export class SingleStreamDriver {
 
   // ------------------------------------------------------------------ 任务入口
 
-  /** 追加一条用户任务（Agent.followup 的驱动器侧入口：只进装配历史，不发请求）。 */
+  /** 追加一条用户任务（Agent.followup 的驱动器侧入口：只进装配历史，不发请求）。
+   *  F7：记录当前任务块的起始下标——段边界只丢弃它之前的旧段（整块、完整回合边界）。 */
   pushUserTask(text: string): void {
+    this.#segmentKeepFrom = this.#renderer.appendBlockCount;
     this.#renderer.appendHistory({ role: 'user', content: text });
   }
 
@@ -628,38 +851,89 @@ export class SingleStreamDriver {
     return { applied, skipped };
   }
 
-  /** 外部取消（Agent.cancel 的入口）：中断当前流与在途请求。 */
+  /** 外部取消（Agent.cancel 的入口）：中断当前流与在途请求，并 abort 回合 signal
+   *  （K4：取消传导到工具派发与 tf-code runtime；abort 后由 drain 等待在途清理再收束）。 */
   cancel(reason: unknown): void {
     this.#aborted = true;
     this.#abortReason = reason;
     for (const controller of this.#activeControllers) {
       controller.abort(reason instanceof Error ? reason : new Error(String(reason)));
     }
+    this.#turnController?.abort(reason instanceof Error ? reason : new Error(String(reason)));
+  }
+
+  /** K4：回合 signal（runTurn 期间有效；缺省 = 一次性从未触发的 controller，兼容直派发路径）。 */
+  #commandSignal(): AbortSignal {
+    return this.#turnController?.signal ?? new AbortController().signal;
   }
 
   /** 跑一个回合（从当前装配历史到 FINISH/blocked）。异常一律上抛（fail-open，红线 5）。 */
   async runTurn(): Promise<TurnEndReason> {
+    // F6：resume 停机核对——"有意图无回执"时不发任何请求（零注入），直接 blocked，
+    // 由用户核对意图日志（CLI `dsh-stream-agent intents`）后决定继续或放弃。
+    if (this.#resumeHalt !== null) {
+      const reason: TurnEndReason = { kind: 'blocked', detail: `resume 停机核对（F6）：${this.#resumeHalt}——存在写前意图无回执，不自动重放；请人工核对后重试（CLI: dsh-stream-agent intents）。` };
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'resume-halt-pending-intents', detail: reason.kind === 'blocked' ? reason.detail : undefined });
+      this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'resume-halt-pending-intents', turn: this.#turnCounter + 1 });
+      this.#ports.events?.turnEnd(this.#turnCounter + 1, reason);
+      return reason;
+    }
     const turn = ++this.#turnCounter;
+    const controller = new AbortController();
+    this.#turnController = controller;
+    // F7 长会话段边界：追加区超过阈值时，在新回合开始处整块丢弃旧段（保留当前任务块起
+    // 的全部块）。被丢弃原文句柄化登记（可 tf-peek 回取），显式记录缓存重置点。
+    if (this.#cfg.segmentMaxChars > 0 && this.#segmentKeepFrom > 0 && this.#renderer.appendChars > this.#cfg.segmentMaxChars) {
+      const before = this.#renderer.appendChars;
+      const { dropped } = this.#renderer.dropAppendHead(this.#segmentKeepFrom, {
+        reason: `append chars ${before} > segmentMaxChars ${this.#cfg.segmentMaxChars}（turn ${turn} 开始处，完整回合边界）`,
+      });
+      for (const [i, text] of dropped.entries()) {
+        // 句柄化登记（obs：first observation → high，但不在命令通道上，永不自动注入；
+        // tf-peek 按句柄取回原文——"原文可按 request:N 回取"的落地形态）
+        this.#obs.observe({
+          tool: 'tf-read',
+          ok: true,
+          key: `segment:turn${turn}:${i}`,
+          content: text,
+          callId: `seg-t${turn}-${i}`,
+        });
+      }
+      this.#record({
+        seq: ++DRIVER_SEQ, kind: 'observation',
+        handle: dropped.length > 0 ? `obs:read:seg-t${turn}-0@v1` : null,
+        key: `segment:turn${turn}`, infoGain: 'low', reason: 'segment-drop-handleized',
+      });
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'segment-drop', detail: `dropped ${dropped.length} blocks (${before} chars) at turn ${turn} boundary; originals handleized (obs:read:seg-t${turn}-*)` });
+      this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'segment-drop', turn, droppedBlocks: dropped.length, chars: before });
+      this.#segmentKeepFrom = 0;
+    }
     debugTrace('turn.start', { turn });
     try {
-      this.#ports.events?.turnStart(turn);
-      const reason = await this.#turnLoop(turn);
-      this.#dumpEval(turn, reason);
-      return reason;
-    } catch (error) {
-      const failure: TurnEndReason = {
-        kind: 'error',
-        error: { message: error instanceof Error ? error.message : String(error), code: 'DRIVER_ERROR' },
-      };
-      this.#dumpEval(turn, failure);
-      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'driver-error', detail: failure.error.message });
-      this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'driver-error', detail: failure.error.message, turn });
       try {
-        this.#ports.events?.turnEnd(turn, failure);
-      } catch (eventError) {
-        this.#warn('turn/end 事件写入失败', eventError);
+        this.#ports.events?.turnStart(turn);
+        const reason = await this.#turnLoop(turn);
+        this.#dumpEval(turn, reason);
+        return reason;
+      } catch (error) {
+        const failure: TurnEndReason = {
+          kind: 'error',
+          error: { message: error instanceof Error ? error.message : String(error), code: 'DRIVER_ERROR' },
+        };
+        this.#dumpEval(turn, failure);
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'driver-error', detail: failure.error.message });
+        this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'driver-error', detail: failure.error.message, turn });
+        try {
+          this.#ports.events?.turnEnd(turn, failure);
+        } catch (eventError) {
+          this.#warn('turn/end 事件写入失败', eventError);
+        }
+        throw error;
       }
-      throw error;
+    } finally {
+      // K4：回合收束前等待在途命令清理完成（0 后置写），再释放回合 signal。
+      await this.#drain();
+      if (this.#turnController === controller) this.#turnController = null;
     }
   }
 
@@ -667,6 +941,11 @@ export class SingleStreamDriver {
 
   async #turnLoop(turn: number): Promise<TurnEndReason> {
     let step = 0;
+    // 防震荡护栏按回合重置（maxReentries / final nudge / final-only 档都是回合级护栏）——
+    // 不重置的话，多任务长会话会在第 N 个回合被历史累计计数误杀（F7 长会话测试实抓）。
+    this.#reentryCount = 0;
+    this.#finalNudges = 0;
+    this.#finalOnlyRequests = 0;
     let reason: TurnEndReason = { kind: 'blocked', detail: 'turn loop exited without convergence' };
 
     while (true) {
@@ -757,6 +1036,14 @@ export class SingleStreamDriver {
           : unfinished.length > 0
             ? 'tf-final 过早：仍有命令未完成'
             : undefined;
+        // F5：计划存在且还有未验证的验收项 → tf-final 过早（缺项或未验证不得标完成；
+        // 验证只能来自命令成功回执，模型自述不算）。
+        if (prematureFinal === undefined && this.#cfg.enablePlan && this.#plan !== null) {
+          const open = [...this.#plan.items.entries()].filter(([, item]) => item.status === 'open');
+          if (open.length > 0) {
+            prematureFinal = `tf-final 过早：计划有 ${open.length} 项验收未验证（${open.map(([id]) => id).join(', ')}）——完成对应命令并用 accepts="..." 声明回执，或用 tf-plan 修订计划（显式移除不再需要的项）。`;
+          }
+        }
       }
 
       const finalSeen = this.#finalSeen && prematureFinal === undefined;
@@ -1210,12 +1497,48 @@ export class SingleStreamDriver {
       return;
     }
 
-    // ---- tf-code：程序化工具调用（PTC 桥接；缺端口 → 命令级失败并引导改道）----
+    // ---- tf-plan：计划与验收（F5；驱动器内部处理，不映射工具）----
+    if (cmd.name === 'tf-plan') {
+      if (!this.#cfg.enablePlan) {
+        rec.status = 'failed';
+        rec.detail = 'plan-disabled: 计划与验收未启用（enablePlan: false）';
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        return;
+      }
+      const items = parsePlanItems(cmd.body ?? '');
+      if (items.length === 0) {
+        rec.status = 'failed';
+        rec.detail = 'bad-plan: tf-plan body 需要至少一行验收项（格式：- [id] 描述）';
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        return;
+      }
+      // 计划修订 = 整体替换（修订必须在显式 tf-plan 里声明，不接受隐式改计划）；
+      // 已验证项在新计划中同名重声明时保留证据（显式重声明显式保留），缺席项 = 显式移除。
+      const next = new Map<string, PlanAcceptItem>();
+      for (const item of items) {
+        const prev = this.#plan?.items.get(item.id);
+        next.set(item.id, prev !== undefined && prev.status === 'verified'
+          ? { text: item.text, status: 'verified', evidence: prev.evidence }
+          : { text: item.text, status: 'open' });
+      }
+      const revision = (this.#plan?.revision ?? 0) + 1;
+      this.#plan = { revision, items: next };
+      rec.status = 'ok';
+      rec.detail = `plan v${revision}: ${items.length} 验收项`;
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'plan', revision, open: [...next.values()].filter((i) => i.status === 'open').length, total: next.size });
+      this.#ledgerWrite('plugin:tf-agent/plan', { revision, cmdId: cmd.id, items: items.map((i) => ({ id: i.id, text: i.text, status: next.get(i.id)!.status })) });
+      return;
+    }
+
+    // ---- tf-code：程序化工具调用（PTC 桥接；缺端口或未显式开启 → 命令级失败并引导改道）----
     if (cmd.name === 'tf-code') {
       const executor = this.#ports.executeCode;
       if (executor === undefined || !this.#cfg.codeEnabled) {
         rec.status = 'failed';
-        rec.detail = 'no-code-channel: PTC runtime 不可达（需要宿主挂载 @deepseek-ai/dsh-ptc-runtime 并提供 ctx.ptcRuntime）';
+        rec.detail = 'no-code-channel: tf-code 未开启（K1 默认关闭；需显式 enableCode: true 且宿主提供 ctx.ptcRuntime 服务缝（@deepseek-ai/dsh-ptc-runtime）后才可用），改道 tf-bash/tf-write';
         this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
         this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
         return;
@@ -1228,7 +1551,10 @@ export class SingleStreamDriver {
           callId: cmd.id,
           code: cmd.body ?? '',
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
-          signal: new AbortController().signal,
+          // K4：回合 signal 直通（cancel 传导到 runtime；不再用独立且永不触发的 controller）
+          signal: this.#commandSignal(),
+          // K2：会话工作区（与 tf-write/tf-read 同一解析语义；未解析到则由宿主取默认目录）
+          ...(this.#sessionCwd === undefined ? {} : { cwd: this.#sessionCwd }),
           ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
         });
       } catch (error) {
@@ -1245,7 +1571,7 @@ export class SingleStreamDriver {
         tool: 'tf-code',
         ok: outcome.ok,
         key: observationKey(cmd),
-        content: outcome.ok ? outcome.valueJson : outcome.error,
+        content: outcome.ok ? (outcome.valueJson ?? '') : (outcome.error ?? 'unknown'),
         callId: cmd.id,
       });
       rec.observation = observation;
@@ -1255,47 +1581,110 @@ export class SingleStreamDriver {
         handle: observation.handle, key: observationKey(cmd),
         infoGain: observation.info_gain, reason: observation.reason,
       });
+      // K2 沙箱事实记账（成功与失败都记；enforcement=partial 必须显式可见）
+      const sandbox = outcome.sandbox;
+      if (sandbox !== undefined) {
+        this.#record({
+          seq: ++DRIVER_SEQ, kind: 'sandbox',
+          cmdId: cmd.id, mode: sandbox.mode, enforcement: sandbox.enforcement,
+          deniedCount: sandbox.denied?.length ?? 0,
+        });
+        this.#ledgerWrite('plugin:tf-agent/command', {
+          cmdId: cmd.id, name: cmd.name, sandbox: true,
+          mode: sandbox.mode, enforcement: sandbox.enforcement, denied: sandbox.denied,
+          cwd: outcome.cwd ?? this.#sessionCwd ?? null,
+        });
+      }
       if (!outcome.ok) {
         rec.status = 'failed';
-        rec.detail = outcome.logs === undefined ? outcome.error : `${outcome.error} | logs tail: ${outcome.logs.slice(-200)}`;
+        // K3 结构化失败注入：kind + 可重试结论 + 建议 + 日志尾（200 字符）。
+        const kind = outcome.kind ?? 'exception';
+        const retryable = outcome.retryable === true;
+        const logsTail = outcome.logs === undefined ? '' : `\nlogs tail: ${outcome.logs.slice(-200)}`;
+        rec.detail = `[kind=${kind} retry=${retryable ? 'yes' : 'no'}] ${outcome.error ?? 'unknown'}${logsTail}`.slice(0, 800);
         this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
-        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail.slice(0, 200) });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', kind, retryable, detail: (outcome.error ?? '').slice(0, 200) });
         return;
       }
       rec.status = 'ok';
-      rec.detail = `${outcome.valueJson.length} chars${outcome.logs === undefined ? '' : ` + logs ${outcome.logs.length} chars`}`;
+      rec.detail = `${(outcome.valueJson ?? '').length} chars${outcome.logs === undefined ? '' : ` + logs ${outcome.logs.length} chars`}`;
+      // F3：首成功/变化结果完整注入——值在上限内时挂到 rec.output（need_result 通道），
+      // 超限保持骨架 + 句柄形态（中间结果不回灌的红线不破）。
+      const valueJson = outcome.valueJson ?? '';
+      if (observation.payload.kind === 'skeleton' && valueJson.length <= this.#cfg.codeValueInjectLimit) {
+        rec.output = valueJson;
+      }
+      // F5：tf-code 成功（有回执）→ 声明的验收项记为已验证（证据 = 命令 id + 值指纹）
+      this.#markAccepts(cmd, rec.handle, contentFingerprint(valueJson));
       this.#record({
         seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok',
         handle: rec.handle, infoGain: observation.info_gain, detail: rec.detail,
       });
       this.#ledgerWrite('plugin:tf-agent/command', {
         cmdId: cmd.id, name: cmd.name, status: 'ok',
-        handle: rec.handle, infoGain: observation.info_gain, chars: outcome.valueJson.length,
+        handle: rec.handle, infoGain: observation.info_gain, chars: valueJson.length,
+        valueInjected: rec.output !== undefined,
+        enforcement: sandbox?.enforcement,
       });
       return;
     }
 
-    // ---- tf-write / tf-read / tf-bash：映射原生工具，单命令批执行 ----
-    const mapped = this.#cfg.toolMapping.toToolCall(cmd);
-    if (mapped === null) {
-      rec.status = 'failed';
-      rec.detail = `no-tool-mapping:${cmd.name}`;
-      this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
-      return;
-    }
-
+    // ---- tf-write / tf-read / tf-edit / tf-append / tf-grep / tf-glob / tf-bash：映射原生工具，单命令批执行 ----
+    let mapped: { name: string; arguments: Record<string, unknown> } | null = null;
     let result: ToolBatchResultLike;
+    // F6 写前意图：变更类命令（tf-write/tf-edit/tf-append）在派发到宿主工具**之前**落盘（fsync）。
+    // 崩溃后"有意图无回执"即可判定写入可能已发生 → resume 停机核对。零注入：只进账本。
+    const intentOp: 'write' | 'edit' | 'append' | null = cmd.name === 'tf-write'
+      ? 'write'
+      : cmd.name === 'tf-edit'
+        ? 'edit'
+        : cmd.name === 'tf-append'
+          ? 'append'
+          : null;
+    if (intentOp !== null) {
+      try {
+        this.#ports.onIntent?.({
+          cmdId: cmd.id,
+          op: intentOp,
+          path: cmd.attrs['path'] ?? '',
+          fingerprint: contentFingerprint(cmd.body ?? ''),
+        });
+      } catch (intentError) {
+        // fail-open（红线 6：可选功能 fail-open 且必须告警）——不因意图落盘失败阻断写入
+        this.#warn('F6 写前意图落盘失败（fail-open，继续派发；崩溃窗口内该写入不可判定）', intentError);
+      }
+    }
     try {
+      mapped = this.#cfg.toolMapping.toToolCall(cmd);
+      if (mapped === null) {
+        // tf-edit body 标记解析失败等：映射层无法产出参数——结构化失败，不静默改全文。
+        rec.status = 'failed';
+        rec.detail = cmd.name === 'tf-edit'
+          ? 'tf-edit body 解析失败：需要 "<<<<<<< OLD" / "=======" / ">>>>>>> NEW" 三行标记各出现一次且顺序正确（结构化失败，不做模糊匹配、不改全文）'
+          : `no-tool-mapping:${cmd.name}`;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail.slice(0, 200) });
+        return;
+      }
       result = await this.#ports.executeTools({
         calls: [{ type: 'tool-call', id: cmd.id, name: mapped.name, arguments: JSON.stringify(mapped.arguments) }],
-        signal: new AbortController().signal,
+        // K4：回合 signal（cancel 时传导；不再用独立且永不触发的 AbortController）
+        signal: this.#commandSignal(),
         maxParallelToolCalls: 1,
         ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
         log: safeToolLog(this.#ports, turn, step),
       });
     } catch (error) {
       rec.status = 'failed';
-      rec.detail = describeToolError(error);
+      rec.detail = isAbortError(error) ? `aborted: 回合取消（K4），未产生后置结果` : describeToolError(error);
+      // F6 写后回执（失败路径）：意图闭合为"已发生但失败"，不算"无回执"
+      if (intentOp !== null) {
+        try {
+          this.#ports.onIntentReceipt?.({ cmdId: cmd.id, ok: false, detail: rec.detail.slice(0, 120) });
+        } catch (receiptError) {
+          this.#warn('F6 意图回执落盘失败（fail-open）', receiptError);
+        }
+      }
       this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
       this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail.slice(0, 200) });
       return;
@@ -1324,6 +1713,14 @@ export class SingleStreamDriver {
       rec.status = 'failed';
       rec.detail = contentText.slice(0, 500);
       rec.handle = observation.handle ?? undefined;
+      // F6 写后回执（工具级失败路径）：意图闭合为"已发生但失败"
+      if (intentOp !== null) {
+        try {
+          this.#ports.onIntentReceipt?.({ cmdId: cmd.id, ok: false, detail: rec.detail.slice(0, 120) });
+        } catch (receiptError) {
+          this.#warn('F6 意图回执落盘失败（fail-open）', receiptError);
+        }
+      }
       this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
       this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail.slice(0, 200) });
       return;
@@ -1336,6 +1733,16 @@ export class SingleStreamDriver {
       // 修复限制 1：登记本任务自写路径（tf-read 命中时只注入回执，掐断"写→读回验"循环）
       this.#writtenPaths.add(normalizeTaskPath(cmd.attrs['path']));
     }
+    // F6 写后回执（成功路径）
+    if (intentOp !== null) {
+      try {
+        this.#ports.onIntentReceipt?.({ cmdId: cmd.id, ok: true, detail: rec.detail.slice(0, 120) });
+      } catch (receiptError) {
+        this.#warn('F6 意图回执落盘失败（fail-open）', receiptError);
+      }
+    }
+    // F5：命令成功（有回执）→ 声明的验收项记为已验证（证据 = 命令 id + 句柄/指纹）
+    this.#markAccepts(cmd, rec.handle, contentFingerprint(contentText));
     this.#record({
       seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok',
       handle: rec.handle, infoGain: observation.info_gain, detail: rec.detail,
@@ -1374,11 +1781,35 @@ export class SingleStreamDriver {
     for (const _call of calls) this.#ports.onToolSettled?.();
     if (results.length === 0 || level === 'final-only') return;
 
-    // 原生通道结果即需求（阻塞语义）：注入易变尾，下一请求立即可见
-    const blocks = results.map((r) => ({
-      role: 'user' as const,
-      content: `[tf-stream:tool-result callId=${r.callId} tool=${r.name}${r.isError ? ' isError=true' : ''}]\n${r.content}`,
-    }));
+    // 原生通道结果即需求（阻塞语义）：注入易变尾，下一请求立即可见。
+    // F4：仅在声明了 nativeToolSchemas（原生通道显式启用）时执行上限策略——
+    // 首成功/短结果完整注入；超限块登记 obs 并转"骨架 + 句柄"，杜绝全量回灌。
+    const capped = this.#cfg.nativeToolSchemasEnabled === true;
+    const blocks = results.map((r) => {
+      if (!capped || r.isError || r.content.length <= this.#cfg.nativeResultLimit) {
+        return {
+          role: 'user' as const,
+          content: `[tf-stream:tool-result callId=${r.callId} tool=${r.name}${r.isError ? ' isError=true' : ''}]\n${r.content}`,
+        };
+      }
+      const observation = this.#obs.observe({
+        tool: r.name,
+        ok: true,
+        key: `native:${r.name}:${r.callId}`,
+        content: r.content,
+        callId: r.callId,
+      });
+      const skeleton = observation.payload.kind === 'skeleton' ? observation.payload.rendered : '';
+      this.#record({
+        seq: ++DRIVER_SEQ, kind: 'observation',
+        handle: observation.handle, key: `native:${r.name}:${r.callId}`,
+        infoGain: observation.info_gain, reason: `${observation.reason}:native-capped`,
+      });
+      return {
+        role: 'user' as const,
+        content: `[tf-stream:tool-result callId=${r.callId} tool=${r.name}] ${r.content.length} 字符超出原生通道注入上限（${this.#cfg.nativeResultLimit}），已句柄化：${skeleton}\n（原文用 tf-peek handle="${observation.handle ?? ''}" from_line=.. to_line=.. 取回）`,
+      };
+    });
     this.#injectedChars += blocks.reduce((n, b) => n + b.content.length, 0);
     this.#pendingNativeBlocks.push(...blocks);
   }
@@ -1514,6 +1945,10 @@ export class SingleStreamDriver {
             continue;
           }
           body = readFeedbackBody(full, obs.payload.rendered, this.#cfg.readFeedbackLimit ?? DEFAULT_READ_FEEDBACK_LIMIT);
+        } else if (rec.cmd.name === 'tf-code' && rec.output !== undefined) {
+          // F3：code 结果可见性——上限内的首成功/变化值完整注入（省一次 tf-peek 往返）；
+          // 句柄仍然有效，需要原文行段时照常 tf-peek。仅 tf-code 显式开启时此路径可达。
+          body = rec.output;
         } else {
           body = obs.payload.rendered;
         }
@@ -1538,7 +1973,23 @@ export class SingleStreamDriver {
       }
     }
 
-    // 4. 原生 tool_call 结果（阻塞通道回灌，任意档都注入——它们是模型的即时需求）
+    // 4. F5 计划差分（只注差分：新计划全量一次，此后只注变化——新增/验证/移除；净增 ≤0 的关键）
+    if (this.#cfg.enablePlan && this.#plan !== null) {
+      const announced = this.#planAnnounced;
+      const planBlock = renderPlanDiff(this.#plan.revision, this.#plan.items, announced);
+      if (planBlock !== null) blocks.push({ role: 'user', content: planBlock });
+      // 更新已宣布快照（与本次注入一致；空差分不推进——下请求继续携带）
+      if (announced === null) {
+        this.#planAnnounced = new Map([...this.#plan.items].map(([id, item]) => [id, item.status]));
+      } else if (planBlock !== null) {
+        for (const [id, status] of this.#plan.items) announced.set(id, status);
+        for (const id of [...announced.keys()]) {
+          if (!this.#plan.items.has(id)) announced.delete(id);
+        }
+      }
+    }
+
+    // 5. 原生 tool_call 结果（阻塞通道回灌，任意档都注入——它们是模型的即时需求）
     blocks.push(...this.#pendingNativeBlocks);
     this.#pendingNativeBlocks = [];
 
@@ -1601,6 +2052,16 @@ function readFeedbackBody(full: string | null, skeleton: string, limit: number):
   return `${full.slice(0, headCut)}\n……（中段省略 ${omitted} 字符；tf-peek handle=<句柄> from_line=.. to_line=.. 精确取回）……\n${full.slice(full.length - tailCut)}`;
 }
 
+/** K4：识别取消类错误（AbortError / DOMException AbortError / 显式 abort 消息），与超时分账。 */
+function isAbortError(error: unknown): boolean {
+  if (error instanceof Error) {
+    return error.name === 'AbortError'
+      || (error as DOMException).code === 20
+      || /(^|\b)(abort|aborted)(\b|$)/i.test(error.message);
+  }
+  return false;
+}
+
 /** 工具批失败取因：ToolBatchExecutionError 把真实错误包在 cause/partial 里（dsh-tools
  *  shared-DTdn5dXO.js），只记 message 会把根因吞掉（2026-11-15 真连 W1 教训）。 */
 function describeToolError(error: unknown): string {
@@ -1645,6 +2106,44 @@ function observationKey(cmd: TfCommand): string {
       : `code:${contentFingerprint(cmd.body ?? '')}`;
   }
   return cmd.name;
+}
+
+/**
+ * F5 计划差分渲染：首个计划注全量清单；其后只注变化（新增 / 已验证 / 已移除）。
+ * 无变化返回 null（不产生任何块——请求体积不变）。计划状态本身在驱动器侧，
+ * 请求里永远只出现差分（净增 ≤0 的关键设计）。
+ */
+function renderPlanDiff(
+  revision: number,
+  items: ReadonlyMap<string, { text: string; status: 'open' | 'verified'; evidence?: string }>,
+  announced: ReadonlyMap<string, 'open' | 'verified'> | null,
+): string | null {
+  const lines: string[] = [];
+  if (announced === null) {
+    // 首次：全量清单一次（带每项当前验证状态）
+    lines.push(`[tf-stream:plan v${revision}]`, '任务计划与验收项（完成对应命令时用 accepts="<id>" 声明回执；全部验收项有回执后 tf-final 才会通过）：');
+    for (const [id, item] of items) {
+      lines.push(item.status === 'verified'
+        ? `- [${id}] ${item.text} ✓ 已验证（回执：${item.evidence ?? '-'}）`
+        : `- [${id}] ${item.text}（未验证）`);
+    }
+    return lines.join('\n');
+  }
+  const added: string[] = [];
+  const verified: string[] = [];
+  const removed: string[] = [];
+  for (const [id, item] of items) {
+    const prev = announced.get(id);
+    if (prev === undefined) added.push(`+ [${id}] ${item.text}`);
+    else if (prev === 'open' && item.status === 'verified') verified.push(`✓ [${id}] 已验证（回执：${item.evidence ?? '-'}）`);
+  }
+  for (const id of announced.keys()) {
+    if (!items.has(id)) removed.push(`- [${id}] 已从计划移除`);
+  }
+  if (added.length === 0 && verified.length === 0 && removed.length === 0) return null;
+  lines.push(`[tf-stream:plan-diff v${revision}]`);
+  lines.push(...added, ...verified, ...removed);
+  return lines.join('\n');
 }
 
 function blockTextOf(content: unknown): string {
@@ -2546,8 +3045,25 @@ export interface LoopEntryConfig {
   invariants?: string;
   /** 自写回验策略（修复限制 1）：'receipt'（默认）| 'full' —— 见 StreamDriverConfig.selfReadFeedback */
   selfReadFeedback?: 'receipt' | 'full';
-  /** tf-code 程序化通道（PTC 桥接）：缺省 = ctx.ptcRuntime 在位即启用；false 强制关闭 */
+  /** tf-code 程序化通道（PTC 桥接）。K1（0.3.0）：**默认关闭**；显式 true 且宿主挂载
+   *  @deepseek-ai/dsh-ptc-runtime 才启用（协议文本才声明 tf-code 段）。粒度是装配/模式级，
+   *  不做会话级动态开关（协议段构造期冻结）。 */
   enableCode?: boolean;
+  /** K5：tf-code 配额三项硬限制（maxSubcalls / maxOutputBytes / maxWallMs；缺省 DEFAULT_CODE_QUOTA） */
+  codeQuota?: CodeQuota;
+  /** F3：tf-code 结果完整注入上限（字符；缺省 DEFAULT_CODE_VALUE_INJECT_LIMIT，仅 opt-in 生效） */
+  codeValueInjectLimit?: number;
+  /** F4：原生 tool_call 结果单块注入上限（字符；缺省 DEFAULT_NATIVE_RESULT_LIMIT，
+   *  仅声明 nativeToolSchemas 时生效） */
+  nativeResultLimit?: number;
+  /** F5：计划与验收开关（默认 true；false 关闭 tf-plan/accepts/验收拦截——回退点） */
+  enablePlan?: boolean;
+  /** F6：写前意图日志开关（默认 true；false = 不落盘、不做 resume 核对——回退点） */
+  enableIntents?: boolean;
+  /** F6：resume 时"有意图无回执"的策略：'halt'（默认，停机核对）/ 'ignore'（只告警不阻断） */
+  resumeIntentPolicy?: 'halt' | 'ignore';
+  /** F7：长会话段边界阈值（追加区字符数；0/负数关闭；缺省 DEFAULT_SEGMENT_MAX_CHARS） */
+  segmentMaxChars?: number;
   /** tf-code 默认超时（毫秒）；缺省 = 宿主 provider 默认 */
   codeTimeoutMs?: number;
   /** 修复限制 3/4：宿主缺 storage/sessionPersistence/plugin record 模块时的本地文件持久化兜底
@@ -2657,7 +3173,7 @@ export default function apply(ctx: {
           return { file, appendRecord: (type: string, data: unknown) => appendLedgerRecord(file, type, data) };
         }
       : undefined,
-    createDriver({ agentOptions, session }) {
+    createDriver({ agentOptions, session, sessionId }) {
       const live = resolveEffective();
       const cfg: StreamDriverConfig = {
         provider: agentOptions.provider || config.provider || defaultSelection.provider || '',
@@ -2670,21 +3186,78 @@ export default function apply(ctx: {
         selfReadFeedback: live.selfReadFeedback,
         enableCode: live.enableCode,
         codeTimeoutMs: config.codeTimeoutMs,
+        codeQuota: config.codeQuota,
+        codeValueInjectLimit: config.codeValueInjectLimit,
+        nativeResultLimit: config.nativeResultLimit,
+        enablePlan: config.enablePlan,
+        segmentMaxChars: config.segmentMaxChars,
         nativeToolSchemas: config.nativeToolSchemas,
         systemPrompt: config.systemPrompt,
         protocolText: config.protocolText,
         invariants: config.invariants,
       };
+      // F6 恢复意图：意图日志端口（fsync 落盘；enableIntents: false 关闭——回退点）。
+      // 写前意图在派发前落盘、写后回执落定即记；崩溃后"有意图无回执"= 写入可能已发生。
+      const intentsEnabled = config.enableIntents !== false;
+      const intentBook = new Map<string, number>();
+      const intentFile = sessionId !== undefined && sessionId !== '' ? intentFileOf(stateRoot, sessionId) : undefined;
+      const loadIntentState = (): { seq: number } => {
+        if (intentFile === undefined) return { seq: 0 };
+        try {
+          return { seq: loadIntentRecords(intentFile).records.length };
+        } catch {
+          return { seq: 0 };
+        }
+      };
+      const intentSeqState = intentsEnabled ? loadIntentState() : { seq: 0 };
       const driver = new SingleStreamDriver(
         {
           stream: (options) => llm.stream(options),
           executeTools: (input) => tools.execute(input),
           ...(codeExecutor === undefined ? {} : { executeCode: codeExecutor }),
+          ...(intentsEnabled && intentFile !== undefined
+            ? {
+                onIntent: (event: { cmdId: string; op: 'write' | 'edit' | 'append'; path: string; fingerprint: string }) => {
+                  intentSeqState.seq += 1;
+                  intentBook.set(event.cmdId, intentSeqState.seq);
+                  appendIntentRecord(intentFile!, { type: 'intent', seq: intentSeqState.seq, at: new Date().toISOString(), sessionId: sessionId ?? '', ...event });
+                },
+                onIntentReceipt: (event: { cmdId: string; ok: boolean; detail?: string }) => {
+                  const intentSeq = intentBook.get(event.cmdId) ?? -1;
+                  intentSeqState.seq += 1;
+                  appendIntentRecord(intentFile!, { type: 'receipt', seq: intentSeqState.seq, at: new Date().toISOString(), intentSeq, ok: event.ok, ...(event.detail === undefined ? {} : { detail: event.detail }) });
+                },
+              }
+            : {}),
           events: createSessionEventWriter(session),
           onWarning: warning,
         },
         cfg,
       );
+      // K2：会话工作区解析（tf-code resolve 透传用）。会话 header.cwd（会话原始目录）
+      // 优先，缺省回退宿主 workingDirectory 服务的部署默认目录；两者都不可得则不传，
+      // 由宿主按自己的默认语义解析。插件不复制宿主的优先级规则。
+      const headerCwd = (session as { header?: { cwd?: unknown } } | undefined)?.header?.cwd;
+      const workingDirectory = getService<{ defaultDirectory?: string }>(ctx, 'workingDirectory');
+      const resolvedCwd = typeof headerCwd === 'string' && headerCwd !== ''
+        ? headerCwd
+        : (workingDirectory?.defaultDirectory !== undefined ? workingDirectory.defaultDirectory : undefined);
+      driver.setSessionCwd(resolvedCwd);
+      // F6 resume 停机核对：创建/恢复会话时检查"有意图无回执"；存在即置位停机
+      // （不发请求、零注入、不自动重放）。resumeIntentPolicy: 'ignore' 可跳过（回退点）。
+      if (intentsEnabled && intentFile !== undefined && config.resumeIntentPolicy !== 'ignore') {
+        try {
+          const { records, badLines } = loadIntentRecords(intentFile);
+          const pending = pendingIntents(records).filter((p) => p.state === 'pending');
+          if (pending.length > 0) {
+            const listing = pending.slice(0, 8).map((p) => `${p.intent.op} ${p.intent.path} (cmd=${p.intent.cmdId} fp=${p.intent.fingerprint})`).join('; ');
+            driver.setResumeHalt(`${pending.length} 条写前意图无回执（${listing}${pending.length > 8 ? ' …' : ''}）${badLines > 0 ? `；另有 ${badLines} 行坏记录` : ''}`);
+            warning(`[stream-loop] F6 resume 停机核对：会话 ${sessionId} 有 ${pending.length} 条写前意图无回执（写入可能已发生）——不自动重放，请人工核对（CLI: dsh-stream-agent intents）`);
+          }
+        } catch (error) {
+          warning('F6 意图日志读取失败（fail-open：不做停机核对，继续会话）', error);
+        }
+      }
       return { driver };
     },
     onWarning: warning,
@@ -2694,7 +3267,17 @@ export default function apply(ctx: {
   if (agents === undefined || typeof agents.setFactory !== 'function') {
     throw new Error('[stream-loop] ctx.agents.setFactory 不可用：无法接管 agent 创建（需要 dsh-agent 服务在位）');
   }
-  const detachFactory = agents.setFactory(factory);
+  // S3 双 loop 具名诊断（0.3.0-beta.1）：setFactory 是全局唯一槽位，内建 agent-loop 未被
+  // 停用时宿主抛裸错 "an agent factory is already registered"。转换为 E_DOUBLE_LOOP：
+  // 带 profile 标识、冲突来源与处置建议——冲突必须具名失败，不 catch 后继续、不重试、
+  // 不靠装载顺序"碰巧"获胜（C2 单 loop 权威）。
+  const profileName = resolveProfileName(ctx);
+  let detachFactory: (() => void) | undefined;
+  try {
+    detachFactory = agents.setFactory(factory);
+  } catch (error) {
+    throw doubleLoopError(error, profileName);
+  }
   // 接管事实登记：控制栏据此写"接管生效"或"未接管"
   markTakeover(control.mode);
 
@@ -2714,7 +3297,7 @@ export default function apply(ctx: {
       langLocked: control.langSource === 'config' || control.langSource === 'env',
       effective: {
         selfReadFeedback: live.selfReadFeedback,
-        enableCode: live.enableCode === undefined ? 'auto' : live.enableCode,
+        enableCode: live.enableCode === undefined ? false : live.enableCode,
         persistFallback: live.persistFallback,
         maxParallelToolCalls: live.maxParallelToolCalls,
         maxReentries: live.maxReentries,
@@ -2769,7 +3352,10 @@ export default function apply(ctx: {
   }
 
   if (config.announceTakeover === true) {
-    console.error(`[stream-loop] TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch) · mode=${control.mode} (${control.modeSource})`);
+    const codeState = codeExecutor === undefined
+      ? 'code=off'
+      : (resolveEffective().enableCode === true ? 'code=on(opt-in)' : 'code=off(default,K1)');
+    console.error(`[stream-loop] TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch) · mode=${control.mode} (${control.modeSource}) · ${codeState} · profile=${profileName}`);
   }
 
   // 会话投影注册（桌面端硬依赖，内建 agent-loop 在 Service.init 注册——dsh-agent-loop rc.3:50110）：
@@ -2818,6 +3404,34 @@ function detailString(detail: unknown): string {
   } catch {
     return String(detail);
   }
+}
+
+/** S3：解析当前 profile 名（宿主 profileContext.dir 的 basename；测试桩/缺失时回退 env 与 unknown）。 */
+function resolveProfileName(ctx: unknown): string {
+  const dir = (ctx as { get?: (name: string) => unknown }).get?.('profileContext') as { dir?: unknown } | undefined;
+  const raw = typeof (dir as { dir?: unknown } | undefined)?.dir === 'string' ? (dir as { dir: string }).dir : undefined;
+  if (raw !== undefined && raw !== '') {
+    const parts = raw.replace(/\\/g, '/').split('/').filter((p) => p !== '');
+    const last = parts[parts.length - 1];
+    if (last !== undefined && last !== '') return last;
+  }
+  const env = typeof process !== 'undefined' ? process.env['DSH_PROFILE'] : undefined;
+  return env !== undefined && env !== '' ? env : 'unknown';
+}
+
+/** S3：把宿主的 setFactory 冲突裸错转换为 E_DOUBLE_LOOP 具名失败（fail-fast，不重试不静默）。 */
+function doubleLoopError(original: unknown, profile: string): Error {
+  const detail = original instanceof Error ? original.message : String(original);
+  const error = new Error(
+    `[E_DOUBLE_LOOP] 双 loop 冲突，接管失败：profile=${profile} 已注册了另一个 agent factory`
+    + `（来源通常为内建 @deepseek-ai/dsh-agent-loop 或另一个 stream 实例）；entry=stream-agent。`
+    + ` 原始错误：${detail}`
+    + ` 处置建议：不要把本插件装进已有内建 loop 的 profile（web/desktop 等）；`
+    + `在专用 profile（如 profiles/stream 模板）中安装，或确认该 profile 的 bundle/patch 已停用`
+    + ` @deepseek-ai/dsh-agent-loop（"- id: agent-loop" + "disabled: true"）。`,
+  );
+  error.name = 'E_DOUBLE_LOOP';
+  return error;
 }
 
 /** 诊断追踪（STREAM_LOOP_DEBUG=1 时向 stderr 打里程碑；生产默认关闭，不产生噪音）。 */

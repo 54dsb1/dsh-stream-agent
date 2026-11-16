@@ -1,0 +1,265 @@
+{
+  "stamp": "2026-11-15-v02",
+  "arms": {
+    "baseline": {
+      "tasks": {
+        "W1": {
+          "requests": 5,
+          "excludedTitleRequests": 1,
+          "inputTokens": 2092,
+          "cacheReadTokens": 36480,
+          "cacheWriteTokens": 0,
+          "outputTokens": 1900,
+          "fourComponentTotal": 40472,
+          "twoComponentTotal": 3992,
+          "cacheComponentsUnavailable": false
+        },
+        "W2": {
+          "requests": 5,
+          "excludedTitleRequests": 1,
+          "inputTokens": 3269,
+          "cacheReadTokens": 40704,
+          "cacheWriteTokens": 0,
+          "outputTokens": 5633,
+          "fourComponentTotal": 49606,
+          "twoComponentTotal": 8902,
+          "cacheComponentsUnavailable": false
+        },
+        "W3": {
+          "requests": 9,
+          "excludedTitleRequests": 1,
+          "inputTokens": 5155,
+          "cacheReadTokens": 91520,
+          "cacheWriteTokens": 0,
+          "outputTokens": 5051,
+          "fourComponentTotal": 101726,
+          "twoComponentTotal": 10206,
+          "cacheComponentsUnavailable": false
+        },
+        "R1": {
+          "requests": 4,
+          "excludedTitleRequests": 1,
+          "inputTokens": 1996,
+          "cacheReadTokens": 27648,
+          "cacheWriteTokens": 0,
+          "outputTokens": 1112,
+          "fourComponentTotal": 30756,
+          "twoComponentTotal": 3108,
+          "cacheComponentsUnavailable": false
+        },
+        "R2": {
+          "requests": 5,
+          "excludedTitleRequests": 1,
+          "inputTokens": 2212,
+          "cacheReadTokens": 35328,
+          "cacheWriteTokens": 0,
+          "outputTokens": 965,
+          "fourComponentTotal": 38505,
+          "twoComponentTotal": 3177,
+          "cacheComponentsUnavailable": false
+        },
+        "R3": {
+          "requests": 2,
+          "excludedTitleRequests": 1,
+          "inputTokens": 6130,
+          "cacheReadTokens": 12160,
+          "cacheWriteTokens": 0,
+          "outputTokens": 136,
+          "fourComponentTotal": 18426,
+          "twoComponentTotal": 6266,
+          "cacheComponentsUnavailable": false
+        },
+        "R4": {
+          "requests": 2,
+          "excludedTitleRequests": 1,
+          "inputTokens": 3896,
+          "cacheReadTokens": 12288,
+          "cacheWriteTokens": 0,
+          "outputTokens": 252,
+          "fourComponentTotal": 16436,
+          "twoComponentTotal": 4148,
+          "cacheComponentsUnavailable": false
+        },
+        "C1": {
+          "requests": 6,
+          "excludedTitleRequests": 1,
+          "inputTokens": 2513,
+          "cacheReadTokens": 43776,
+          "cacheWriteTokens": 0,
+          "outputTokens": 1099,
+          "fourComponentTotal": 47388,
+          "twoComponentTotal": 3612,
+          "cacheComponentsUnavailable": false
+        },
+        "C2": {
+          "requests": 5,
+          "excludedTitleRequests": 1,
+          "inputTokens": 3209,
+          "cacheReadTokens": 38016,
+          "cacheWriteTokens": 0,
+          "outputTokens": 1296,
+          "fourComponentTotal": 42521,
+          "twoComponentTotal": 4505,
+          "cacheComponentsUnavailable": false
+        },
+        "C3": {
+          "requests": 7,
+          "excludedTitleRequests": 1,
+          "inputTokens": 2556,
+          "cacheReadTokens": 55808,
+          "cacheWriteTokens": 0,
+          "outputTokens": 2210,
+          "fourComponentTotal": 60574,
+          "twoComponentTotal": 4766,
+          "cacheComponentsUnavailable": false
+        }
+      },
+      "totals": {
+        "inputTokens": 33028,
+        "cacheReadTokens": 393728,
+        "cacheWriteTokens": 0,
+        "outputTokens": 19654,
+        "fourComponentTotal": 446410
+      },
+      "requests": 50,
+      "checks": {
+        "pass": 29,
+        "total": 36
+      },
+      "twoComponentReference": {
+        "sum": 52682,
+        "note": "非全量口径，只作参考（METRICS.md M1）"
+      }
+    },
+    "stream": {
+      "tasks": {
+        "W1": {
+          "requests": 9,
+          "excludedTitleRequests": 0,
+          "inputTokens": 6432,
+          "cacheReadTokens": 9600,
+          "cacheWriteTokens": 0,
+          "outputTokens": 6239,
+          "fourComponentTotal": 22271,
+          "twoComponentTotal": 12671,
+          "cacheComponentsUnavailable": false
+        },
+        "W2": {
+          "requests": 7,
+          "excludedTitleRequests": 0,
+          "inputTokens": 4489,
+          "cacheReadTokens": 7168,
+          "cacheWriteTokens": 0,
+          "outputTokens": 5926,
+          "fourComponentTotal": 17583,
+          "twoComponentTotal": 10415,
+          "cacheComponentsUnavailable": false
+        },
+        "W3": {
+          "requests": 3,
+          "excludedTitleRequests": 0,
+          "inputTokens": 1079,
+          "cacheReadTokens": 2944,
+          "cacheWriteTokens": 0,
+          "outputTokens": 1056,
+          "fourComponentTotal": 5079,
+          "twoComponentTotal": 2135,
+          "cacheComponentsUnavailable": false
+        },
+        "R1": {
+          "requests": 5,
+          "excludedTitleRequests": 0,
+          "inputTokens": 4671,
+          "cacheReadTokens": 4480,
+          "cacheWriteTokens": 0,
+          "outputTokens": 1701,
+          "fourComponentTotal": 10852,
+          "twoComponentTotal": 6372,
+          "cacheComponentsUnavailable": false
+        },
+        "R2": {
+          "requests": 8,
+          "excludedTitleRequests": 0,
+          "inputTokens": 3820,
+          "cacheReadTokens": 7296,
+          "cacheWriteTokens": 0,
+          "outputTokens": 2592,
+          "fourComponentTotal": 13708,
+          "twoComponentTotal": 6412,
+          "cacheComponentsUnavailable": false
+        },
+        "R3": {
+          "requests": 2,
+          "excludedTitleRequests": 0,
+          "inputTokens": 8300,
+          "cacheReadTokens": 1664,
+          "cacheWriteTokens": 0,
+          "outputTokens": 207,
+          "fourComponentTotal": 10171,
+          "twoComponentTotal": 8507,
+          "cacheComponentsUnavailable": false
+        },
+        "R4": {
+          "requests": 2,
+          "excludedTitleRequests": 0,
+          "inputTokens": 3031,
+          "cacheReadTokens": 1920,
+          "cacheWriteTokens": 0,
+          "outputTokens": 312,
+          "fourComponentTotal": 5263,
+          "twoComponentTotal": 3343,
+          "cacheComponentsUnavailable": false
+        },
+        "C1": {
+          "requests": 8,
+          "excludedTitleRequests": 0,
+          "inputTokens": 3200,
+          "cacheReadTokens": 7936,
+          "cacheWriteTokens": 0,
+          "outputTokens": 2598,
+          "fourComponentTotal": 13734,
+          "twoComponentTotal": 5798,
+          "cacheComponentsUnavailable": false
+        },
+        "C2": {
+          "requests": 9,
+          "excludedTitleRequests": 0,
+          "inputTokens": 3756,
+          "cacheReadTokens": 9088,
+          "cacheWriteTokens": 0,
+          "outputTokens": 4550,
+          "fourComponentTotal": 17394,
+          "twoComponentTotal": 8306,
+          "cacheComponentsUnavailable": false
+        },
+        "C3": {
+          "requests": 6,
+          "excludedTitleRequests": 0,
+          "inputTokens": 4004,
+          "cacheReadTokens": 6016,
+          "cacheWriteTokens": 0,
+          "outputTokens": 3103,
+          "fourComponentTotal": 13123,
+          "twoComponentTotal": 7107,
+          "cacheComponentsUnavailable": false
+        }
+      },
+      "totals": {
+        "inputTokens": 42782,
+        "cacheReadTokens": 58112,
+        "cacheWriteTokens": 0,
+        "outputTokens": 28284,
+        "fourComponentTotal": 129178
+      },
+      "requests": 59,
+      "checks": {
+        "pass": 33,
+        "total": 36
+      },
+      "twoComponentReference": {
+        "sum": 71066,
+        "note": "非全量口径，只作参考（METRICS.md M1）"
+      }
+    }
+  }
+}

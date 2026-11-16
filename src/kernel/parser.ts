@@ -9,13 +9,25 @@
  *   <tf-write path="src/app.ts" id="w1" depends_on="r1">
  *   文件正文（原文，直到闭合标签）
  *   </tf-write>
+ *   <tf-edit path="src/app.ts" id="e1">
+ *   <<<<<<< OLD
+ *   被替换的原文（精确字面量，必须唯一）
+ *   =======
+ *   >>>>>>> NEW
+ *   替换后的新文
+ *   </tf-edit>
+ *   <tf-append path="notes.md" id="a1" anchor="最后一节"/>
+ *   追加正文（原文，直到闭合标签）
+ *   </tf-append>
+ *   <tf-grep pattern="TODO" path="src" include="*.ts" id="g1"/>
+ *   <tf-glob pattern="src/**" id="gl1"/>
  *   <tf-bash cmd="npm test" id="b1"/>
  *   <tf-peek handle="obs:read:c3@v1" from_line="10" to_line="20" id="p1"/>
  *   <tf-final id="f1" summary="任务完成说明"/>
  *
  * 规则：
- * - 只有 tf-write 有正文；其余命令自闭合（`/>`）或空元素配对（`></...>`）；
- *   非 body 命令带非空正文 → malformed；
+ * - 有正文的命令：tf-write / tf-edit / tf-append / tf-code；其余自闭合（`/>`）
+ *   或空元素配对（`></...>`）；非 body 命令带非空正文 → malformed；
  * - 属性值用双引号，值内可含 `>`（如 shell 重定向）——头部扫描引号感知；
  * - id 可省略（自动编号 cmd1、cmd2...）；depends_on 是逗号分隔的命令 id
  *   列表，可空；重复依赖去重保序；
@@ -35,7 +47,9 @@
 // 协议 schema（显式定义；解析失败产出 malformed，绝不静默丢弃）
 // ---------------------------------------------------------------------------
 
-export type TfCommandName = 'tf-write' | 'tf-read' | 'tf-bash' | 'tf-peek' | 'tf-final' | 'tf-code';
+export type TfCommandName =
+  | 'tf-write' | 'tf-read' | 'tf-edit' | 'tf-append' | 'tf-grep' | 'tf-glob'
+  | 'tf-bash' | 'tf-peek' | 'tf-final' | 'tf-code' | 'tf-plan';
 
 interface CommandSchema {
   required: readonly string[];
@@ -43,21 +57,33 @@ interface CommandSchema {
   hasBody: boolean;
 }
 
-/** id / depends_on 是所有命令的公共属性，不计入各命令 schema */
-const COMMON_ATTRS: readonly string[] = ['id', 'depends_on'];
+/** id / depends_on / accepts 是所有命令的公共属性，不计入各命令 schema。
+ *  accepts（F5）：逗号分隔的验收项 id 列表——命令成功（有回执）时对应验收项记为已验证。 */
+const COMMON_ATTRS: readonly string[] = ['id', 'depends_on', 'accepts'];
 
 const COMMAND_SCHEMAS: Readonly<Record<TfCommandName, CommandSchema>> = {
   'tf-write': { required: ['path'], optional: [], hasBody: true },
   'tf-read': { required: ['path'], optional: ['offset', 'limit'], hasBody: false },
+  // F1：精确替换（body 用 OLD/NEW 标记行分隔两段字面量）与追加（body = 追加正文；
+  // anchor 给出插入锚点字面量，缺省 = 追加到文件末尾）。两者都映射宿主 edit/apply_patch，
+  // 不自建文件 IO。
+  'tf-edit': { required: ['path'], optional: ['replace_all'], hasBody: true },
+  'tf-append': { required: ['path'], optional: ['anchor'], hasBody: true },
+  // F2：搜索只回匹配行/路径（宿主 fs-search 的 grep/glob 映射），不回全文。
+  'tf-grep': { required: ['pattern'], optional: ['path', 'include'], hasBody: false },
+  'tf-glob': { required: ['pattern'], optional: ['path'], hasBody: false },
   'tf-bash': { required: ['cmd'], optional: [], hasBody: false },
   'tf-peek': { required: ['handle'], optional: ['from_line', 'to_line'], hasBody: false },
   'tf-final': { required: [], optional: ['summary'], hasBody: false },
+  // F5：计划与验收——body 按行声明验收项（`- [id] 描述`）；计划状态在驱动器（宿主侧）持有，
+  // 请求只注差分；tf-final 在存在未验证验收项时判定为过早。
+  'tf-plan': { required: [], optional: [], hasBody: true },
   // 程序体 = PTC 的 async TS 函数体（可擦除语法）；description 只进台账，timeout 为毫秒数
   'tf-code': { required: [], optional: ['timeout', 'description'], hasBody: true },
 };
 
 const COMMAND_NAMES: readonly TfCommandName[] =
-  ['tf-write', 'tf-read', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code'];
+  ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan'];
 
 export interface TfCommand {
   name: TfCommandName;
@@ -458,4 +484,38 @@ export async function parseStream(src: AsyncIterable<string>): Promise<ParserEve
   }
   events.push(...parser.end());
   return events;
+}
+
+// ---------------------------------------------------------------------------
+// tf-edit body 的标记切分（F1；纯函数，映射层与测试共用）
+// ---------------------------------------------------------------------------
+
+/** tf-edit body 的三行标记（各占一行；正文里恰好出现该行时按结构化失败处理，不猜测）。 */
+export const TF_EDIT_MARKERS = { old: '<<<<<<< OLD', split: '=======', end: '>>>>>>> NEW' } as const;
+
+export interface EditBodySplit {
+  /** 待替换的精确字面量（宿主 edit 的 old_string）。 */
+  old: string;
+  /** 替换后的字面量（宿主 edit 的 new_string）。 */
+  new: string;
+}
+
+/**
+ * 切分 tf-edit body：`<<<<<<< OLD` 与 `>>>>>>> NEW` 两行之间以 `=======` 行为界，
+ * 前段 = old、后段 = new。标记行必须各出现一次且顺序正确；正文换行结构原样保留。
+ * 解析失败返回 null（调用方必须回结构化失败，不得静默改成全文重写）。
+ */
+export function splitEditBody(body: string): EditBodySplit | null {
+  const lines = body.split('\n');
+  const idxOld = lines.indexOf(TF_EDIT_MARKERS.old);
+  const idxSplit = lines.indexOf(TF_EDIT_MARKERS.split);
+  const idxEnd = lines.indexOf(TF_EDIT_MARKERS.end);
+  if (idxOld === -1 || idxSplit === -1 || idxEnd === -1) return null;
+  if (!(idxOld < idxSplit && idxSplit < idxEnd)) return null;
+  if (lines.indexOf(TF_EDIT_MARKERS.old, idxOld + 1) !== -1) return null;
+  if (lines.indexOf(TF_EDIT_MARKERS.split, idxSplit + 1) !== -1) return null;
+  if (lines.indexOf(TF_EDIT_MARKERS.end, idxEnd + 1) !== -1) return null;
+  const old = lines.slice(idxOld + 1, idxSplit).join('\n');
+  const $new = lines.slice(idxSplit + 1, idxEnd).join('\n');
+  return { old, new: $new };
 }

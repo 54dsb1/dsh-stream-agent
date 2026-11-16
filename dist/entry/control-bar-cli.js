@@ -14,6 +14,7 @@
 // 零依赖：只用 node:process 与内核渲染（kernel/control-bar.ts 是唯一输出源，
 // 保证 CLI 与插件装载横幅的中英文案、宽度、语义完全一致）。
 
+import { readdirSync } from 'node:fs';
 import { MODES, getMode, isModeId } from '../kernel/modes.js';
 import {
   createControlState,
@@ -29,6 +30,8 @@ import {
 import { VERSION } from '../version.js';
 import { controlFileOf, readPersistedControl, writePersistedControl } from './control-state.js';
 import { ControlSession } from './control-session.js';
+import { resolveStateDir } from './json-persistence.js';
+import { appendIntentRecord, intentFileOf, loadIntentRecords, pendingIntents } from './intent-log.js';
 
 const CLEAR = '\x1b[2J\x1b[H';
 
@@ -57,6 +60,7 @@ function usage(lang      )           {
     '  dsh-stream-agent status [--json]            ' + (zh ? '当前模式与语言' : 'current mode and language'),
     '  dsh-stream-agent mode <balanced|lean|compat|power>',
     '  dsh-stream-agent lang <zh|en>',
+    '  dsh-stream-agent intents [--ack <sessionId>] ' + (zh ? 'F6 意图核对：列出"有意图无回执"（--ack 人工确认后闭合）' : 'F6 intent triage: list intents without receipts (--ack to close)'),
     '  dsh-stream-agent help                       ' + (zh ? '全模式指南' : 'full mode guide'),
     '',
     zh ? '状态文件' : 'State file',
@@ -201,6 +205,58 @@ function main(argv                   )         {
       const next               = { ...state, lang: target };
       save(next);
       print([renderStatusBar(next, { version: VERSION, columns: columns() })]);
+      return 0;
+    }
+
+    case 'intents': {
+      // F6 停机核对出口：列出各会话"有意图无回执"（pending）与失败意图（failed）；
+      // --ack <sessionId> 追加 ack 记录闭合全部 pending（人工确认"未发生/放弃"后执行）。
+      const stateRoot = resolveStateDir();
+      const intentsDir = `${stateRoot}/intents`;
+      const ackTarget = rest[1] === '--ack' ? rest[2] : undefined;
+      const zh = state.lang === 'zh';
+      let sessions           = [];
+      try {
+        sessions = readdirSync(intentsDir).filter((f) => f.endsWith('.jsonl')).map((f) => f.replace(/\.jsonl$/, ''));
+      } catch {
+        sessions = [];
+      }
+      if (sessions.length === 0) {
+        print([zh ? '没有意图日志（无写入或 F6 未启用）。' : 'No intent logs (no writes, or F6 disabled).']);
+        return 0;
+      }
+      if (ackTarget !== undefined) {
+        const file = intentFileOf(stateRoot, ackTarget);
+        if (!sessions.includes(ackTarget)) {
+          print([zh ? `未知会话：${ackTarget}` : `Unknown session: ${ackTarget}`]);
+          return 2;
+        }
+        const { records } = loadIntentRecords(file);
+        const open = pendingIntents(records).filter((p) => p.state === 'pending');
+        if (open.length === 0) {
+          print([zh ? `会话 ${ackTarget} 没有待核对的意图。` : `Session ${ackTarget} has no pending intents.`]);
+          return 0;
+        }
+        appendIntentRecord(file, { type: 'ack', seq: records.length + 1, at: new Date().toISOString(), intentSeqs: open.map((p) => p.intent.seq), note: 'cli --ack' });
+        print([zh
+          ? `已确认 ${open.length} 条意图（会话 ${ackTarget}）：下一次 resume 不再停机核对。`
+          : `Acked ${open.length} intent(s) for session ${ackTarget}: next resume will not halt.`]);
+        return 0;
+      }
+      const lines           = [zh ? '写前意图核对（F6）：' : 'Intent triage (F6):'];
+      for (const session of sessions) {
+        const { records, badLines } = loadIntentRecords(intentFileOf(stateRoot, session));
+        const pending = pendingIntents(records).filter((p) => p.state === 'pending');
+        const failed = pendingIntents(records).filter((p) => p.state === 'failed');
+        lines.push(`  ${session}: ${zh ? '待核对' : 'pending'} ${pending.length} · ${zh ? '失败已闭合' : 'failed(closed)'} ${failed.length}${badLines > 0 ? ` · ${zh ? '坏行' : 'bad lines'} ${badLines}` : ''}`);
+        for (const p of pending) {
+          lines.push(`    - [seq ${p.intent.seq}] ${p.intent.op} ${p.intent.path} (cmd=${p.intent.cmdId} fp=${p.intent.fingerprint} at=${p.intent.at})`);
+        }
+      }
+      lines.push('', zh
+        ? '待核对 = 写入可能已发生（进程在写入中被杀）。人工核对文件后：dsh-stream-agent intents --ack <sessionId> 闭合；'
+        : 'Pending = the write MAY have happened (process killed mid-write). Verify files, then run: dsh-stream-agent intents --ack <sessionId>');
+      print(lines);
       return 0;
     }
 

@@ -1,6 +1,11 @@
 {
-  "root": "6791b374adf9017481c26db57f1d64fd49b0ac8154c77e0162512d53ddd7f606",
+  "root": "9b97b5b59160e7dfd7d619a986789285d2a21386c303edc26f89d76b317c595f",
   "files": [
+    {
+      "rel": "out/result.json",
+      "size": 52,
+      "sha256": "0d8b2531b699fd0f5b86c9dae448245516f3fea30ea1bfdfbdb2625c07f65ceb"
+    },
     {
       "rel": "pipeline.yaml",
       "size": 98,

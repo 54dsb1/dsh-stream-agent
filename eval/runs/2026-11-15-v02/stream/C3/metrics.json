@@ -176,12 +176,12 @@
     "copiedBytes": 28276
   },
   "replay": {
-    "opsReplayed": 0,
+    "opsReplayed": 5,
     "skipped": [],
     "errors": [],
-    "replRoot": "ec89a9f8dc2673c1ff4d07c88e04828a1a84d6f02907b1b7a8416a3f79c568ac",
+    "replRoot": "e898df893568187c2984049ecc73c72db983900b1bd75892fefd80e97f02dcd4",
     "wsRoot": "e898df893568187c2984049ecc73c72db983900b1bd75892fefd80e97f02dcd4",
-    "pass": false,
-    "note": "提取零写入操作：回放不可得（如实标注，不假装通过）"
+    "pass": true,
+    "note": "重放树哈希 == 实跑树哈希"
   }
 }

@@ -71,3 +71,7 @@
         maxParallelToolCalls: 3
         maxReentries: 8
         streamIdleTimeoutMs: 30000
+        # K1（0.3.0）：tf-code 默认关闭——协议段 0 字符，模型不会幻觉调用。
+        # 显式开启走 power 模式，或把本行改为 true（前提：宿主挂载 @deepseek-ai/dsh-ptc-runtime，
+        # 且 K2-K6 五项已验收，见 docs/protocol.md 的开启说明）。
+        enableCode: false

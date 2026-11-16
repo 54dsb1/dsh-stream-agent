@@ -1,0 +1,16 @@
+{
+  "name": "dsh-profile-stream-headless",
+  "private": true,
+  "description": "S1 专用 profile 模板（headless 入口变体）：dsh-base → 本插件主 bundle → headless 入口。headless 不引入 preset（宿主无 registry；工具面由 profile 决定）。",
+  "dependencies": {
+    "@hugesb/dsh-stream-agent": "link:../.."
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-headless"
+      ]
+    }
+  }
+}

@@ -1,0 +1,12 @@
+# stream profile 的 patch 层（S1）——只承载"覆盖声明"，不接管 loop。
+#
+# 红线（C4）：本文件不得出现 agent-loop 的停用行——停用必须留在主 bundle 的
+# cordis.patch.yml（plugin remove 整层消失，卸载原子）。这里唯一要做的覆盖是
+# 把 preset registry 的默认 preset 指向 stream（S4）。
+#
+# 本层在全部 bundle 层之后应用（宿主 profile 语义），因此下面的 config 覆盖
+# 能命中 dsh-web-app 插入的 agent-preset-registry 行。
+
+- id: agent-preset-registry
+  config:
+    default: stream

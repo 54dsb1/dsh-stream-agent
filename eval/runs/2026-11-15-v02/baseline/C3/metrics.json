@@ -201,6 +201,6 @@
     "replRoot": "ec89a9f8dc2673c1ff4d07c88e04828a1a84d6f02907b1b7a8416a3f79c568ac",
     "wsRoot": "2338a49d20cc41db18967ec86c3b7714ad527eaaa6edc98d56a619957a7777c7",
     "pass": false,
-    "note": "提取零写入操作：回放不可得（如实标注，不假装通过）"
+    "note": "零写入但树哈希不一致：存在未回放的写入差异"
   }
 }

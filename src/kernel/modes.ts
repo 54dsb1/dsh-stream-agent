@@ -47,7 +47,8 @@ export const AVAILABILITY_TEXT: Record<ModeAvailability, { zh: string; en: strin
 export interface ModeConfigPatch {
   /** O7 自写回验：'receipt' = 读自己刚写过的文件只回回执；'full' = v0.1 全文回灌 */
   selfReadFeedback: 'receipt' | 'full';
-  /** tf-code（PTC 桥接）：'auto' = 宿主有 ctx.ptcRuntime 就启用；false 强制关闭；true 强制声明 */
+  /** tf-code（PTC 桥接）。K1（0.3.0）：默认关闭；'auto' 是 v0.2.0 的遗留值（等价 false，
+   *  不再由任何模式产出）；true = 显式开启（power 模式或装配显式配置）。 */
   enableCode: 'auto' | boolean;
   /** 宿主缺 storage/sessionPersistence 时的本地文件兜底 */
   persistFallback: boolean;
@@ -93,18 +94,18 @@ export const MODES: readonly ModeSpec[] = [
       en: 'First run, everyday read/write and lookup tasks, or when unsure: start here.',
     },
     tradeoff: {
-      zh: '写批任务仍会出现"读自己刚写的文件只回回执"，需要全文时用 tf-peek 按行段取。',
-      en: 'Write-batch tasks get a receipt instead of full echo when re-reading your own file; use tf-peek for line ranges.',
+      zh: '写批任务仍会出现"读自己刚写的文件只回回执"，需要全文时用 tf-peek 按行段取；tf-code 默认关闭（K1）。',
+      en: 'Write-batch tasks get a receipt instead of full echo when re-reading your own file; use tf-peek for line ranges. tf-code stays off by default (K1).',
     },
     saving: 'baseline',
     availability: 'default',
     note: {
-      zh: '不动任何配置就是它。相对原生 loop 实测约 29% token（v0.1.0 十任务两臂），本版参数与之一致。',
-      en: 'This is what you get without touching any config. Measured at ~29% of the native loop tokens (v0.1.0, 10 tasks, two arms); this version keeps those defaults.',
+      zh: '不动任何配置就是它。相对原生 loop 实测约 29% token（v0.1.0 十任务两臂）。0.3.0 起 tf-code 默认关闭（协议不声明，K1）；需要程序化加工选 power 模式或显式 enableCode: true。',
+      en: 'This is what you get without touching any config. Measured at ~29% of the native loop tokens (v0.1.0, 10 tasks, two arms). Since 0.3.0 tf-code is off by default (K1); pick power mode or set enableCode: true explicitly for programmatic data work.',
     },
     config: {
       selfReadFeedback: 'receipt',
-      enableCode: 'auto',
+      enableCode: false,
       persistFallback: true,
       maxParallelToolCalls: 3,
       maxReentries: 8,
@@ -190,8 +191,8 @@ export const MODES: readonly ModeSpec[] = [
     saving: 'most',
     availability: 'needs-ptc',
     note: {
-      zh: '数据加工类任务省最多（结果句柄化，中间结果不进上下文）；普通读写任务反而略高于默认。宿主无 PTC 时自动回落为默认参数。未单独实测。',
-      en: 'Saves most on data-processing tasks (results are handle-ized, intermediates never enter context); on plain read/write tasks it costs slightly more than the default. Falls back to default parameters without a host PTC runtime. Not separately benchmarked.',
+      zh: '数据加工类任务省最多（结果句柄化，上限内首成功值完整注入，中间结果不进上下文）；普通读写任务反而略高于默认。宿主无 PTC 时自动回落为默认参数。这是唯一显式开 tf-code 的模式（K1 默认关闭）。未单独实测。',
+      en: 'Saves most on data-processing tasks (results are handle-ized, first successful values within the cap are injected in full, intermediates never enter context); on plain read/write tasks it costs slightly more than the default. Falls back to default parameters without a host PTC runtime. The only mode that turns tf-code on explicitly (K1 default is off). Not separately benchmarked.',
     },
     config: {
       selfReadFeedback: 'receipt',

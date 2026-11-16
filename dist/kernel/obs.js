@@ -72,14 +72,14 @@ const LOW_RECEIPT_FAMILIES                          = new Set([
 export function classifyTool(tool        )             {
   const t = tool.toLowerCase();
   if (t === 'tf-read' || t === 'read' || t === 'read_file' || t === 'cat') return 'read';
-  if (t === 'tf-write' || t === 'write' || t === 'write_file' || t === 'edit') return 'write';
+  if (t === 'tf-write' || t === 'write' || t === 'write_file' || t === 'edit' || t === 'tf-edit' || t === 'apply_patch') return 'write';
   if (t === 'tf-peek' || t === 'peek') return 'read';
   if (t === 'tf-bash' || t === 'bash' || t === 'shell') return 'bash';
   if (t === 'tf-code' || t === 'run_code') return 'code';
-  if (t === 'append') return 'append';
+  if (t === 'tf-append' || t === 'append') return 'append';
   if (t === 'mkdir') return 'mkdir';
-  if (t === 'grep' || t === 'search' || t === 'grep_search') return 'grep';
-  if (t === 'glob' || t === 'list' || t === 'ls') return 'glob';
+  if (t === 'tf-grep' || t === 'grep' || t === 'search' || t === 'grep_search') return 'grep';
+  if (t === 'tf-glob' || t === 'glob' || t === 'list' || t === 'ls') return 'glob';
   if (t.startsWith('web') || t === 'fetch' || t === 'http') return 'web';
   if (t === 'test' || t === 'run_tests') return 'test';
   if (t === 'build' || t === 'compile') return 'build';

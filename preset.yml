@@ -47,8 +47,10 @@
       inject: []
     - id: stream-agent
       name: ./dist/entry/loop.js
-      inject: [llm, tools, agents, sessions]
+      inject: [llm, tools, agents, sessions, sessionProjections]
       config:
         maxParallelToolCalls: 3
         maxReentries: 8
         streamIdleTimeoutMs: 30000
+        # K1（0.3.0）：tf-code 默认关闭；显式开启见 docs/protocol.md（前提 K2–K6）。
+        enableCode: false

@@ -1,0 +1,17 @@
+{
+  "name": "dsh-profile-stream",
+  "private": true,
+  "description": "S1 专用 profile 模板（A-1 独立模式）：dsh-base → 本插件主 bundle → preset-stream bundle → web 入口。安装/卸载/回退见同目录 README.md。",
+  "dependencies": {
+    "@hugesb/dsh-stream-agent": "link:../..",
+    "@hugesb/dsh-stream-agent-preset-stream": "link:../../preset/stream"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app"
+      ]
+    }
+  }
+}
