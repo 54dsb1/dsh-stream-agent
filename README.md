@@ -25,7 +25,7 @@ R3 重跑后以同批双臂复算为准。
 | 控制栏 | `dsh-stream-agent bar`：四模式 + 中英切换 + 意图核对，装载时自动打印上手引导                                                                                       |
 | 桌面页 | 客户端左侧栏「控制栏 / Control bar」：状态 + 四模式 + 中英切换，**不改 Electron 壳**                                                                               |
 | 计量  | 四分量脚本出数 + 回放一致性对照臂 10/10 + 发布门禁 6 项                                                                                                             |
-| 发布  | npm [`@hugesb/dsh-stream-agent`](https://www.npmjs.com/package/@hugesb/dsh-stream-agent) · GitHub [Releases](https://github.com/54dsb1/dsh-stream-agent/releases)   |
+| 发布  | GitHub [Releases](https://github.com/54dsb1/dsh-stream-agent/releases) · npm `@hugesb/dsh-stream-agent` **尚未发布**（当前唯一安装路径见 §2）                                                      |
 
 > **0.3.0 安装方式变更（重要）**：独立模式下本插件**只允许装进专用 profile**
 > （`profiles/stream` / `profiles/stream-headless`）。0.2.x 的"plugin add 进既有

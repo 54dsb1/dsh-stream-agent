@@ -19,6 +19,11 @@ function arg(name) {
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : undefined;
 }
 
+// --offline：只跑与发布状态无关的离线装配不变量（G1–G3），供 CI 使用。
+// G4 断言"HEAD 精确 tagged"，只在发布提交上成立，日常提交必然为假——由发布流程自己守；
+// G5/G6 需真机数据，离线模式既不判定也不改写记录文件。
+const offlineOnly = process.argv.includes('--offline');
+
 const pkg = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf8'));
 const stamp = arg('stamp') ?? '2026-11-15';
 const runDir = join(pkgRoot, 'eval', 'runs', stamp);
@@ -64,7 +69,9 @@ function gate(id, name, pass, evidence) {
 }
 
 // ---- G4 C9 版本可追溯：tag = package ----
-{
+if (offlineOnly) {
+  console.log('[SKIP] G4 C9 tag = package — --offline 模式不判定（只在发布提交上成立）');
+} else {
   let tag = '';
   try {
     tag = execSync(`git describe --tags --exact-match 2>nul`, { cwd: pkgRoot, encoding: 'utf8', shell: true }).trim();
@@ -76,7 +83,9 @@ function gate(id, name, pass, evidence) {
 }
 
 // ---- G5 C1 token 门槛：T1 ≤22.3%、逐任务 ≤+2%、请求数 ≤59、checks ≥9/10 ----
-{
+if (offlineOnly) {
+  console.log('[SKIP] G5 C1 token 门槛 — --offline 模式不判定（需真机评测数据）');
+} else {
   const resultsPath = join(pkgRoot, 'eval', 'RESULTS.md');
   const results = existsSync(resultsPath) ? readFileSync(resultsPath, 'utf8') : '';
   const hasCurrentRun = existsSync(join(runDir, 'stream')) && existsSync(join(runDir, 'baseline'));
@@ -89,7 +98,9 @@ function gate(id, name, pass, evidence) {
 }
 
 // ---- G6 回退演练记录 ----
-{
+if (offlineOnly) {
+  console.log('[SKIP] G6 回退演练 — --offline 模式不判定（需真机演练记录）');
+} else {
   const drill = join(pkgRoot, 'eval', 'GATE-0.3.0.md');
   // 必须是"已勾选"的复选框（防止模板文案本身造成假阳性）
   const recorded = existsSync(drill) && /- \[x\] 回退演练：已执行/.test(readFileSync(drill, 'utf8'));
@@ -99,6 +110,10 @@ function gate(id, name, pass, evidence) {
 
 const failed = gates.filter((g) => !g.pass);
 console.log('');
+if (offlineOnly) {
+  console.log(`[gate] 离线装配不变项 ${gates.length - failed.length}/${gates.length} 通过（G4/G5/G6 未判定；CI 只守离线不变量）`);
+  process.exit(failed.length > 0 ? 1 : 0);
+}
 console.log(`[gate] ${gates.length - failed.length}/${gates.length} 项通过${failed.length > 0 ? `；未过：${failed.map((g) => g.id).join('、')}` : ''}`);
 console.log('[gate] 纪律：G5/G6 需真机数据，未过前不得发布（不允许先发后补）。');
 
@@ -113,7 +128,7 @@ const report = [
   '## 真机复测清单（发布前必须回填）',
   '',
   '- [ ] R3 评测矩阵：10 任务 + 哨兵两臂重跑（`eval/tools/runner.cjs --stamp <新>`），数字可复算',
-  '- [ ] 回退演练：已执行（scripts/install-cycle.mjs 10 轮 + 回退 0.2.x 产物验证宿主恢复）',
+  '- [ ] 回退演练：未执行（待真机：scripts/install-cycle.mjs 10 轮 + 回退 0.2.x 产物验证宿主恢复）',
   '- [ ] M2 T3 三格：B / A-1a / A-1b 同批首请求对照（eval/tools/t3-cells.cjs）',
   '- [ ] K6 真机五场景：成功/失败/取消/拒绝/partial（eval/tools/manual-code-scenarios.md）',
   '',

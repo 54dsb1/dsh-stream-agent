@@ -12,6 +12,6 @@
 ## 真机复测清单（发布前必须回填）
 
 - [ ] R3 评测矩阵：10 任务 + 哨兵两臂重跑（`eval/tools/runner.cjs --stamp <新>`），数字可复算
-- [ ] 回退演练：已执行（scripts/install-cycle.mjs 10 轮 + 回退 0.2.x 产物验证宿主恢复）
+- [ ] 回退演练：未执行（待真机：scripts/install-cycle.mjs 10 轮 + 回退 0.2.x 产物验证宿主恢复）
 - [ ] M2 T3 三格：B / A-1a / A-1b 同批首请求对照（eval/tools/t3-cells.cjs）
 - [ ] K6 真机五场景：成功/失败/取消/拒绝/partial（eval/tools/manual-code-scenarios.md）

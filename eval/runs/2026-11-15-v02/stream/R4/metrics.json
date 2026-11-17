@@ -14,7 +14,7 @@
     "probe": 2,
     "probeRaw": 2,
     "titleExcluded": 0,
-    "note": "v1.1�����ھ�=probe ������main(session log request/header) �����߱ۿɵã�������"
+    "note": "v1.1 主口径=probe 计数；main(session log request/header) 仅基线臂可得（对账）"
   },
   "M1_tokens": {
     "input": 4951,
@@ -45,13 +45,13 @@
         }
       }
     ],
-    "sourceNote": "E3 �ھ���input=uncached+cacheRead+cacheWrite��usage ԭ����������"
+    "sourceNote": "E3 口径：input=uncached+cacheRead+cacheWrite；usage 原文逐条留存"
   },
   "M3_injectedRatio": {
     "injected": 4,
     "produced": 2,
     "injectedRatio": 2,
-    "source": "driver snapshot��Ȩ����"
+    "source": "driver snapshot（权威口径）"
   },
   "M4_prefix": {
     "sequence": [
@@ -68,8 +68,8 @@
         "identicalToPrev": false
       }
     ],
-    "monotonicNote": "������ fullHash Ӧ������ͬ��׷��ʽ��ʷ����commonPrefixBytesWithPrev ��ӳǰ׺����Ǳ��",
-    "cachedFieldsEvidence": "probe usage ԭ�ĺ� cache �ֶ�"
+    "monotonicNote": "两臂 fullHash 应各自恒定（同追加式历史）；commonPrefixBytesWithPrev 反映前缀单调性",
+    "cachedFieldsEvidence": "probe usage 原文含 cache 字段"
   },
   "modelConfig": [],
   "checks": [

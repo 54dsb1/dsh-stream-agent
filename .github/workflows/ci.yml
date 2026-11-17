@@ -22,6 +22,15 @@ jobs:
       - name: Build
         run: npm run build
 
+      # 装配一致性（R2 四项）：entry 集 / inject / 装载顺序 / README 命令表与数字
+      - name: 装配一致性
+        run: npm run check
+
+      # 门禁的离线项（G1–G3）：装配、单 loop 权威、卸载原子。
+      # G4（tag=package）只在发布提交成立、G5/G6 需真机数据，故由发布流程与真机复测守，CI 不判。
+      - name: 发布门禁（离线项）
+        run: npm run gate -- --offline
+
       # 关键不变量：dist/ 是提交进仓库的发布产物，patch 直接引用 ./dist/entry/*.js。
       # 源码改动后忘记重建 dist 会让安装到的版本静默落后于源码，这里直接拦下。
       - name: dist 与 src 同步

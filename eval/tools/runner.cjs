@@ -175,21 +175,21 @@ function runTask(task, arm, runDir, apiKey, timeoutSec) {
     task: task.id, arm, type: task.type,
     started, finished, exitCode: res.status, timedOut: timedOut === true, signal: res.signal || null,
     stdoutTail: (res.stdout || '').slice(-800), stderrTail: (res.stderr || '').slice(-1500),
-    M2_callCount: { main: sessionFacts.requestHeaderCount, probe: probeRequests.length, probeRaw: probeRequestsRaw.length, titleExcluded, note: 'v1.1�����ھ�=probe ������main(session log request/header) �����߱ۿɵã�������' },
-    M1_tokens: { ...tokens, unitTaskToken: tokens.input + tokens.output, cachedFieldsSeen, usageOriginal, sourceNote: 'E3 �ھ���input=uncached+cacheRead+cacheWrite��usage ԭ����������' },
+    M2_callCount: { main: sessionFacts.requestHeaderCount, probe: probeRequests.length, probeRaw: probeRequestsRaw.length, titleExcluded, note: 'v1.1 主口径=probe 计数；main(session log request/header) 仅基线臂可得（对账）' },
+    M1_tokens: { ...tokens, unitTaskToken: tokens.input + tokens.output, cachedFieldsSeen, usageOriginal, sourceNote: 'E3 口径：input=uncached+cacheRead+cacheWrite；usage 原文逐条留存' },
     M3_injectedRatio: driverDump
-      ? { injected: driverDump.counters.injected, produced: driverDump.counters.produced, injectedRatio: driverDump.counters.injectedRatio, source: 'driver snapshot��Ȩ����' }
-      : (arm === 'baseline' ? { note: 'n/a�����߱���ע����' } : { note: 'driver dump ȱʧ' }),
+      ? { injected: driverDump.counters.injected, produced: driverDump.counters.produced, injectedRatio: driverDump.counters.injectedRatio, source: 'driver snapshot（权威口径）' }
+      : (arm === 'baseline' ? { note: 'n/a（基线臂无该口径）' } : { note: 'driver dump 缺失' }),
     M4_prefix: {
       sequence: prefixSequence(probeRequests),
-      monotonicNote: '������ fullHash Ӧ������ͬ��׷��ʽ��ʷ����commonPrefixBytesWithPrev ��ӳǰ׺����Ǳ��',
-      cachedFieldsEvidence: cachedFieldsSeen ? 'probe usage ԭ�ĺ� cache �ֶ�' : 'provider usage δ�� cache �ֶΣ���ʵ��ע���� usageOriginal��',
+      monotonicNote: '两臂 fullHash 应各自恒定（同追加式历史）；commonPrefixBytesWithPrev 反映前缀单调性',
+      cachedFieldsEvidence: cachedFieldsSeen ? 'probe usage 原文含 cache 字段' : 'provider usage 未见 cache 字段（如实记录于 usageOriginal）',
     },
     modelConfig: sessionFacts.providers || [],
     checks, checksPass: checks.every((c) => c.pass),
     sessionArchived: archived,
     sessionFactsNote: sessionFacts.error ? sessionFacts.error : undefined,
-    replay: { pending: true, note: '�� replay-check.cjs ����' },
+    replay: { pending: true, note: '由 replay-check.cjs 生成' },
   };
   fs.writeFileSync(path.join(taskDir, 'metrics.json'), JSON.stringify(metrics, null, 2), 'utf8');
   console.log(`[${arm}/${task.id}] exit=${res.status} calls=${metrics.M2_callCount.probe}(recon:${metrics.M2_callCount.main}) tokens=${metrics.M1_tokens.unitTaskToken} checks=${metrics.checksPass ? 'PASS' : 'FAIL'} archived=${archived.archived}`);

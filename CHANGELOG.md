@@ -2,6 +2,41 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+**第三方评审反馈（2026-11-17）的修复合集。** 不改变运行时行为：只修评测产物编码、报告可读性、
+门禁自洽性与 CI 覆盖面。版本号仍为 0.3.0（`v0.3.0` tag 之后的提交，未重打 tag）。
+
+### Fixed
+
+- **评测产物 GBK 乱码**：`eval/tools/runner.cjs` 有 7 处输出文案、`eval/RESULTS.md` 有 10 行
+  「cached 字段」取证行是早期 GBK 编码残留的替换字符（U+FFFD），grep 不到、无法检索。
+  已还原为中文；并把 46 个 `metrics.json` 与 5 个 `summary.json` 里的同类 `note` 字段一并迁移
+  （**只改文案，数字与口径未动**）。`runner.cjs` 的**代码注释**仍有历史乱码（不可逆，不影响执行），
+  后续重写该文件时清理。
+- **`gen-results.cjs` 覆盖证据文档**：它默认写 `eval/RESULTS.md`，而 §6（0.3.0 复算）是人工追加段，
+  重跑新批次会整段丢失。新增 `--out <路径>`，并对「目标含 §6」直接拒写（需 `--force` 才覆盖）。
+- **RESULTS.md 两处误读点**：`replay` 列改为 `metrics.json` 回填后的复算值（对照臂 10/10 PASS），
+  并加注记说明与历史 FAIL 快照的区别；`stream/W1`、`stream/C2` 的 `exit=1` 行链到
+  [docs/limitations.md](docs/limitations.md) 第 2 条（重入预算护栏耗尽，产物 checks 判 PASS，不是任务失败）。
+- **`eval/GATE-0.3.0.md` 自相矛盾**：模板写「回退演练：已执行」但复选框是 `[ ]`，等于假记录。
+  改为「未执行（待真机）」，与 G6 判定一致。
+- **§6.1 的 `summary.json` 没写路径**：补成 `eval/runs/2026-11-15-v02/summary.json`（该文件本已入库）。
+
+### Added
+
+- **`eval/tools/machine-test.cjs`**：单项目实机对照——默认配置下「插件关 / 插件开」两臂各跑 1 次，
+  自动 `summarize` + `gen-results --out`（不碰 `eval/RESULTS.md`），产出
+  `eval/runs/<stamp>/machine-test-report.md`。支持 `--plan`（不读 key）/ `--report-only` / `--runs`；
+  key 只进子进程环境变量，日志只印后 4 位。
+- **`eval/machine-test-2026-11-17.md`**：本轮实机测试手册（两臂定义、命令、判读顺序、红线、故障排查）。
+
+### Changed
+
+- **CI 覆盖面**：`.github/workflows/ci.yml` 新增 `npm run check` 与 `npm run gate -- --offline`；
+  `gate.mjs` 增加 `--offline`（只判 G1–G3：装配一致性 / 单 loop 权威 / 卸载原子）。
+  G4（tag=package）只在发布提交上成立、G5/G6 需真机数据，故不进 CI，仍由发布流程与真机复测守。
+
 ## [0.3.0] - 2026-11-17
 
 **独立模式 + 全量升级条目。** 交付形态固定为 A-1（专用 profile）；按

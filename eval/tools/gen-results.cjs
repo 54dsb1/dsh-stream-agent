@@ -43,6 +43,8 @@ function probeModel(runDir, arm, id) {
 
 function main() {
   const stamp = arg('stamp');
+  // --out：写到别处（默认 eval/RESULTS.md）。重跑新 stamp 时用它，避免覆盖既有证据文档。
+  const outPath = arg('out') ? path.resolve(arg('out')) : path.join(PKG_ROOT, 'eval', 'RESULTS.md');
   if (!stamp) { console.error('--stamp 必填'); process.exit(2); }
   const runDir = path.join(PKG_ROOT, 'eval', 'runs', stamp);
   const tasks = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'eval', 'tasks', 'tasks.json'), 'utf8')).tasks;
@@ -96,6 +98,8 @@ function main() {
     L.push(`| ${t.id} | ${t.type} / ${t.title} | ${fmt(b)} | ${fmt(s)} | ${irrStr} | ${ratio} | ${b && s ? `${b.checksPass ? '基线✓' : '基线✗'} ${s.checksPass ? '对照✓' : '对照✗'}` : '—'} | ${replayStr} | ${modelMismatch ? '**model 不一致，作废重跑**' : ''} |`);
   }
   L.push('');
+  L.push('> 注：`replay` 列取自对照臂 `metrics.json`，是**提取器修复后**由 `replay-check.cjs` 回填的复算结果（10/10 PASS）；历史快照里该列曾是修复前的 FAIL，勿与当前值混读。基线臂 4/10 与取证面限制见 §6.2。');
+  L.push('');
 
   // ---- 加权判定 ----
   L.push('## 2. 核心命题判定（METRICS.md §2）');
@@ -115,7 +119,10 @@ function main() {
   for (const [armName, rows] of [['baseline', baseline], ['stream', stream]]) {
     for (const r of rows) {
       if (!r.missing && (r.timedOut || (r.exitCode !== 0 && r.exitCode !== null))) {
-        L.push(`- ${armName}/${r.task}: exit=${r.exitCode} timedOut=${r.timedOut}`);
+        const hint = r.exitCode === 1 && !r.timedOut
+          ? ' —— 重入预算护栏耗尽，产物 checks 判 PASS，不是任务失败，见 [docs/limitations.md](../docs/limitations.md) 第 2 条'
+          : '';
+        L.push(`- ${armName}/${r.task}: exit=${r.exitCode} timedOut=${r.timedOut}${hint}`);
         failureListed = true;
       }
     }
@@ -168,8 +175,17 @@ function main() {
   L.push('- 原始证据链：tasks.json（任务文本写死）→ fixtures（逐字节固定）→ probe/session log（原样存档）→ metrics.json（初算）→ 本文件。');
   L.push('');
 
-  fs.writeFileSync(path.join(PKG_ROOT, 'eval', 'RESULTS.md'), L.join('\n'), 'utf8');
-  console.log('RESULTS.md ->', path.join(PKG_ROOT, 'eval', 'RESULTS.md'));
+  // 守卫：默认目标里已有人工追加的 §6（0.3.0 复算）时拒绝直接覆盖，避免重跑新批次时抹掉证据章节。
+  if (!arg('out') && !process.argv.includes('--force') && fs.existsSync(outPath)) {
+    const prev = fs.readFileSync(outPath, 'utf8');
+    if (/\n## 6\./.test(prev)) {
+      console.error('[gen-results] 目标 eval/RESULTS.md 含人工追加的 §6，拒绝覆盖（防止丢证据）。');
+      console.error('             换路径：--out eval/runs/<stamp>/RESULTS.md；确需覆盖加 --force。');
+      process.exit(3);
+    }
+  }
+  fs.writeFileSync(outPath, L.join('\n'), 'utf8');
+  console.log('RESULTS.md ->', outPath);
 }
 
 if (require.main === module) main();

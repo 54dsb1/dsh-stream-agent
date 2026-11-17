@@ -14,16 +14,18 @@
 
 | 任务 | 类型 / 说明 | 基线: 调用/输入/输出 | 对照: 调用/输入/输出 | 对照 injected_ratio | 对照 token/基线 token | checks | replay | 备注 |
 |---|---|---|---|---|---|---|---|---|
-| W1 | write-batch / 写 3 个文件 | 5 / 38572 / 1900 (对账1) | 9 / 16032 / 6239 | 0.840 | 55% | 基线✓ 对照✓ | FAIL |  |
-| W2 | write-batch / 写 5 个章节文件 + index | 5 / 43973 / 5633 (对账1) | 7 / 11657 / 5926 | 0.579 | 35% | 基线✗ 对照✓ | FAIL |  |
-| W3 | write-batch / 写 8 个模块文件 + 汇总 | 9 / 96675 / 5051 (对账1) | 3 / 4023 / 1056 | 0.538 | 5% | 基线✓ 对照✓ | FAIL |  |
-| R1 | read-peek / 读大文件答指定行细节 | 4 / 29644 / 1112 (对账1) | 5 / 9151 / 1701 | 2.000 | 35% | 基线✓ 对照✓ | FAIL |  |
-| R2 | read-edit / 跨文件改配置 | 5 / 37540 / 965 (对账1) | 8 / 11116 / 2592 | 1.667 | 36% | 基线✓ 对照✗ | FAIL |  |
-| R3 | read-peek / 日志找错 | 2 / 18290 / 136 (对账1) | 2 / 9964 / 207 | 3.000 | 55% | 基线✓ 对照✓ | FAIL |  |
-| R4 | read-join / 双 JSON 求共同记录 | 2 / 16184 / 252 (对账1) | 2 / 4951 / 312 | 2.000 | 32% | 基线✓ 对照✓ | FAIL |  |
-| C1 | composite / 读→算→写→汇报 | 6 / 46289 / 1099 (对账1) | 8 / 11136 / 2598 | 2.000 | 29% | 基线✓ 对照✓ | FAIL |  |
-| C2 | composite / 失败改道 | 5 / 41225 / 1296 (对账1) | 9 / 12844 / 4550 | 1.389 | 41% | 基线✓ 对照✓ | FAIL |  |
-| C3 | composite / 按清单批量产出 | 7 / 58364 / 2210 (对账1) | 6 / 10020 / 3103 | 1.158 | 22% | 基线✓ 对照✓ | FAIL |  |
+| W1 | write-batch / 写 3 个文件 | 5 / 38572 / 1900 (对账1) | 9 / 16032 / 6239 | 0.840 | 55% | 基线✓ 对照✓ | PASS |  |
+| W2 | write-batch / 写 5 个章节文件 + index | 5 / 43973 / 5633 (对账1) | 7 / 11657 / 5926 | 0.579 | 35% | 基线✗ 对照✓ | PASS |  |
+| W3 | write-batch / 写 8 个模块文件 + 汇总 | 9 / 96675 / 5051 (对账1) | 3 / 4023 / 1056 | 0.538 | 5% | 基线✓ 对照✓ | PASS |  |
+| R1 | read-peek / 读大文件答指定行细节 | 4 / 29644 / 1112 (对账1) | 5 / 9151 / 1701 | 2.000 | 35% | 基线✓ 对照✓ | PASS |  |
+| R2 | read-edit / 跨文件改配置 | 5 / 37540 / 965 (对账1) | 8 / 11116 / 2592 | 1.667 | 36% | 基线✓ 对照✗ | PASS |  |
+| R3 | read-peek / 日志找错 | 2 / 18290 / 136 (对账1) | 2 / 9964 / 207 | 3.000 | 55% | 基线✓ 对照✓ | PASS |  |
+| R4 | read-join / 双 JSON 求共同记录 | 2 / 16184 / 252 (对账1) | 2 / 4951 / 312 | 2.000 | 32% | 基线✓ 对照✓ | PASS |  |
+| C1 | composite / 读→算→写→汇报 | 6 / 46289 / 1099 (对账1) | 8 / 11136 / 2598 | 2.000 | 29% | 基线✓ 对照✓ | PASS |  |
+| C2 | composite / 失败改道 | 5 / 41225 / 1296 (对账1) | 9 / 12844 / 4550 | 1.389 | 41% | 基线✓ 对照✓ | PASS |  |
+| C3 | composite / 按清单批量产出 | 7 / 58364 / 2210 (对账1) | 6 / 10020 / 3103 | 1.158 | 22% | 基线✓ 对照✓ | PASS |  |
+
+> 注：`replay` 列取自对照臂 `metrics.json`，是**提取器修复后**由 `replay-check.cjs` 回填的复算结果（10/10 PASS）。本表此前版本里该列是修复前的 FAIL 快照，两者不要混读；基线臂 4/10 与取证面限制见 §6.2。
 
 ## 2. 核心命题判定（METRICS.md §2）
 
@@ -33,8 +35,8 @@
 - 判定：**通过（≤55%）**
 
 失败/超时任务清单（计入分母，如实上报）：
-- stream/W1: exit=1 timedOut=false
-- stream/C2: exit=1 timedOut=false
+- stream/W1: exit=1 timedOut=false —— 重入预算护栏耗尽，产物 checks 判 PASS，不是任务失败，见 [docs/limitations.md](../docs/limitations.md) 第 2 条
+- stream/C2: exit=1 timedOut=false —— 同上（重入预算耗尽，产物正确），见 [docs/limitations.md](../docs/limitations.md) 第 2 条
 
 ## 3. prefix_hash 序列与 cached 字段取证（对照臂；基线臂同款数据见各自 metrics.json）
 
@@ -52,7 +54,7 @@
 | 8 | f425979dbc657c99 | 3176 | 否 |
 | 9 | e7895b80b2817ba8 | 3312 | 否 |
 
-- cached 字段：probe usage ԭ�ĺ� cache �ֶ�
+- cached 字段：probe usage 原文含 cache 字段
 - usage 原文（前 3 条，全量见 metrics.json）：`{"inputTokens":135,"outputTokens":491,"cacheReadTokens":896,"cacheWriteTokens":0,"totalTokens":1522}`；`{"inputTokens":1008,"outputTokens":507,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":2539}`；`{"inputTokens":639,"outputTokens":532,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":2195}`
 - injected_ratio：0.840 (injected=42/produced=50，驱动器 snapshot 权威口径)
 
@@ -68,7 +70,7 @@
 | 6 | 46a06121ff035226 | 2924 | 否 |
 | 7 | d1dfdb10045ea16f | 3115 | 否 |
 
-- cached 字段：probe usage ԭ�ĺ� cache �ֶ�
+- cached 字段：probe usage 原文含 cache 字段
 - usage 原文（前 3 条，全量见 metrics.json）：`{"inputTokens":261,"outputTokens":1004,"cacheReadTokens":768,"cacheWriteTokens":0,"totalTokens":2033}`；`{"inputTokens":308,"outputTokens":510,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":1842}`；`{"inputTokens":853,"outputTokens":1641,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":3518}`
 - injected_ratio：0.579 (injected=22/produced=38，驱动器 snapshot 权威口径)
 
@@ -80,7 +82,7 @@
 | 2 | a1be614a0d960f73 | 2215 | 否 |
 | 3 | a110da90ba9a7e5f | 2532 | 否 |
 
-- cached 字段：probe usage ԭ�ĺ� cache �ֶ�
+- cached 字段：probe usage 原文含 cache 字段
 - usage 原文（前 3 条，全量见 metrics.json）：`{"inputTokens":134,"outputTokens":496,"cacheReadTokens":896,"cacheWriteTokens":0,"totalTokens":1526}`；`{"inputTokens":303,"outputTokens":90,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":1417}`；`{"inputTokens":642,"outputTokens":470,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":2136}`
 - injected_ratio：0.538 (injected=7/produced=13，驱动器 snapshot 权威口径)
 
@@ -94,7 +96,7 @@
 | 4 | 356487b664cfdff2 | 2451 | 否 |
 | 5 | 57ef9ec2d4b97229 | 2441 | 否 |
 
-- cached 字段：probe usage ԭ�ĺ� cache �ֶ�
+- cached 字段：probe usage 原文含 cache 字段
 - usage 原文（前 3 条，全量见 metrics.json）：`{"inputTokens":254,"outputTokens":91,"cacheReadTokens":768,"cacheWriteTokens":0,"totalTokens":1113}`；`{"inputTokens":503,"outputTokens":373,"cacheReadTokens":896,"cacheWriteTokens":0,"totalTokens":1772}`；`{"inputTokens":568,"outputTokens":131,"cacheReadTokens":896,"cacheWriteTokens":0,"totalTokens":1595}`
 - injected_ratio：2.000 (injected=10/produced=5，驱动器 snapshot 权威口径)
 
@@ -111,7 +113,7 @@
 | 7 | 8e8a4a5f225d4a58 | 2697 | 否 |
 | 8 | e7d6d1ecc2b394f3 | 2687 | 否 |
 
-- cached 字段：probe usage ԭ�ĺ� cache �ֶ�
+- cached 字段：probe usage 原文含 cache 字段
 - usage 原文（前 3 条，全量见 metrics.json）：`{"inputTokens":244,"outputTokens":82,"cacheReadTokens":768,"cacheWriteTokens":0,"totalTokens":1094}`；`{"inputTokens":321,"outputTokens":267,"cacheReadTokens":896,"cacheWriteTokens":0,"totalTokens":1484}`；`{"inputTokens":535,"outputTokens":453,"cacheReadTokens":896,"cacheWriteTokens":0,"totalTokens":1884}`
 - injected_ratio：1.667 (injected=20/produced=12，驱动器 snapshot 权威口径)
 
@@ -122,7 +124,7 @@
 | 1 | 4bb5ddc0683f991c | — | 否 |
 | 2 | f2e556e7540025ab | 2179 | 否 |
 
-- cached 字段：probe usage ԭ�ĺ� cache �ֶ�
+- cached 字段：probe usage 原文含 cache 字段
 - usage 原文（前 3 条，全量见 metrics.json）：`{"inputTokens":247,"outputTokens":55,"cacheReadTokens":768,"cacheWriteTokens":0,"totalTokens":1070}`；`{"inputTokens":8053,"outputTokens":152,"cacheReadTokens":896,"cacheWriteTokens":0,"totalTokens":9101}`
 - injected_ratio：3.000 (injected=3/produced=1，驱动器 snapshot 权威口径)
 
@@ -133,7 +135,7 @@
 | 1 | b01ef8c6c4ed3445 | — | 否 |
 | 2 | ffc4ee78019c8bd5 | 2277 | 否 |
 
-- cached 字段：probe usage ԭ�ĺ� cache �ֶ�
+- cached 字段：probe usage 原文含 cache 字段
 - usage 原文（前 3 条，全量见 metrics.json）：`{"inputTokens":154,"outputTokens":40,"cacheReadTokens":896,"cacheWriteTokens":0,"totalTokens":1090}`；`{"inputTokens":2877,"outputTokens":272,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":4173}`
 - injected_ratio：2.000 (injected=4/produced=2，驱动器 snapshot 权威口径)
 
@@ -150,7 +152,7 @@
 | 7 | 8a63f3a92652d60c | 2593 | 否 |
 | 8 | 0451b2a6a51f67c8 | 2593 | 否 |
 
-- cached 字段：probe usage ԭ�ĺ� cache �ֶ�
+- cached 字段：probe usage 原文含 cache 字段
 - usage 原文（前 3 条，全量见 metrics.json）：`{"inputTokens":259,"outputTokens":94,"cacheReadTokens":768,"cacheWriteTokens":0,"totalTokens":1121}`；`{"inputTokens":1242,"outputTokens":852,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":3118}`；`{"inputTokens":265,"outputTokens":192,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":1481}`
 - injected_ratio：2.000 (injected=14/produced=7，驱动器 snapshot 权威口径)
 
@@ -168,7 +170,7 @@
 | 8 | a2fcfbfe4cad99c0 | 2978 | 否 |
 | 9 | f4d58b37d86aa7ec | 3093 | 否 |
 
-- cached 字段：probe usage ԭ�ĺ� cache �ֶ�
+- cached 字段：probe usage 原文含 cache 字段
 - usage 原文（前 3 条，全量见 metrics.json）：`{"inputTokens":156,"outputTokens":56,"cacheReadTokens":896,"cacheWriteTokens":0,"totalTokens":1108}`；`{"inputTokens":350,"outputTokens":196,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":1570}`；`{"inputTokens":385,"outputTokens":593,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":2002}`
 - injected_ratio：1.389 (injected=25/produced=18，驱动器 snapshot 权威口径)
 
@@ -183,7 +185,7 @@
 | 5 | 89271d06bc50ff81 | 2736 | 否 |
 | 6 | 1f24cda68eb1fc97 | 2868 | 否 |
 
-- cached 字段：probe usage ԭ�ĺ� cache �ֶ�
+- cached 字段：probe usage 原文含 cache 字段
 - usage 原文（前 3 条，全量见 metrics.json）：`{"inputTokens":158,"outputTokens":59,"cacheReadTokens":896,"cacheWriteTokens":0,"totalTokens":1113}`；`{"inputTokens":463,"outputTokens":1205,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":2692}`；`{"inputTokens":252,"outputTokens":376,"cacheReadTokens":1024,"cacheWriteTokens":0,"totalTokens":1652}`
 - injected_ratio：1.158 (injected=22/produced=19，驱动器 snapshot 权威口径)
 
@@ -220,7 +222,7 @@ node eval/tools/gen-results.cjs --stamp 2026-11-15-v02                         #
 | stream（本插件） | 42,782 | 58,112 | 0 | 28,284 | **129,178** | 59 | 33/36 |
 
 - 全量口径 T1 = 129,178 / 446,410 = **28.9%**（本 stamp）；缓存写分量两臂均为 0（深航缓存未触发写）。
-- 复算命令：`node eval/tools/summarize.cjs --stamp 2026-11-15-v02 --md`（summary.json 逐任务留档）。
+- 复算命令：`node eval/tools/summarize.cjs --stamp 2026-11-15-v02 --md`（逐任务留档在 `eval/runs/2026-11-15-v02/summary.json`，已入库，可离线复算）。
 - 如实说明：v0.2.0-baseline.md 记的 22.3%（840,138 → 187,290）来自更早批次；两批数字不可混用，
   R3 重跑时以同批双臂复算为准（同一 `summarize.cjs` 口径）。
 
