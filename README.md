@@ -20,7 +20,7 @@ R3 重跑后以同批双臂复算为准。
 | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 宿主  | DeepSeek Harness `0.2.2-rc.1`（类型锚点）/ `rc.3`（运行时实测）                                                                                                     |
 | 依赖  | 零 npm 依赖；Node ≥ 22.18（原生类型擦除）                                                                                                                           |
-| 测试  | 269 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力回归）                                                                                       |
+| 测试  | 275 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力/会话格式回归）                                                                              |
 | 形态  | 单 bundle 包 + **专用 profile**（`profiles/stream` 模板）；`dsh plugin remove` 整层消失、宿主 loop 原子恢复                                                          |
 | 控制栏 | `dsh-stream-agent bar`：四模式 + 中英切换 + 意图核对，装载时自动打印上手引导                                                                                       |
 | 桌面页 | 客户端左侧栏「控制栏 / Control bar」：状态 + 四模式 + 中英切换，**不改 Electron 壳**                                                                               |
@@ -78,6 +78,11 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 - 误装到 `web` / `desktop` 会被 `install-check` 拒绝；若绕过校验强行装入，宿主会以
   `E_DOUBLE_LOOP`（带 profile 标识与处置建议）具名失败——不静默共存（C2/S3）。
 - `dsh plugin` 依赖 `pnpm` 在 PATH 中（或按 dsh-plugin-manager 配置 `pnpmCommand`）。
+- **旧会话日志（0.2.x 及 0.3.0 发布前的产物）**：0.3.0 起修正了会话日志的 v4 工具生命周期
+  写入——此前写出的日志在桌面端点开历史对话会报"会话加载失败"
+  （`tool/call … has no advertised tool lifecycle`，宿主把整条日志判 corrupt，并非数据丢失）。
+  升级后跑一次 `node scripts/repair-session-logs.mjs --write`（先不加 `--write` 看清单；
+  写前自动备份 `.bak-<时间戳>`、写后清投影缓存），日志即可正常加载。
 
 开发/验证用的临时叠加（不进 profile）仍可用：
 `dsh --profile headless --patch ./patches/takeover.yml headless "任务"`。
@@ -247,14 +252,15 @@ dsh-stream-agent/
 │                          #   （runner / summarize / replay-check / t3-cells / f6-kill-drill）
 ├── docs/                  # protocol / limitations / architecture / adr-001 /
 │                          #   disabled-lines-audit / v0.4.0-plan / TEST-PROPOSITIONS
-├── scripts/               # build / check-consistency / gate / install-check / install-cycle / release
-└── test/                  # 269 用例（kernel 2 套 + entry 14 套 + 20 mock 场景；零 API）
+├── scripts/               # build / check-consistency / gate / install-check / install-cycle /
+│                          #   repair-session-logs / release
+└── test/                  # 275 用例（kernel 2 套 + entry 15 套 + 20 mock 场景；零 API）
 ```
 
 ## 10. 开发
 
 ```bash
-npm test          # 269/269，零 API 调用
+npm test          # 275/275，零 API 调用
 npm run build     # 产出 dist/ 25 个文件 + 全量 smoke import + 桌面页构建闸门
 npm run check     # R2：装配与文档一致性 4 项
 npm run gate      # R4：发布门禁 6 项（真机项如实标待复测）

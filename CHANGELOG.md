@@ -9,6 +9,10 @@
 并把 **0.4.0 规划的 F5/F6/F7 一并实施**（合并产出，最终版本号标记 0.3.0，
 实施对照见 `docs/v0.4.0-plan.md`）。
 
+另含**会话日志格式修复（发布前并入，不单独发版）**：0.3.0 开发期写出的会话日志在宿主
+v4 校验下被判 corrupt（`tool/call <id> has no advertised tool lifecycle`），桌面端点开历史
+对话报"加载失败"；本版修正写入路径，并附存量日志修复脚本。
+
 ### Added
 
 - **独立装配（S 组）**
@@ -84,6 +88,17 @@
   - **测试命题**：`docs/TEST-PROPOSITIONS.md` —— A 组回归 + B 组新能力（B1 编辑、B3 搜索、
     B4 计划、B5 幻觉检查、B6 五场景、B7 强杀、B8 段边界、B9 双 loop、B10 校验）+
     C 组成本对照；≈2 元/命题，供人工复测。
+- **会话日志修复工具（发布前并入）**
+  - **`scripts/repair-session-logs.mjs`：存量日志修复**。默认 dry-run，`--write` 落盘；
+    为缺失广告的 `tool/call` 补入同 turn/step 的 `assistant/message`（tool-call 块），
+    把误写在 `step/end` 之后的 final 答案移回 step 内，重排 seq 与全部 seq 引用
+    （`sourceEventSeqs` / `messageSeqs` / `throughSeq` / `headerSeq` / 压缩范围），
+    写前备份 `.bak-<时间戳>`、写后清除投影缓存；设 `DSH_HOST_MODULES` 时用宿主自己的
+    v4 校验器复核（`restoreReleasedV4Artifact` + `assertReleasedV4Relationships`）。
+    实测：本机 10 条历史会话全部修复为可读，27/27 会话通过宿主校验。
+  - **`test/session-format.test.ts`**：S1 正常回合的广告顺序、S2 派发前异常的
+    `TOOL_NOT_STARTED` 闭合、S3 final 答案早于 `step/end`；用"宿主同款"假工具管线
+    （start → tool/call，commit → tool/result）复核生命周期。
 
 ### Changed
 
@@ -113,9 +128,13 @@
   `#finalOnlyRequests` 在 `#turnLoop` 入口清零——此前跨回合累计，多任务长会话会在
   第 N 个回合被历史计数误杀（blocked 重入上限）。
 - **版本**：`package.json` / `src/version.ts` → 0.3.0；`files` 增加 `profiles/` 与 `preset/`；
-  `scripts` 增加 `check` / `gate`；engines 维持 `dsh >= 0.2.2-rc.1`。
+  `scripts` 增加 `check` / `gate`（另有并入的 `repair-session-logs.mjs` 存量日志修复）；
+  engines 维持 `dsh >= 0.2.2-rc.1`。
 - `preset.yml` 与 `cordis.patch.yml` 对齐（stream-agent inject 补 `sessionProjections`，
   与 0.2.1 真机验证过的装配形态一致）。
+- **兼容性（会话日志）**：装配、协议、配置项全部不变（`enableCode` 仍默认关闭）。0.3.0 起
+  写出的日志可被 0.2.x 读取（新增的只是合法的 `assistant/message` 事件）；0.2.x 及 0.3.0
+  发布前的开发期产物写出的旧日志仍需跑一次 `repair-session-logs.mjs` 才能加载。
 
 ### Fixed
 
@@ -123,6 +142,24 @@
 - **多回合护栏误杀**（详见 Changed/护栏按回合重置）。
 - **F6 演练脚本与 t3-cells 的 Windows 路径 / 事件循环问题**（file:// URL 导入、
   Atomics.wait 阻塞 stdout 事件）。
+- **会话日志 v4 工具生命周期（致命，桌面端"历史加载失败"的直接原因）**
+  - **工具调用生命周期缺失**：驱动器把 tf-* 命令映射成宿主工具后直接调
+    `ctx.tools.execute`，由宿主管线写 `tool/call` + `tool/result`，却从未写 v4 格式要求的
+    `assistant/message`（content 带 `tool-call` 块）。`dsh-session-format-v3-to-v4` 的
+    `tool()` 在读取时抛 `tool/call <id> has no advertised tool lifecycle` → 整条日志被判
+    corrupt；表现是会话列表能列出、点开却"历史加载失败"。现在每次派发**前**先广告同名
+    同参的 tool-call 块（`advertiseToolCalls`）；派发异常 / 批次缺项时用 `repairToolCall`
+    闭合生命周期——未开始 = 宿主唯一接受的 `TOOL_NOT_STARTED` 修复形状
+    （`message.id = interrupted-tool-result-<callId>-<n>`、`isError:true`、
+    `error.code = TOOL_NOT_STARTED`），已开始 = 普通错误结果，已有 result 不重复写。
+    原生 `tool_call` 通道的调用块随同一条 assistant 消息一起广告。
+  - **final 答案写在 step/end 之后（同类 corrupt）**：`finalAnswer` 原在 `step/end` 之后写
+    `assistant/message`；v4 要求该事件落在打开的 turn+step 内（否则读取时抛
+    `assistant/message does not match an open turn and step`）。收束判定前移到
+    `step/end` 之前写出。
+  - **不可重试流错误的 step/end 早于在途工具**：fail-fast 分支先写 `step/end` 再结束，
+    流中途已派发的 `tool/call` 会在 `step/end` 之后才落 `tool/result`（同一类 corrupt）。
+    现在先 `drain()` 等在途工具落定，再写 `step/end`。
 
 ### Security
 
@@ -133,7 +170,7 @@
 
 ### 测试
 
-- 269/269 全绿（255 → 269：+5 F5 计划验收、+5 F6 意图、+4 F7 段边界）。
+- 275/275 全绿（+5 F5 计划验收、+5 F6 意图、+4 F7 段边界、+3 会话格式回归）。
 - 离线演练：F6 强杀 10 轮通过；M3 对照臂 replay 10/10；M1 复算一致。
 - 真机复测项（不阻塞本版提交，阻塞正式发布）：R3 评测矩阵重跑、M2 三格、K6 五场景、
   S6 十轮装卸、回退演练 —— 全部命令与命题见 `docs/TEST-PROPOSITIONS.md` 与

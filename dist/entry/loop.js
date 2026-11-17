@@ -293,12 +293,22 @@ export const DEFAULT_TOOL_MAPPING              = {
  * 会话事件写入面（真实宿主路径专用；事件形状逐字段镜像 dsh-agent-loop/lib/index.js
  * 的 append 调用 :731/:757/:781/:819/:891-955，turn/end reason 形状镜像 :747-821）。
  */
+                                        
+             
+               
+                    
+ 
+
                                   
                                 
                                               
                                                                     
                              
                                                           
+                                                                  
+                                                                   
+                                                      
+                                                 
            
                                             
                                                      
@@ -307,6 +317,16 @@ export const DEFAULT_TOOL_MAPPING              = {
                                                                
                                                                             
                                                                                   
+                                                              
+                                                   
+                                                                             
+                                                                             
+                                        
+                                                                                                 
+                                                          
+                                                    
+                                                              
+                                                                    
  
 
 /** kernel/gate.ts ActionGate.admit 的 duck-type 面（04 号对接面备忘） */
@@ -985,6 +1005,9 @@ export class SingleStreamDriver {
 
       // 不可重试的流错误（凭据/配置层）：fail-fast 终止回合，不进重入循环
       if (streamOutcome.finish.kind === 'error' && NON_RETRYABLE_STREAM_CODES.has(finishCode(streamOutcome.finish))) {
+        // v0.3.0：step/end 之前必须等在途工具落定——流中途已派发的 tool/call 若在
+        // step/end 之后才写 tool/result，v4 校验会判"tool/call 不在打开的 step 内"→ corrupt。
+        await this.#drain();
         try {
           this.#ports.events?.stepEnd(turn, step);
         } catch (error) {
@@ -999,11 +1022,9 @@ export class SingleStreamDriver {
       // ---- 等 drain（F8 普通异步等待）----
       await this.#drain();
       await this.#resolveDeferredPeeks(turn, step);
-      try {
-        this.#ports.events?.stepEnd(turn, step);
-      } catch (error) {
-        this.#warn('step/end 事件写入失败', error);
-      }
+      // v0.3.0：step/end 推迟到"收束判定"之后——final 答案是 assistant/message，
+      // v4 格式要求它落在打开的 turn+step 内；此前在 step/end 之后写会被判
+      // "assistant/message does not match an open turn and step" → 整条会话 corrupt。
 
       // ---- 收束判定（仅三种重入事由：失败/拒绝、high 观测、peek 需求）----
       const issues = this.#collectIssues();
@@ -1063,7 +1084,8 @@ export class SingleStreamDriver {
       if (finalSeen && !needsReentry) {
         // 成功路径：零注入，只写 ledger —— 分派 06 核心命题
         reason = { kind: 'completed' };
-        // 最终答案落会话：headless 输出与评测 checks 消费最后一条 assistant 消息
+        // 最终答案落会话：headless 输出与评测 checks 消费最后一条 assistant 消息。
+        // v0.3.0：必须在 step/end 之前写（v4 的 assistant/message 要求打开的 turn+step）。
         if (lastFinal !== undefined && lastFinal.summary.trim() !== '') {
           try {
             this.#ports.events?.finalAnswer?.(turn, step, lastFinal.summary);
@@ -1071,7 +1093,19 @@ export class SingleStreamDriver {
             this.#warn('final 答案消息写入失败', error);
           }
         }
+        try {
+          this.#ports.events?.stepEnd(turn, step);
+        } catch (error) {
+          this.#warn('step/end 事件写入失败', error);
+        }
         break;
+      }
+
+      // 非成功路径（重入 / 阻断 / 取消）：本步到此结束
+      try {
+        this.#ports.events?.stepEnd(turn, step);
+      } catch (error) {
+        this.#warn('step/end 事件写入失败', error);
       }
 
       const finalOnlyGate = level === 'final-only' && this.#finalOnlyRequests >= 1;
@@ -1287,8 +1321,15 @@ export class SingleStreamDriver {
     for (const event of parser.end()) this.#handleParserEvent(event, turn, step);
 
     // 会话落盘：assistant 消息（成功 → assistant/message；error/aborted → attempt / 中断消息）
+    // v0.3.0：原生 tool_call 通道要在**同一条** assistant 消息里广告 tool-call 块，
+    // 否则随后宿主写出的 tool/call 在 v4 格式校验里没有生命周期 → 历史加载被判 corrupt。
+    // 只有确定会执行的批次才广告（error/aborted 的残缺调用如实丢弃，不能留下未解广告）。
+    const nativeCallsWillRun = (finish.kind === 'stop' || finish.kind === 'tool-calls') && natives.size > 0;
+    const nativeAds                          = nativeCallsWillRun
+      ? [...natives.values()].map((c) => ({ id: c.id, name: c.name ?? 'unknown', arguments: c.arguments || '{}' }))
+      : [];
     try {
-      this.#ports.events?.assistantMessage(turn, step, textBuf, { finish, usage: usageSeen });
+      this.#ports.events?.assistantMessage(turn, step, textBuf, { finish, usage: usageSeen, toolCalls: nativeAds });
     } catch (error) {
       this.#warn('assistant 事件写入失败', error);
     }
@@ -1666,8 +1707,17 @@ export class SingleStreamDriver {
         this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail.slice(0, 200) });
         return;
       }
+      // v0.3.0（会话格式修复）：先广告 tool-call 生命周期，再让宿主工具管线落 tool/call。
+      // 宿主的 v4 校验要求 assistant/message(tool-call) → tool/call → tool/result 三段齐全；
+      // 只写 tool/call 会让整条会话日志被判 corrupt（桌面端历史对话加载失败）。
+      const advertised                        = { id: cmd.id, name: mapped.name, arguments: JSON.stringify(mapped.arguments) };
+      try {
+        this.#ports.events?.advertiseToolCalls?.(turn, step, [advertised]);
+      } catch (adError) {
+        this.#warn('tool-call 广告写入失败（fail-open：工具照常派发，但该条会话日志可能不可读）', adError);
+      }
       result = await this.#ports.executeTools({
-        calls: [{ type: 'tool-call', id: cmd.id, name: mapped.name, arguments: JSON.stringify(mapped.arguments) }],
+        calls: [{ type: 'tool-call', id: cmd.id, name: advertised.name, arguments: advertised.arguments }],
         // K4：回合 signal（cancel 时传导；不再用独立且永不触发的 AbortController）
         signal: this.#commandSignal(),
         maxParallelToolCalls: 1,
@@ -1677,6 +1727,12 @@ export class SingleStreamDriver {
     } catch (error) {
       rec.status = 'failed';
       rec.detail = isAbortError(error) ? `aborted: 回合取消（K4），未产生后置结果` : describeToolError(error);
+      // v0.3.0：广告已落但派发失败 → 闭合工具生命周期（否则 step/end 留下未解调用）
+      try {
+        this.#ports.events?.repairToolCall?.(turn, step, cmd.id);
+      } catch (repairError) {
+        this.#warn('tool-call 生命周期闭合事件写入失败（fail-open）', repairError);
+      }
       // F6 写后回执（失败路径）：意图闭合为"已发生但失败"，不算"无回执"
       if (intentOp !== null) {
         try {
@@ -1691,6 +1747,14 @@ export class SingleStreamDriver {
     }
 
     const first = result.results[0];
+    // v0.3.0：批次返回里没有本调用的结果（宿主静默丢弃/未派发）→ 补闭合，避免未解广告。
+    if (first === undefined) {
+      try {
+        this.#ports.events?.repairToolCall?.(turn, step, cmd.id);
+      } catch (repairError) {
+        this.#warn('tool-call 生命周期闭合事件写入失败（fail-open）', repairError);
+      }
+    }
     const contentText = blockTextOf(first?.result?.content);
     const isError = first?.result?.isError === true;
 
@@ -1771,6 +1835,15 @@ export class SingleStreamDriver {
       });
     } catch (error) {
       this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'native-tool-batch-error', detail: error instanceof Error ? error.message : String(error) });
+    }
+    // v0.3.0：广告已随 assistant 消息落盘；批次异常/缺项时逐个闭合，避免未解工具生命周期。
+    for (const call of calls) {
+      if (result !== undefined && result.results.some((r) => r.callId === call.id)) continue;
+      try {
+        this.#ports.events?.repairToolCall?.(turn, step, call.id);
+      } catch (repairError) {
+        this.#warn('原生 tool-call 生命周期闭合事件写入失败（fail-open）', repairError);
+      }
     }
     const results = (result?.results ?? []).map((r) => ({
       callId: r.callId,
@@ -2228,6 +2301,7 @@ export function createSessionEventWriter(session         )                      
     },
     assistantMessage(turn, step, text, info) {
       const usageField = info.usage === undefined ? {} : { usage: info.usage };
+      const toolCalls = info.toolCalls ?? [];
       if (info.finish.kind === 'error' || info.finish.kind === 'aborted') {
         if (text.length > 0) {
           // 中断但有部分正文：assistant/message + interrupted（镜像内建 :891-905）
@@ -2243,16 +2317,69 @@ export function createSessionEventWriter(session         )                      
         }
         return;
       }
-      if (text.length === 0) {
-        // 成功终止但无文本：assistant/attempt（镜像内建 :906-915 的空内容分支）
+      if (text.length === 0 && toolCalls.length === 0) {
+        // 成功终止但无文本也无原生调用：assistant/attempt（镜像内建 :906-915 的空内容分支）
         append('assistant/attempt', { turn, step, stream: [] });
         return;
       }
       append('assistant/message', {
         turn, step,
-        message: makeAssistantMessage(text),
+        message: makeAssistantMessage(text, toolCalls),
         ...usageField,
         stream: [],
+      }, { surfaceOp: 'append' });
+    },
+    advertiseToolCalls(turn, step, calls) {
+      if (calls.length === 0) return;
+      // v0.3.0：v4 会话格式的工具生命周期广告。形状 = 内建 loop 的 assistant/message
+      // （content 里的 tool-call 块），arguments 必须与随后 tool/call 里的字符串逐字节相同
+      // （宿主校验器用严格相等比对 name/arguments）。
+      append('assistant/message', {
+        turn, step,
+        message: makeAssistantMessage('', calls),
+        stream: [],
+      }, { surfaceOp: 'append' });
+    },
+    repairToolCall(turn, step, callId) {
+      // v0.3.0：派发异常后的生命周期闭合。先读会话快照确认事实，已有 result 就什么都不写
+      // （重复 result 会让日志再次 corrupt）。
+      const snap = (s                                                              ).snapshotEvents;
+      const events = typeof snap === 'function' ? snap.call(s) : [];
+      let started = false;
+      let settled = false;
+      for (const event of events) {
+        const e = event                                                                                       ;
+        if (e.type === 'tool/call' && e.data?.callId === callId) started = true;
+        if (e.type === 'tool/result' && e.data?.message?.toolCallId === callId) settled = true;
+      }
+      if (settled) return;
+      if (started) {
+        append('tool/result', {
+          turn, step,
+          message: {
+            id: `tool-result-${callId}-${randomUUID()}`,
+            role: 'tool',
+            source: { kind: 'tool', callId },
+            toolCallId: callId,
+            isError: true,
+            content: [{ type: 'text', text: 'Error: tool call ended without a recorded result（插件在派发异常后补写的闭合结果）' }],
+          },
+        }, { surfaceOp: 'append' });
+        return;
+      }
+      // 未开始：宿主 v4 校验唯一接受的形状（notStartedRepair：id 前缀 / 固定正文 /
+      // error.name=ToolNotStartedError + code=TOOL_NOT_STARTED / 无 sourceEventSeqs）。
+      append('tool/result', {
+        turn, step,
+        message: {
+          id: `interrupted-tool-result-${callId}-0`,
+          role: 'tool',
+          source: { kind: 'tool', callId },
+          toolCallId: callId,
+          isError: true,
+          content: [{ type: 'text', text: 'The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.' }],
+        },
+        error: { name: 'ToolNotStartedError', code: 'TOOL_NOT_STARTED' },
       }, { surfaceOp: 'append' });
     },
     stepEnd(turn, step) {
@@ -2274,11 +2401,16 @@ export function createSessionEventWriter(session         )                      
   };
 }
 
-function makeAssistantMessage(text        )                                                                                                          {
+                                                                                                                                 
+
+function makeAssistantMessage(text        , toolCalls                                   = [])                                                                                                 {
+  const content                          = [];
+  if (text.length > 0) content.push({ type: 'text', text });
+  for (const call of toolCalls) content.push({ type: 'tool-call', id: call.id, name: call.name, arguments: call.arguments });
   return {
     id: randomUUID(),
     role: 'assistant',
-    content: [{ type: 'text', text }],
+    content,
     source: { kind: 'model' },
   };
 }

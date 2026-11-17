@@ -22,7 +22,7 @@ earlier batch — the two are not comparable; see the honest note in
 | ----- | ----- |
 | Host | DeepSeek Harness `0.2.2-rc.1` (type anchor) / `rc.3` (runtime-tested) |
 | Dependencies | Zero npm dependencies; Node ≥ 22.18 (native type stripping) |
-| Tests | 269 cases green, zero API calls (mock full-chain + 20 scenarios + activation/desktop/new-capability regressions) |
+| Tests | 275 cases green, zero API calls (mock full-chain + 20 scenarios + activation/desktop/new-capability/session-format regressions) |
 | Shape | Single bundle + **dedicated profile** (`profiles/stream` template); `dsh plugin remove` unwinds the whole layer and restores the host loop atomically |
 | Control bar | `dsh-stream-agent bar`: four modes + zh/en + intent triage, onboarding banner on load |
 | Desktop page | Left-rail **Control bar**: status + four mode cards + zh/en switch, **without touching the Electron shell** |
@@ -92,6 +92,12 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
   still fails fast with `E_DOUBLE_LOOP` (profile id + remediation hint) — never a silent
   coexistence (C2/S3).
 - `dsh plugin` needs `pnpm` on PATH (or a configured `pnpmCommand`).
+- **Old session logs (0.2.x and anything written before 0.3.0 shipped)**: 0.3.0 fixes how the
+  v4 tool lifecycle is written — logs written earlier make the desktop app show
+  "failed to load history" (`tool/call … has no advertised tool lifecycle`; the host marks the
+  whole log corrupt — no data was lost). After upgrading, run
+  `node scripts/repair-session-logs.mjs --write` once (drop `--write` to preview the list;
+  it backs up to `.bak-<timestamp>` and clears the projection cache), then history loads.
 
 For development you can still stack temporarily without installing:
 `dsh --profile headless --patch ./patches/takeover.yml headless "task"`.
@@ -292,14 +298,15 @@ dsh-stream-agent/
 │                          #   (runner / summarize / replay-check / t3-cells / f6 kill drill)
 ├── docs/                  # protocol / limitations / architecture / adr-001 /
 │                          #   disabled-lines-audit / v0.4.0-plan / TEST-PROPOSITIONS
-├── scripts/               # build / check-consistency / gate / install-check / install-cycle / release
-└── test/                  # 269 cases (2 kernel + 14 entry suites + 20 mock scenarios; zero API)
+├── scripts/               # build / check-consistency / gate / install-check / install-cycle /
+│                          #   repair-session-logs / release
+└── test/                  # 275 cases (2 kernel + 15 entry suites + 20 mock scenarios; zero API)
 ```
 
 ## 10. Development
 
 ```bash
-npm test          # 269/269, zero API calls
+npm test          # 275/275, zero API calls
 npm run build     # emits dist/ (25 files) + smoke imports + desktop-page build gates
 npm run check     # R2: assembly & doc consistency (4 checks)
 npm run gate      # R4: release gate (6 items; real-machine items marked honestly)
