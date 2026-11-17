@@ -2,12 +2,41 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.3.1] - 2026-11-18
 
-**第三方评审反馈（2026-11-17）的修复合集。** 不改变运行时行为：只修评测产物编码、报告可读性、
-门禁自洽性与 CI 覆盖面。版本号仍为 0.3.0（`v0.3.0` tag 之后的提交，未重打 tag）。
+**桌面端思考过程显示修复 + 第三方评审反馈修复合集。** 两部分内容并入同一补丁版本：
+评审反馈修复（只动评测产物与文档，不改运行时行为）与思考过程显示修复（改运行时行为，
+见下）。
 
-### Fixed
+### Fixed（思考过程显示 —— 桌面端"乱码"bug）
+
+**现象**：electron 桌面端跑 stream 模式时，模型的思考过程显示错误，输出内容大多是乱码。
+取证（本机会话日志 `~/.dsh/sessions/` 真机样本 + 宿主渲染面源码）定位到三个根因，逐一修复：
+
+- **思考过程被丢弃**：驱动器对 `reasoning-delta` 只计体积（`reasoningChars`）不落盘，
+  而桌面端思考区只认 assistant 消息里的 `{type:'reasoning'}` 内容块（取证：
+  `dsh-client-ui-chat/src/client/conversation-nodes/event-projection.ts:117`）。本版把
+  reasoning delta 按块捕获，随 assistant/message 落成首个内容块（块序镜像内建
+  BlockAssembler：思考先于正文；中断路径的部分思考同样落盘）。
+- **协议标记与 DSML 噪声进正文**：0.3.0 把整段流原文（含 `<tf-*>` 标记）落成消息文本；
+  模型偶尔混入的原生调用格式 `<｜｜DSML｜｜ …>`（全角竖线）在桌面端渲染成乱码，协议
+  标记则被 Markdown 渲染器吞掉或显示破碎。两处修复：
+  - **落盘正文纯 prose 化**：assistant/message 只落解析器的 prose 事件（命令事实仍完整
+    记在 `plugin:tf-agent/*` 台账，会话事实层不丢、resume 重放不受影响）；
+  - **parser DSML 归一化**：`<｜…DSML…>` 形态一律不作为 prose 透传——
+    `<｜｜DSML｜｜ invoke name="tf-xxx" …>` 改写回等价 tf-* 头部（命令不丢），
+    其余包装行按 `malformed(dsml-wrapper)` 记账后丢弃（只进台账，不注入、不打断流）。
+  - 协议文本补第 7 条规则：禁止输出 DSML/原生调用格式（省输出 token，治本）。
+- **无实时流**：驱动器从不发 `agent/assistant-stream` 帧，桌面端在整个流期间没有 live
+  内容（内建 loop 的思考区 live 数据源就是这套帧）。本版补发：start → 逐 reasoning-delta
+  chunk → end。契约对齐宿主两端 fold（`SessionAssistantStreamAccumulator.accept` 要求
+  revision 逐帧 +1、chunk index 逐块 +1；客户端 `ClientAssistantStream.acceptFrame`）。
+  两条自保语义：**正文不逐帧透传**（流文本是协议标记，实时显示会闪现乱码）；**工具广告
+  前收束 attempt**（广告是流中落盘的 assistant/message，落在活跃 attempt 内会被客户端
+  fold 暂存进 pending 且 end 帧只消费一条结算 → 滞留到下一步触发 `events.restart()` 整窗
+  重建）。发射异常熔断（本会话不再发），无端口/无监听器是 no-op——headless/离线零影响。
+
+### Fixed（评审反馈）
 
 - **评测产物 GBK 乱码**：`eval/tools/runner.cjs` 有 7 处输出文案、`eval/RESULTS.md` 有 10 行
   「cached 字段」取证行是早期 GBK 编码残留的替换字符（U+FFFD），grep 不到、无法检索。

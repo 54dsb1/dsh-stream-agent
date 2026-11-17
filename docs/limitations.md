@@ -157,3 +157,25 @@
 
 - 驱动器 snapshot 计数在 peek / 完整反馈场景下会偏大或偏小。
 - **口径**：以驱动器 turn-end snapshot 为权威值，`eval/METRICS.md` 有定义；不要用它单独论证收益，token 总量才是判据。
+
+## 六、桌面显示面（0.3.1）
+
+### 10. 实时帧只送思考过程，正文在落盘后显示
+
+- **现象**：stream 模式下，桌面端流式显示的是思考过程（reasoning-delta 实时帧）；回答正文
+  在该步 assistant/message 落盘后才出现（一次性）。
+- **原因**：流文本是 tf-* 协议标记——逐帧透传会让标记在界面上闪现成乱码（0.3.1 修的正是
+  这个）。内建 loop 的流文本是最终答案本身，所以可以逐帧透传；两种模式的流文本语义不同，
+  不宜对齐。
+- **取证**：`src/entry/loop.ts` 的 `#frameReasoningDelta`（只发 reasoning-delta）与
+  `#consumeStream` 的落盘注释；`test/v031-display.test.ts` R3。
+- **缓解**：思考过程全程实时可见；正文延迟与 0.3.0 相同（0.3.0 是全程无实时显示）。
+
+### 11. 有工具执行的步骤，live attempt 在首个工具广告前收束
+
+- **现象**：一条流内一旦开始派发工具（工具广告落盘），思考过程的实时帧即停止（该步后续
+  的思考不再实时出现，只在落盘消息里可见）；无工具的步骤全程实时。
+- **原因**：客户端 fold（`ClientAssistantStream`）把活跃 attempt 期间到达的 assistant/message
+  暂存进 pending，而 end 帧只消费一条结算——广告消息不收束会滞留到下一步，触发
+  `events.restart()` 整窗重建（比"提前收束"更伤体验）。
+- **取证**：`src/entry/loop.ts` 的 `#frameEndAbandonedIfOpen`；`test/v031-display.test.ts` R3。

@@ -333,3 +333,76 @@ test('混合流：prose + 三条命令 + malformed 混合，全部事件齐全',
   assert.equal(cmds[1].body, '\n内容\n');
   assert.equal(cmds[2].name, 'tf-final');
 });
+
+// ---------------------------------------------------------------------------
+// DSML 噪声归一化（v0.3.1：思考过程乱码修复的解析半边）
+// ---------------------------------------------------------------------------
+
+test('DSML 包装行：malformed 上报并丢弃，不进 prose（真机形态）', () => {
+  const p = new TfStreamParser();
+  const events = feedAll(p, [
+    '\n\n<｜｜DSML｜｜ calls>\n',
+    '<｜｜DSML｜｜ invoke name="tf-plan" id="p1">\n- [a1] 验收项\n</tf-plan>',
+  ]);
+  const text = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
+  assert.equal(text, '\n\n\n', 'DSML 标签本身不得作为 prose 透传（标签间空白换行保留）');
+  const malformed = events.filter((e) => e.type === 'malformed').map((e) => e as { reason: string });
+  assert.ok(malformed.some((m) => m.reason === 'dsml-wrapper'), '包装行应按 dsml-wrapper 上报');
+  // invoke + 配对闭合 → 命令不丢
+  const cmds = commandsOf(events);
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].name, 'tf-plan');
+  assert.equal(cmds[0].id, 'p1');
+  assert.equal(cmds[0].body, '\n- [a1] 验收项\n');
+});
+
+test('DSML invoke 自闭合：改写回 tf-* 命令（属性透传）', () => {
+  const p = new TfStreamParser();
+  const events = p.feed('<｜｜DSML｜｜ invoke name="tf-read" path="data/x.md" id="r9" offset="3" limit="4"/>');
+  const cmds = commandsOf(events);
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].name, 'tf-read');
+  assert.equal(cmds[0].id, 'r9');
+  assert.equal(cmds[0].attrs['path'], 'data/x.md');
+  assert.equal(cmds[0].attrs['offset'], '3');
+  assert.equal(cmds[0].attrs['limit'], '4');
+});
+
+test('DSML 残缺属性（真机 mangled 形态）：malformed 丢弃，不作为 prose 泄漏', () => {
+  const p = new TfStreamParser();
+  const events = feedAll(p, [
+    '<｜｜DSML｜｜ invoke name="tf-read path="data/big-report.md" id="r1" offset="130" limit="15"/>',
+  ]);
+  const text = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
+  assert.equal(text, '', 'mangled DSML 不得进 prose');
+  assert.ok(events.some((e) => e.type === 'malformed'));
+  assert.equal(commandsOf(events).length, 0);
+});
+
+test('DSML 尾巴（流终止未闭合）：malformed 上报，不进 prose', () => {
+  const p = new TfStreamParser();
+  const events = feedAll(p, ['回答正文。<｜｜DSML｜｜ calls']);
+  const text = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
+  assert.equal(text, '回答正文。');
+  assert.ok(events.some((e) => e.type === 'malformed' && (e as { reason: string }).reason === 'dsml-wrapper'));
+});
+
+test('全角竖线出现在普通 prose 中（非标签起始）不受影响', () => {
+  const p = new TfStreamParser();
+  const events = feedAll(p, ['评分 9｜10 分，很好。']);
+  const text = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
+  assert.equal(text, '评分 9｜10 分，很好。');
+  assert.equal(events.filter((e) => e.type === 'malformed').length, 0);
+});
+
+test('DSML 跨 chunk 边界：闭合跨流仍能改写（增量喂入）', () => {
+  const p = new TfStreamParser();
+  const events = feedAll(p, [
+    '<｜｜DSM',
+    'L｜｜ invoke name="tf-glob" pattern="**/*.md" id="gl1"/>',
+  ]);
+  const cmds = commandsOf(events);
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].name, 'tf-glob');
+  assert.equal(cmds[0].id, 'gl1');
+});

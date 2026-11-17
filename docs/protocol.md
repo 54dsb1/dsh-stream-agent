@@ -73,3 +73,27 @@
 | `fatal` | 无人工批准通道时直接拒绝 |
 
 缺 `reversibility` 声明不会静默通过——`registry.freeze()` 在装配期就抛 `MissingReversibilityError`。把"忘记声明"变成启动期失败，而不是运行时的意外放行。
+
+## DSML 噪声与桌面显示（0.3.1）
+
+真机取证：模型偶尔把 DeepSeek 原生调用格式 `<｜｜DSML｜｜ …>`（U+FF5C 全角竖线）混进文本流
+（`<｜｜DSML｜｜ calls>` 包装行、`<｜｜DSML｜｜ invoke name="tf-plan" id="p1">` 调用行）。
+协议里没有任何合法形式以 `<｜` 开头，parser（`src/kernel/parser.ts`，唯一权威）一律不作为
+prose 透传：
+
+| 形态 | 处理 |
+|---|---|
+| `<｜…DSML… invoke name="tf-xxx" 属性…/>` 或配对打开 | 改写回等价 `tf-*` 头部，交 `parseHeader` 统一 schema 校验——**命令不丢** |
+| 其余包装行（`calls` 等）与属性段残缺的调用行 | `malformed(dsml-wrapper)` 记账后丢弃：只进驱动器台账与 `plugin:tf-agent/fault`，不注入、不打断流 |
+| 尾部未闭合的 DSML 片段（流终止） | 同上，不进 prose |
+
+配套两条（桌面端思考过程显示修复，取证链见 CHANGELOG 0.3.1）：
+
+- **落盘正文纯 prose 化**：assistant/message 的 text 块只含解析器 prose 事件；tf-* 标记与
+  DSML 噪声留在台账（`plugin:tf-agent/*`），不进会话表面。resume 重放读台账，不受影响。
+- **`agent/assistant-stream` 实时帧**：start → 逐 reasoning-delta chunk → end。契约对齐宿主
+  两端 fold（服务端 `SessionAssistantStreamAccumulator.accept`：revision 逐帧 +1、chunk
+  index 逐块 +1；客户端 `ClientAssistantStream.acceptFrame`）。正文不逐帧透传（协议标记不
+  闪现）；工具广告前收束 attempt（abandoned）——否则广告消息滞留客户端 pending，下一步
+  start 帧触发 `events.restart()` 整窗重建。思考过程以 `{type:'reasoning'}` 内容块随
+  assistant/message 落盘（块序镜像内建：思考先于正文），重放/历史加载同样可见。

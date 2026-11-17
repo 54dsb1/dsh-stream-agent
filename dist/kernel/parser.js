@@ -35,6 +35,11 @@
  *   非 tf- 前缀的 '<' 一律视为模型 prose 原样透传，绝不丢弃
  *   （代价：恰好以 "<tf-xxx" 开头且全文无 '>' 的 prose 会被判为 truncated，
  *   但内容仍在 raw 里，不丢失）；
+ * - DSML 噪声（v0.3.1）：模型偶尔把原生调用格式 `<｜｜DSML｜｜ …>`（U+FF5C 全角竖线）
+ *   混进文本流——协议里没有任何合法形式以 "<｜" 开头，一律按协议违规处理，
+ *   绝不作为 prose 透传（透传会在桌面端渲染成乱码）。其中
+ *   `<｜｜DSML｜｜ invoke name="tf-xxx" ...>` 形态改写回等价 tf-* 头部（命令不丢）；
+ *   其余（calls 包装行等）以 malformed(dsml-wrapper) 上报后丢弃，只记台账不注入。
  * - 未闭合即流终止 → truncated 事件（loop 据此决定重入策略）；
  * - depends_on 环 → cycle 事件（路径首尾相同，如 [a, b, a]）。
  *
@@ -112,7 +117,7 @@ const COMMAND_NAMES                           =
 // ---------------------------------------------------------------------------
 
                                          
-                                                             
+                                                                      
 
 export class TfStreamParser {
           buf = '';
@@ -152,7 +157,13 @@ export class TfStreamParser {
     this.ended = true;
     const events                = [];
     if (this.mode === 'header') {
-      events.push({ type: 'truncated', raw: this.buf, reason: 'unclosed-command-tag' });
+      if (isDsmlTag(this.buf)) {
+        // DSML 尾巴（feed 期间已进 header 模式但流终止）：malformed 上报，不进 prose
+        events.push({ type: 'malformed', raw: this.buf, reason: 'dsml-wrapper' });
+        this.buf = '';
+      } else {
+        events.push({ type: 'truncated', raw: this.buf, reason: 'unclosed-command-tag' });
+      }
     } else if (this.mode === 'body') {
       events.push({
         type: 'truncated',
@@ -161,12 +172,17 @@ export class TfStreamParser {
       });
     } else {
       // ground：残留的 "<tf-" 片段（尚无法判定是否标签）→ truncated；
+      // DSML 尾巴（协议违规，v0.3.1）→ malformed 上报后丢弃，不作为 prose 泄漏；
       // 其余（含普通 '<'）全部按 prose 透传
       const lt = this.buf.lastIndexOf('<');
       const tail = lt >= 0 ? this.buf.slice(lt) : '';
-      if (tail.startsWith('<tf-') && probeTag(tail) === 'need-more') {
+      const tailProbe = tail === '' ? 'prose' : probeTag(tail);
+      if (tail.startsWith('<tf-') && tailProbe === 'need-more') {
         if (lt > 0) events.push({ type: 'text', text: this.buf.slice(0, lt) });
         events.push({ type: 'truncated', raw: tail, reason: 'unclosed-command-tag' });
+      } else if (tailProbe === 'dsml') {
+        if (lt > 0) events.push({ type: 'text', text: this.buf.slice(0, lt) });
+        events.push({ type: 'malformed', raw: tail, reason: 'dsml-wrapper' });
       } else if (this.buf !== '') {
         events.push({ type: 'text', text: this.buf });
       }
@@ -218,7 +234,7 @@ export class TfStreamParser {
       this.buf = this.buf.slice(lt + 1);
       return true;
     }
-    // tag / tf-unknown：都进入 header 模式（后者闭合时判 malformed）
+    // tag / tf-unknown / dsml：都进入 header 模式（后两者闭合时判 malformed 或改写）
     if (lt > 0) events.push({ type: 'text', text: this.buf.slice(0, lt) });
     this.buf = this.buf.slice(lt);
     this.mode = 'header';
@@ -231,6 +247,32 @@ export class TfStreamParser {
     const raw = this.buf.slice(0, close.end + 1);
     this.buf = this.buf.slice(close.end + 1);
     this.mode = 'ground';
+
+    // DSML 噪声（v0.3.1）：先于普通解析处理——`invoke name="tf-xxx" ...` 形态改写回
+    // 等价 tf-* 头部（命令不丢）；其余包装行按 malformed 上报后丢弃（不进 prose）。
+    if (isDsmlTag(raw)) {
+      const dsml = parseDsmlHeader(raw, close.selfClosing);
+      if (dsml === null) {
+        events.push({ type: 'malformed', raw, reason: 'dsml-wrapper' });
+        return true;
+      }
+      const parsed = parseHeader(dsml.synthetic);
+      if ('error' in parsed || parsed.name === null) {
+        events.push({ type: 'malformed', raw, reason: 'dsml-wrapper' });
+        return true;
+      }
+      if (close.selfClosing) {
+        this.emitCommand(events, parsed.name, parsed.attrs, parsed.dependsOn, undefined, raw);
+      } else {
+        this.bodyName = parsed.name;
+        this.bodyAttrs = parsed.attrs;
+        this.bodyDeps = parsed.dependsOn;
+        this.bodyRawOpen = raw;
+        this.bodyBuf = '';
+        this.mode = 'body';
+      }
+      return true;
+    }
 
     const parsed = parseHeader(raw);
     if ('error' in parsed) {
@@ -372,6 +414,39 @@ function scanHeaderClose(buf        )                                           
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// DSML 噪声归一化（v0.3.1）
+// ---------------------------------------------------------------------------
+
+/** DSML 前缀："<" 后跟全角竖线（U+FF5C）串 + "DSML" + 全角竖线串。观察到的真机形态：
+ *  `<｜｜DSML｜｜ calls>`、`<｜｜DSML｜｜ invoke name="tf-plan" id="p1">`。 */
+const DSML_TAG_RE = /^<\/?｜+DSML｜*/;
+
+/** 判定一段头部原文是否是 DSML 噪声标签（probeTag 'dsml' 的闭合侧复核）。 */
+function isDsmlTag(raw        )          {
+  return DSML_TAG_RE.test(raw);
+}
+
+/**
+ * 尝试把 DSML 头部改写为等价 tf-* 头部。
+ * 可改写形态：`<｜｜DSML｜｜ invoke name="tf-xxx" 其余属性/>`（或配对打开）——
+ * 返回合成头部原文（`<tf-xxx 其余属性...>`）；包装行（calls 等）与无法解析的
+ * 属性段返回 null（调用方按 malformed 上报丢弃，绝不作为 prose 透传）。
+ */
+function parseDsmlHeader(raw        , selfClosing         )                               {
+  // 去掉 '<' 与结尾 '>'（或 '/>'），取 DSML 前缀之后的剩余段
+  let inner = raw.slice(1);
+  if (selfClosing && inner.endsWith('/>')) inner = inner.slice(0, -2);
+  else if (inner.endsWith('>')) inner = inner.slice(0, -1);
+  const rest = inner.replace(/^\/?｜+DSML｜*/, '');
+  const invoke = rest.match(/^\s*invoke\s+name="(tf-[a-z]+)"([\s\S]*)$/);
+  if (invoke === null) return null;
+  const [, name, attrsPart] = invoke                                       ;
+  if (!COMMAND_NAMES.includes(name                 )) return null;
+  // 属性段原样拼接：dsml 属性语法与 tf 协议一致（key="value"），交 parseHeader 统一校验
+  return { synthetic: `<${name}${attrsPart}${selfClosing ? '/>' : '>'}` };
+}
+
                   
                                                                                         
                                                                                
@@ -448,6 +523,9 @@ function parseHeader(raw        )              {
 function probeTag(s        )           {
   if (!s.startsWith('<')) return 'prose';
   if (s.length === 1) return 'need-more';
+  // DSML 噪声（v0.3.1）："<" 后直接跟全角竖线（U+FF5C）——协议没有任何合法形式以
+  // "<｜"（或 "</｜"）开头，无需等待更多数据即可判定（不再作为 prose 透传）。
+  if (s[1] === '｜' || (s[1] === '/' && s[2] === '｜')) return 'dsml';
   for (const name of COMMAND_NAMES) {
     const open = `<${name}`;
     if (s.length <= open.length) {

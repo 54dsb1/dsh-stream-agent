@@ -285,6 +285,10 @@ export const DEFAULT_TOOL_MAPPING              = {
                                                                                                                      
                                                          
                                                                                        
+                                                          
+                                                             
+                                                      
+                                                            
                                        
                                                           
  
@@ -302,14 +306,20 @@ export const DEFAULT_TOOL_MAPPING              = {
                                   
                                 
                                               
+                                                             
+                                                           
                                                                     
                              
                                                           
+                                                    
+                                                               
+                                            
+                       
                                                                   
                                                                    
                                                       
                                                  
-           
+                                                                                         
                                             
                                                      
                                                            
@@ -465,7 +475,9 @@ tf-final 的 summary 必须包含任务要求的最终答案原文（数字、�
    tf-edit 匹配失败（原文不唯一/不存在）会以结构化错误注入：核对后修正 OLD 段重发，
    不要扩大替换范围改全文。tf-grep/tf-glob 只回匹配行/路径，超长会截断并提示 tf-peek。
 5. 上一请求若报告 [tf-stream:error]，先修复或改道该命令（换路径/换命令），再继续其余任务。
-6. 全部命令成功且无需更多信息时输出 tf-final；收到 tf-final 后本任务收敛，不再有下一请求。`;
+6. 全部命令成功且无需更多信息时输出 tf-final；收到 tf-final 后本任务收敛，不再有下一请求。
+7. 调用工具只允许上表的 tf-* 标记：不要输出 <｜｜DSML｜｜…>、<think> 包裹、JSON tool_call
+   等任何原生调用格式——它们不会被解析成命令，只会浪费输出 token 并在界面显示为乱码。`;
 
 export const DEFAULT_INVARIANTS = '不变量：历史消息只增不改（任何"压缩/摘要历史"的请求都会被拒绝）；写文件成功不会有结果回灌（只记台账），失败一定会以 [tf-stream:error] 注入下一请求；tf-read 自己刚写过的文件只会得到回执（[tf-stream:receipt]，行数+指纹），不会回灌全文；不要用原生 tool_call 写文件。回合必须以 <tf-final .../> 收尾：所有命令输出完毕后立即输出 tf-final，不带 tf-final 的回合视为未完成——即使全部工作已做完。';
 
@@ -661,6 +673,82 @@ export class SingleStreamDriver {
   #segmentKeepFrom = 0;
   /** ok 的 tf-final 候选（解析序）；任务最终答案取最后一个（过早 final 可被后继覆盖） */
   #finalCandidates                                                                        = [];
+  /** v0.3.1：当前流内的 prose 累积（parser 的 text 事件拼接；落盘 assistant/message 的正文）。
+   *  0.3.0 落盘的是整段原文（含 tf-* 标记与 DSML 噪声）——桌面端过程区把协议标记渲染成乱码，
+  *  本版起落盘纯 prose：命令事实在台账（plugin:tf-agent/*），会话日志只留用户可读内容。 */
+  #streamProse = '';
+  /** v0.3.1 实时帧状态：agent 生命周期内的 attempt 序号与帧序号（revision 逐帧 +1，
+   *  契约见 dsh-api-session-controller SessionAssistantStreamAccumulator.accept）。 */
+  #attemptCounter = 0;
+  #frameRevision = 0;
+  #frameChunkIndex = 0;
+  #frameAttemptId                     = undefined;
+  /** 实时帧熔断：发射抛错（无监听器异常/宿主总线异常）后本会话不再发（fail-open）。 */
+  #frameBroken = false;
+
+  // ---------------------------------------------------------- v0.3.1 实时帧（agent/assistant-stream）
+
+  /**
+   * 思考过程实时帧（桌面端 live 显示的数据源）。契约对齐宿主两端的 fold：
+   * dsh-api-session-controller SessionAssistantStreamAccumulator.accept（服务端，要求
+   * revision 逐帧 +1、chunk index 逐块 +1）与客户端 ClientAssistantStream.acceptFrame
+   * （start 只在无活跃 attempt 时接受）。发射异常即熔断（本会话不再发，fail-open）。
+   */
+  #frameEmit(frame                         )       {
+    if (this.#frameBroken || this.#ports.emitHostEvent === undefined || this.#agentRef === undefined) return;
+    try {
+      this.#ports.emitHostEvent('agent/assistant-stream', { agent: this.#agentRef, frame });
+    } catch (error) {
+      this.#frameBroken = true;
+      this.#warn('assistant-stream 实时帧发射失败（已熔断，本会话不再发）', error);
+    }
+  }
+
+  /** 流开始帧：分配 attemptId（session 内唯一），index 清零。 */
+  #frameStartAttempt(turn        , step        )       {
+    if (this.#ports.emitHostEvent === undefined || this.#agentRef === undefined || this.#sessionId === undefined) return;
+    this.#frameAttemptId = `${this.#sessionId}:${++this.#attemptCounter}`;
+    this.#frameChunkIndex = 0;
+    this.#frameEmit({ type: 'start', attemptId: this.#frameAttemptId, revision: ++this.#frameRevision, turn, step });
+  }
+
+  /** 思考 delta 帧（正文不逐帧透传：流文本是协议标记，实时显示会闪现乱码）。 */
+  #frameReasoningDelta(index        , text        )       {
+    if (this.#frameAttemptId === undefined) return;
+    this.#frameEmit({
+      type: 'chunk',
+      attemptId: this.#frameAttemptId,
+      revision: ++this.#frameRevision,
+      index: this.#frameChunkIndex++,
+      time: Date.now(),
+      chunk: { type: 'reasoning-delta', index, text },
+    });
+  }
+
+  /** 流末结算帧：durable 结算已落（有 seq）才发 committed，否则 abandoned。 */
+  #frameEndAttempt(settlement                                                 )       {
+    if (this.#frameAttemptId === undefined) return;
+    this.#frameEmit({
+      type: 'end',
+      attemptId: this.#frameAttemptId,
+      revision: ++this.#frameRevision,
+      index: this.#frameChunkIndex,
+      outcome: settlement !== undefined && settlement.seq !== undefined
+        ? { kind: 'committed', eventType: settlement.eventType, seq: settlement.seq }
+        : { kind: 'abandoned' },
+    });
+    this.#frameAttemptId = undefined;
+  }
+
+  /**
+   * 工具广告前的 attempt 收束（abandoned）。客户端 fold 会把活跃 attempt 期间到达的
+   * assistant/message（广告消息）暂存进 pending，而 end 帧只消费一条结算——不先收束，
+   * 广告条目会永久滞留 pending，下一步的 start 帧触发 events.restart()（整窗重建）。
+   * 先收束：广告与后续 tool/call、落盘消息全部直接 publish，零 restart。
+   */
+  #frameEndAbandonedIfOpen()       {
+    this.#frameEndAttempt(undefined);
+  }
 
   constructor(ports             , config                    , renderer                  , obs                    ) {
     this.#ports = ports;
@@ -1200,7 +1288,11 @@ export class SingleStreamDriver {
     const controller = new AbortController();
     this.#activeControllers.add(controller);
     let textBuf = '';
+    this.#streamProse = '';
     let reasoningChars = 0;
+    // v0.3.1：思考过程捕获（按块 index 分段，落盘时按到达序拼接为单个 reasoning 块）
+    const reasoningParts           = [];
+    let reasoningLastIndex                = null;
     const natives = new Map                               ();
     let finish                          = null;
     let usageSeen                                                           ;
@@ -1223,6 +1315,14 @@ export class SingleStreamDriver {
       const events                = parser.feed(delta);
       for (const event of events) this.#handleParserEvent(event, turn, step);
     };
+
+    // v0.3.1 实时帧：流开始即发 start 帧（契约见 #frameEmit）。思考过程
+    // （reasoning-delta）逐帧透传——桌面端思考区 live 渲染的数据源。正文不逐帧透传：
+    // 流文本是协议标记（tf-*），实时显示会把标记闪成乱码；落盘后以纯 prose 消息呈现。
+    // 发射异常即熔断（本会话不再发），任务不受影响（fail-open）。
+    const frameStart = ()       => this.#frameStartAttempt(turn, step);
+    const frameEnd = (settlement                                                 )       =>
+      this.#frameEndAttempt(settlement);
 
     try {
       if (this.#cfg.provider === '' || this.#cfg.model === '') {
@@ -1252,6 +1352,7 @@ export class SingleStreamDriver {
         messages: messages.length,
         sessionProbe: this.#sessionProbe(),
       });
+      frameStart();
 
       for await (const chunk of stream) {
         bump();
@@ -1260,9 +1361,18 @@ export class SingleStreamDriver {
             textBuf += chunk.text;
             feed(chunk.text);
             break;
-          case 'reasoning-delta':
+          case 'reasoning-delta': {
             reasoningChars += chunk.text.length; // 思维链不进协议解析，只计体积
+            // v0.3.1：思考过程捕获 + 实时帧（桌面端思考过程 live 显示的数据源）
+            if (reasoningLastIndex !== chunk.index) {
+              reasoningParts.push(chunk.text);
+              reasoningLastIndex = chunk.index;
+            } else {
+              reasoningParts[reasoningParts.length - 1] += chunk.text;
+            }
+            this.#frameReasoningDelta(chunk.index, chunk.text);
             break;
+          }
           case 'tool-call-delta': {
             const acc = natives.get(chunk.id) ?? { id: chunk.id, arguments: '' };
             if (chunk.name !== undefined) acc.name = chunk.name;
@@ -1324,15 +1434,25 @@ export class SingleStreamDriver {
     // v0.3.0：原生 tool_call 通道要在**同一条** assistant 消息里广告 tool-call 块，
     // 否则随后宿主写出的 tool/call 在 v4 格式校验里没有生命周期 → 历史加载被判 corrupt。
     // 只有确定会执行的批次才广告（error/aborted 的残缺调用如实丢弃，不能留下未解广告）。
+    // v0.3.1：正文落盘从整段原文改为纯 prose（#streamProse，parser text 事件拼接）——
+    // 协议标记（tf-*/DSML）留在台账与会话事实层，桌面端过程区只显示可读文本。
     const nativeCallsWillRun = (finish.kind === 'stop' || finish.kind === 'tool-calls') && natives.size > 0;
     const nativeAds                          = nativeCallsWillRun
       ? [...natives.values()].map((c) => ({ id: c.id, name: c.name ?? 'unknown', arguments: c.arguments || '{}' }))
       : [];
+    const reasoningText = reasoningParts.join('\n');
+    let settlement                                                 ;
     try {
-      this.#ports.events?.assistantMessage(turn, step, textBuf, { finish, usage: usageSeen, toolCalls: nativeAds });
+      settlement = this.#ports.events?.assistantMessage(turn, step, this.#streamProse, {
+        finish,
+        usage: usageSeen,
+        toolCalls: nativeAds,
+        ...(reasoningText !== '' ? { reasoning: reasoningText } : {}),
+      });
     } catch (error) {
       this.#warn('assistant 事件写入失败', error);
     }
+    frameEnd(settlement);
     if (reasoningChars > 0) {
       this.#ledgerWrite('plugin:tf-agent/step', { turn, step, reasoningChars });
     }
@@ -1354,7 +1474,9 @@ export class SingleStreamDriver {
   #handleParserEvent(event             , turn        , step        )       {
     switch (event.type) {
       case 'text':
-        // prose 原样透传：已随 textBuf 落 assistant/message，无需重复处理（不改写）
+        // v0.3.1：prose 累积（落盘 assistant/message 的正文；0.3.0 落整段原文，协议
+        // 标记会在桌面端渲染成乱码）。命令本体已作为 command 事件处理，不进 prose。
+        this.#streamProse += event.text;
         break;
       case 'command':
         this.#onCommand(event.command, turn, step);
@@ -1710,6 +1832,10 @@ export class SingleStreamDriver {
       // v0.3.0（会话格式修复）：先广告 tool-call 生命周期，再让宿主工具管线落 tool/call。
       // 宿主的 v4 校验要求 assistant/message(tool-call) → tool/call → tool/result 三段齐全；
       // 只写 tool/call 会让整条会话日志被判 corrupt（桌面端历史对话加载失败）。
+      // v0.3.1：广告是流中落盘的 assistant/message——若实时 attempt 还开着，客户端 fold 会把它
+      // 暂存进 pending 且 end 帧只消费一条结算 → 滞留到下一步触发 events.restart()。
+      // 先收束（abandoned）再广告：广告与后续 tool/call、落盘消息全部直接 publish。
+      this.#frameEndAbandonedIfOpen();
       const advertised                        = { id: cmd.id, name: mapped.name, arguments: JSON.stringify(mapped.arguments) };
       try {
         this.#ports.events?.advertiseToolCalls?.(turn, step, [advertised]);
@@ -2292,6 +2418,11 @@ export function createSessionEventWriter(session         )                      
   const append = (type        , data         , opts          )       => {
     s.append (type, data, opts);
   };
+  /** v0.3.1：带结算信息的 append（seq 供 assistant-stream end 帧配对）。 */
+  const appendSettling = (type                                           , data         , opts          )                                                                         => {
+    const appended = s.append (type, data, opts)                                       ;
+    return { eventType: type, ...(appended !== null && typeof appended === 'object' && typeof appended.seq === 'number' ? { seq: appended.seq } : {}) };
+  };
   return {
     turnStart(turn) {
       append('turn/start', { turn });
@@ -2302,29 +2433,27 @@ export function createSessionEventWriter(session         )                      
     assistantMessage(turn, step, text, info) {
       const usageField = info.usage === undefined ? {} : { usage: info.usage };
       const toolCalls = info.toolCalls ?? [];
+      const reasoning = info.reasoning;
       if (info.finish.kind === 'error' || info.finish.kind === 'aborted') {
         if (text.length > 0) {
           // 中断但有部分正文：assistant/message + interrupted（镜像内建 :891-905）
-          append('assistant/message', {
+          return appendSettling('assistant/message', {
             turn, step,
-            message: makeAssistantMessage(text),
+            message: makeAssistantMessage(text, [], reasoning),
             interrupted: true,
             ...usageField,
             stream: [],
           }, { surfaceOp: 'append' });
-        } else {
-          append('assistant/attempt', { turn, step, stream: [] });
         }
-        return;
+        return appendSettling('assistant/attempt', { turn, step, stream: [] });
       }
       if (text.length === 0 && toolCalls.length === 0) {
         // 成功终止但无文本也无原生调用：assistant/attempt（镜像内建 :906-915 的空内容分支）
-        append('assistant/attempt', { turn, step, stream: [] });
-        return;
+        return appendSettling('assistant/attempt', { turn, step, stream: [] });
       }
-      append('assistant/message', {
+      return appendSettling('assistant/message', {
         turn, step,
-        message: makeAssistantMessage(text, toolCalls),
+        message: makeAssistantMessage(text, toolCalls, reasoning),
         ...usageField,
         stream: [],
       }, { surfaceOp: 'append' });
@@ -2401,10 +2530,12 @@ export function createSessionEventWriter(session         )                      
   };
 }
 
-                                                                                                                                 
+                                                                                                                                                                       
 
-function makeAssistantMessage(text        , toolCalls                                   = [])                                                                                                 {
+function makeAssistantMessage(text        , toolCalls                                   = [], reasoning         )                                                                                                 {
   const content                          = [];
+  // v0.3.1：reasoning 块在首位（镜像内建 BlockAssembler 的流序：思考先于正文）。
+  if (reasoning !== undefined && reasoning.trim() !== '') content.push({ type: 'reasoning', text: reasoning });
   if (text.length > 0) content.push({ type: 'text', text });
   for (const call of toolCalls) content.push({ type: 'tool-call', id: call.id, name: call.name, arguments: call.arguments });
   return {
@@ -3347,6 +3478,15 @@ export default function apply(ctx
           stream: (options) => llm.stream(options),
           executeTools: (input) => tools.execute(input),
           ...(codeExecutor === undefined ? {} : { executeCode: codeExecutor }),
+          // v0.3.1 思考过程实时帧：宿主事件总线在位（cordis ctx.emit）才接线；
+          // 发射契约由驱动器保证（revision/index 递增、异常熔断），宿主无监听器时是 no-op。
+          ...(typeof (ctx                      ).emit === 'function'
+            ? {
+                emitHostEvent: (event        , payload         ) => {
+                  (ctx                                                      ).emit(event, payload);
+                },
+              }
+            : {}),
           ...(intentsEnabled && intentFile !== undefined
             ? {
                 onIntent: (event                                                                                       ) => {
