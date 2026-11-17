@@ -58,6 +58,11 @@ export const AVAILABILITY_TEXT                                                  
                        
                                                
                         
+                                                    
+                                                            
+                                                               
+                                       
+                                                     
  
 
                            
@@ -109,6 +114,7 @@ export const MODES                      = [
       persistFallback: true,
       maxParallelToolCalls: 3,
       maxReentries: 8,
+      toolSurface: 'standard',
     },
   },
   {
@@ -140,6 +146,7 @@ export const MODES                      = [
       maxParallelToolCalls: 2,
       maxReentries: 6,
       budgetTokens: 60_000,
+      toolSurface: 'core',
     },
   },
   {
@@ -170,6 +177,7 @@ export const MODES                      = [
       persistFallback: true,
       maxParallelToolCalls: 1,
       maxReentries: 12,
+      toolSurface: 'off',
     },
   },
   {
@@ -200,6 +208,7 @@ export const MODES                      = [
       persistFallback: true,
       maxParallelToolCalls: 3,
       maxReentries: 10,
+      toolSurface: 'standard',
     },
   },
 ];

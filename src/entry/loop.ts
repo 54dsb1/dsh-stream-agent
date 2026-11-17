@@ -47,6 +47,8 @@ import { readPersistedControl, resolveControlState, writePersistedControl } from
 import type { ControlStateWithSource } from './control-state.ts';
 import { appendIntentRecord, intentFileOf, loadIntentRecords, pendingIntents } from './intent-log.ts';
 import { clearTakeover, markTakeover } from './takeover-registry.ts';
+import { ToolSurfaceHolder, degradedLine } from './tool-surface.ts';
+import type { SurfaceProfile, ToolSurface, ToolsServiceLike } from './tool-surface.ts';
 import { isModeId, modeConfig, publicModeCatalog } from '../kernel/modes.ts';
 import { isLang } from '../kernel/control-bar.ts';
 import { VERSION } from '../version.ts';
@@ -102,6 +104,9 @@ export interface StreamRequestOptions {
   model: string;
   reasoningEffort?: string;
   messages: readonly { role: string; content: readonly { type: 'text'; text: string }[] }[];
+  /** v0.4.0 原生通道（P1）：nativeTools 开启时携带冻结工具面的 schema（GenerateOptions.tools 直通）。
+   *  默认关闭（§15：默认文本）——可达性走 tf-call，不为 schema 付每请求 token。 */
+  tools?: readonly { name: string; description: string; parameters: Record<string, unknown> }[];
   signal?: AbortSignal;
   sessionId?: string;
 }
@@ -211,6 +216,27 @@ export const DEFAULT_TOOL_MAPPING: ToolMapping = {
             description: `tf-bash: ${(cmd.attrs['cmd'] ?? '').slice(0, 80)}`,
           },
         };
+      case 'tf-skill': {
+        // v0.4.0（§6.4 高频例外）：技能装载专用语法 → 宿主 skill（{name} 单必填）。
+        return { name: 'skill', arguments: { name: cmd.attrs['name'] ?? '' } };
+      }
+      case 'tf-ask': {
+        // v0.4.0（§6.4）：阻塞式提问专用语法 → 宿主 ask_user_question。
+        // {questions:[{id,question,header?,options?:[{label}]}]}；选项逗号分隔取标签
+        // （带描述的复杂选项走 tf-call body JSON）。options="A,B" → [{label:'A'},{label:'B'}]。
+        const options = (cmd.attrs['options'] ?? '')
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s !== '')
+          .map((label) => ({ label }));
+        const question: Record<string, unknown> = {
+          id: cmd.id,
+          question: cmd.attrs['q'] ?? '',
+        };
+        if (cmd.attrs['header'] !== undefined && cmd.attrs['header'] !== '') question['header'] = cmd.attrs['header'];
+        if (options.length > 0) question['options'] = options;
+        return { name: 'ask_user_question', arguments: { questions: [question] } };
+      }
       default:
         return null; // tf-peek / tf-final / tf-code 由驱动器内部处理（tf-code 走 executeCode 端口）
     }
@@ -251,6 +277,20 @@ export interface StreamDriverConfig {
   codeTimeoutMs?: number;
   /** tf-code 协议段覆盖（缺省 DEFAULT_CODE_PROTOCOL_SECTION；仅通道启用时追加） */
   codeProtocolText?: string;
+  /** v0.4.0 工具面档位（P1）：'core' | 'standard'（默认）| 'full' | 'off'（0.3.x 回退点）。
+   *  只影响原生 tools 声明面与降级语义；tf-call 可达性始终是冻结面的全量。 */
+  toolSurface?: SurfaceProfile;
+  /** v0.4.0 原生通道（P1）：请求携带 tools schema。默认 false（§15 默认文本）——
+   *  schema 的每请求 token 成本 > tf-call 的逐调用成本；开启场景 = 模型对原生
+   *  tool_call 的结构化收益优先（provider 原生并行/错误形状）。 */
+  nativeTools?: boolean;
+  /** v0.4.0 tf-call 通用调用通道（G2：命令表净增 1）。默认 true；toolSurface=off 强制关。 */
+  callCommand?: boolean;
+  /** v0.4.0 tf-call 协议段覆盖（缺省 DEFAULT_CALL_PROTOCOL_SECTION；仅通道启用时追加） */
+  callProtocolText?: string;
+  /** v0.4.0 toolSet 准入（R5：beta 缺省 false——toolSet 只用于 schemas 视图，不传 execute）。
+   *  true = execute 带 toolSet（when 门控收紧，P6 复跑后再默认开）。 */
+  strictAdmission?: boolean;
   /** K5：tf-code 配额三项硬限制（子调用次数 / 输出字节 / 墙钟毫秒）；缺省 DEFAULT_CODE_QUOTA。 */
   codeQuota?: CodeQuota;
   /** F3：tf-code 首成功/变化结果的完整注入上限（字符）；≤ 上限整值注入，超限转骨架 + 句柄。
@@ -289,6 +329,9 @@ export interface DriverPorts {
    *  思考过程 live 显示的数据源；真实宿主 = ctx.emit）。缺省 = 不发（headless/离线），
    *  桌面端只看落盘消息（0.3.0 行为）。发射异常由驱动器捕获并熔断（fail-open）。 */
   emitHostEvent?: (event: string, payload: unknown) => void;
+  /** v0.4.0 工具面（P1）：宿主 tools 服务的完整面（resolve/schemas/execute）。
+   *  缺省 = 无宿主面 → ToolSurfaceHolder 返回 undefined（L2 protocol-only，0.3.x 行为）。 */
+  toolsService?: ToolsServiceLike;
   /** 驱动器自身异常/账本落盘失败的告警出口（红线 5：不许静默） */
   onWarning?: (message: string, detail?: unknown) => void;
 }
@@ -507,6 +550,20 @@ return { total: lines.length, errorCount: errors.length, samples: errors.slice(0
 - 每次运行的子调用次数、输出字节、墙钟有插件级配额（超限结构化终止 kind: quota-exceeded）；
   沙箱事实（mode/enforcement）逐次记账，enforcement=partial 只覆盖文件效果、不是隔离。`;
 
+/** v0.4.0（G2/P2）：tf-call 通用调用通道的协议段——命令表净增 1 的全部协议成本（§6.2 方案 C）。
+ *  规则刻意短：一条语法 + 一条判断规则 + 一条失败处置；不逐工具展开说明（工具描述由宿主
+ *  面给出，unknown-tool 的建议注入里带前缀匹配，不回灌全表）。 */
+export const DEFAULT_CALL_PROTOCOL_SECTION = `## tf-call 通用调用（映射面之外的一切宿主工具）
+<tf-call name="工具名" id="c1" depends_on="w1">{"参数名": "值"}</tf-call>
+- body 是一个 JSON 对象（参数原样透传）；name 必须是本会话工具面里的工具名，写错会收到
+  unknown-tool 注入（附相近工具名建议），核对后换新 id 重发。
+- 两条高频专用语法（不走 JSON）：提问 <tf-ask q="问题" id="a1" header="标题" options="选项1,选项2"/>；
+  装载技能 <tf-skill name="skill-name" id="s1"/>。
+- 何时用：要用的工具不在上表 tf-* 里时（搜网页、查后台任务、委派子代理、写任务清单、office/present 等）。
+  tf-* 覆盖到的操作继续用 tf-*（更短）；两者可混用，depends_on/accepts 语义一致。
+- 结果按工具类型分族处理（读类结果注入、写类只记回执），与 tf-* 同一套规则；JSON 引号
+  转义错误会收到 bad-json-arguments 注入，修正 body 重发即可。`;
+
 /** F3：tf-code 首成功/变化结果完整注入的默认上限（字符）。4000 ≈ 2k tokens：
  *  上限内值直接可见（省一次 tf-peek 往返），超限转骨架 + 句柄（中间结果不回灌的红线不破）。 */
 export const DEFAULT_CODE_VALUE_INJECT_LIMIT = 4000;
@@ -614,9 +671,26 @@ export class SingleStreamDriver {
   /** F7：段边界阈值（追加区字符数；≤0 = 关闭） */
   segmentMaxChars: number;
   toolMapping: ToolMapping;
+  /** v0.4.0 工具面档位（§16 决议 2：缺省 standard）。'off' = 0.3.x 行为（无宿主面，
+   *  tf-call 关闭——回退点）。 */
+  toolSurface: SurfaceProfile;
+  /** v0.4.0 原生通道开关（§15：默认文本 false）。开启时请求携带冻结面 schema
+   *  （core 档白名单 / standard-full 全量），可达性同时保留 tf-call。 */
+  nativeTools: boolean;
+  /** v0.4.0 tf-call 通用通道开关（G2）。toolSurface=off 时强制关。 */
+  callCommand: boolean;
+  /** v0.4.0 toolSet 准入（R5 决议 3：beta 缺省 false——toolSet 只用于 schemas 视图，
+   *  不传 execute；P6 复跑后再收紧）。 */
+  strictAdmission: boolean;
   };
   readonly #renderer: ContextRenderer;
   readonly #obs: ObservationLedger;
+  /** v0.4.0 工具面（P1）：会话首请求冻结；tf-call 校验面 + nativeTools 声明面。 */
+  readonly #surface: ToolSurfaceHolder;
+  /** 本请求冻结的工具面快照（undefined = L2 protocol-only / toolSurface=off）。 */
+  #currentSurface: ToolSurface | undefined = undefined;
+  /** 上一次注入的降级级别（同级别不重复注入；级别变化或恢复时重新注入）。 */
+  #lastSurfaceDegraded: 'stale' | 'core' | 'protocol-only' | 'ok' = 'ok';
   readonly #records: DriverRecord[] = [];
   readonly #commands = new Map<string, CommandRecord>();
   readonly #inFlight = new Set<Promise<void>>();
@@ -772,15 +846,32 @@ export class SingleStreamDriver {
       enablePlan: config.enablePlan ?? true,
       segmentMaxChars: config.segmentMaxChars ?? DEFAULT_SEGMENT_MAX_CHARS,
       toolMapping: config.toolMapping ?? DEFAULT_TOOL_MAPPING,
+      // v0.4.0 工具面（P1）：'off' 档 = 0.3.x 行为回退点；无宿主服务面（headless/离线）
+      // 时 tf-call 段不声明（协议文本与 0.3.x 一致，mock 剧本匹配不受影响）
+      toolSurface: config.toolSurface ?? 'standard',
+      nativeTools: config.nativeTools === true,
+      callCommand: (config.toolSurface ?? 'standard') !== 'off'
+        && config.callCommand !== false
+        && ports.toolsService !== undefined,
+      strictAdmission: config.strictAdmission === true,
     };
     // tf-code 协议段只在实际可执行时声明（稳定前缀构造期冻结：通道不存在就不会被模型幻觉调用）
+    // v0.4.0：tf-call 协议段同理（callCommand 决定声明与否；'off' 档不声明，0.3.x 回退点）
     const protocolText = (config.protocolText ?? DEFAULT_PROTOCOL_TEXT)
-      + (this.#cfg.codeEnabled ? `\n\n${config.codeProtocolText ?? DEFAULT_CODE_PROTOCOL_SECTION}` : '');
+      + (this.#cfg.codeEnabled ? `\n\n${config.codeProtocolText ?? DEFAULT_CODE_PROTOCOL_SECTION}` : '')
+      + (this.#cfg.callCommand ? `\n\n${config.callProtocolText ?? DEFAULT_CALL_PROTOCOL_SECTION}` : '');
     this.#renderer = renderer ?? new ContextRenderer({
       system: config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
       protocol: protocolText,
-      toolSchemas: config.nativeToolSchemas ?? '（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）',
+      toolSchemas: config.nativeToolSchemas ?? (this.#cfg.nativeTools
+        ? '（本请求的原生工具 schema 见 tools 字段；未列出的宿主工具一律走 tf-call）'
+        : '（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）'),
       invariants: config.invariants ?? DEFAULT_INVARIANTS,
+    });
+    this.#surface = new ToolSurfaceHolder(ports.toolsService, {
+      profile: this.#cfg.toolSurface,
+      nativeTools: this.#cfg.nativeTools,
+      callCommand: this.#cfg.callCommand,
     });
     this.#obs = obs ?? new ObservationLedger({ starvationThreshold: config.starvationThreshold });
     this.#warn = ports.onWarning ?? (() => {});
@@ -829,6 +920,11 @@ export class SingleStreamDriver {
    *  只读通道，不进上下文——供排障/回取与评测断言使用。 */
   peekHandle(handle: string, fromLine = 1, toLine = Number.MAX_SAFE_INTEGER): string | null {
     return this.#obs.peek(handle, fromLine, toLine);
+  }
+
+  /** v0.4.0（P5）：当前冻结工具面的工具名（tf-code 全绑定生成用）。无面 = 空数组（0.3.x 行为）。 */
+  surfaceNames(): readonly string[] {
+    return this.#currentSurface?.names ?? [];
   }
 
   /**
@@ -1075,6 +1171,33 @@ export class SingleStreamDriver {
       } catch (error) {
         this.#warn('step/start 事件写入失败', error);
       }
+
+      // ---- v0.4.0 工具面（P1）：每请求解析一次（首请求冻结；失败沿用旧面 degraded=stale）。
+      // 无宿主面（toolSurface=off 或 L2）→ undefined，注入一行降级说明（级别转换时）。 ----
+      const surface = await this.#surface.resolve({
+        ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
+        signal: this.#commandSignal(),
+        modelSelection: { provider: this.#cfg.provider, model: this.#cfg.model, ...(this.#cfg.reasoningEffort === undefined ? {} : { reasoningEffort: this.#cfg.reasoningEffort }) },
+      });
+      this.#currentSurface = surface;
+      // 降级判定：有宿主服务面且解析失败/缺席才是降级；headless 无服务面 = 稳态
+      // protocol-only（0.3.x 行为），不注行不记账（避免对离线路径制造永久噪声）
+      const degradedLevel: 'stale' | 'core' | 'protocol-only' | 'ok' =
+        surface?.degraded
+        ?? (surface === undefined && this.#surface.hasService && this.#cfg.toolSurface !== 'off' ? 'protocol-only' : 'ok');
+      if (degradedLevel !== 'ok' && degradedLevel !== this.#lastSurfaceDegraded) {
+        // 降级注入走追加区（前缀单调不破；同级别不重复——只加一次级别转换行）
+        this.#renderer.appendHistory({ role: 'user', content: degradedLine(degradedLevel) });
+        this.#ledgerWrite('plugin:tf-agent/surface', { event: 'degrade', level: degradedLevel, frozenAt: surface?.frozenAt ?? 0 });
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: `surface-${degradedLevel}`, detail: `frozenAt=${surface?.frozenAt ?? 0}` });
+      } else if (degradedLevel === 'ok' && this.#lastSurfaceDegraded !== 'ok') {
+        this.#ledgerWrite('plugin:tf-agent/surface', { event: 'recover', frozenAt: surface?.frozenAt ?? 0 });
+      }
+      if (surface !== undefined && this.#lastSurfaceDegraded === 'ok' && surface.frozenAt === 1 && this.#cfg.toolSurface !== 'off') {
+        // 首冻结审计（§8.4：surface:freeze 落 obs 台账，不落 session——E6 红线不变）
+        this.#ledgerWrite('plugin:tf-agent/surface', { event: 'freeze', profile: surface.profile, tools: surface.names.length, nativeDeclared: surface.schemas.length, frozenAt: surface.frozenAt });
+      }
+      this.#lastSurfaceDegraded = degradedLevel;
 
       // ---- REQUEST：装配 + O6 preflight（render() 内置断言，违反即抛 → fail-closed）----
       const messages = this.#renderer.render();
@@ -1340,6 +1463,11 @@ export class SingleStreamDriver {
         model: this.#cfg.model,
         reasoningEffort: this.#cfg.reasoningEffort,
         messages: toWireMessages(messages),
+        // v0.4.0（P1）：nativeTools 开启时携带冻结面 schema（core 档白名单 / standard-full 全量）。
+        // 默认关闭——schema 的每请求 token 成本由 tf-call 的逐调用成本替代（§15 默认文本）。
+        ...(this.#cfg.nativeTools && this.#currentSurface !== undefined && this.#currentSurface.schemas.length > 0
+          ? { tools: this.#currentSurface.schemas }
+          : {}),
         signal: controller.signal,
         sessionId: this.#sessionId,
       });
@@ -1792,9 +1920,38 @@ export class SingleStreamDriver {
       return;
     }
 
-    // ---- tf-write / tf-read / tf-edit / tf-append / tf-grep / tf-glob / tf-bash：映射原生工具，单命令批执行 ----
+    // ---- tf-write / tf-read / tf-edit / tf-append / tf-grep / tf-glob / tf-bash / tf-call：映射原生工具，单命令批执行 ----
     let mapped: { name: string; arguments: Record<string, unknown> } | null = null;
     let result: ToolBatchResultLike;
+    // v0.4.0（P2/G2）：tf-call 通用调用通道——name 在冻结工具面内校验（unknown-tool 结构化
+    // 失败 + 前缀建议），body 必须是 JSON 对象（bad-json-arguments 结构化失败）。校验不占
+    // 请求 token（错误只进下一请求注入）；工具面缺席（L2）时引导回 tf-* 命令。
+    if (cmd.name === 'tf-call') {
+      const toolName = cmd.attrs['name'] ?? '';
+      const nameError = this.#surface.validateCallName(toolName);
+      let args: unknown;
+      let argsError: string | undefined;
+      if (nameError === null) {
+        try {
+          args = JSON.parse((cmd.body ?? '').trim());
+          if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+            argsError = 'tf-call body 必须是 JSON 对象（键值参数表），不是数组或标量';
+          }
+        } catch {
+          argsError = 'tf-call body 不是合法 JSON：核对引号转义（属性值内的 " 要写成 \\"）后重发';
+        }
+      }
+      if (nameError !== null || argsError !== undefined) {
+        rec.status = 'failed';
+        rec.detail = (nameError ?? argsError)!.slice(0, 500);
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', kind: nameError !== undefined ? 'unknown-tool' : 'bad-json-arguments', detail: rec.detail.slice(0, 200) });
+        return;
+      }
+      mapped = { name: toolName, arguments: args as Record<string, unknown> };
+    } else {
+      mapped = this.#cfg.toolMapping.toToolCall(cmd);
+    }
     // F6 写前意图：变更类命令（tf-write/tf-edit/tf-append）在派发到宿主工具**之前**落盘（fsync）。
     // 崩溃后"有意图无回执"即可判定写入可能已发生 → resume 停机核对。零注入：只进账本。
     const intentOp: 'write' | 'edit' | 'append' | null = cmd.name === 'tf-write'
@@ -1818,7 +1975,6 @@ export class SingleStreamDriver {
       }
     }
     try {
-      mapped = this.#cfg.toolMapping.toToolCall(cmd);
       if (mapped === null) {
         // tf-edit body 标记解析失败等：映射层无法产出参数——结构化失败，不静默改全文。
         rec.status = 'failed';
@@ -1848,6 +2004,10 @@ export class SingleStreamDriver {
         signal: this.#commandSignal(),
         maxParallelToolCalls: 1,
         ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
+        // v0.4.0（R5）：beta 缺省不透传 toolSet（when 门控不收紧）；strictAdmission 开启才带
+        ...(this.#cfg.strictAdmission && this.#currentSurface?.toolSet !== undefined
+          ? { toolSet: this.#currentSurface.toolSet }
+          : {}),
         log: safeToolLog(this.#ports, turn, step),
       });
     } catch (error) {
@@ -1884,9 +2044,13 @@ export class SingleStreamDriver {
     const contentText = blockTextOf(first?.result?.content);
     const isError = first?.result?.isError === true;
 
-    // ---- 观测登记（O1 三档返回；失败一律 high）----
+    // ---- 观测登记（O1 三档返回；失败一律 high）。v0.4.0：tf-call 按宿主工具名分族
+    // （familyHint 语义：web/skill/agent/ask → high 候选，office/goal → 低增益回执）----
     const observation = this.#obs.observe({
-      tool: cmd.name,
+      tool: cmd.name === 'tf-call' ? (cmd.attrs['name'] ?? 'tf-call')
+        : cmd.name === 'tf-ask' ? 'ask_user_question'
+        : cmd.name === 'tf-skill' ? 'skill'
+        : cmd.name,
       ok: !isError,
       key: observationKey(cmd),
       content: contentText,
@@ -1956,6 +2120,10 @@ export class SingleStreamDriver {
       result = await this.#ports.executeTools({
         calls: calls.map((c) => ({ type: 'tool-call' as const, id: c.id, name: c.name ?? 'unknown', arguments: c.arguments || '{}' })),
         ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
+        // v0.4.0（R5）：strictAdmission 开启才带 toolSet（与 tf-* 批同一准入视图）
+        ...(this.#cfg.strictAdmission && this.#currentSurface?.toolSet !== undefined
+          ? { toolSet: this.#currentSurface.toolSet }
+          : {}),
         signal,
         log: safeToolLog(this.#ports, turn, step),
       });
@@ -2298,6 +2466,10 @@ function suggestFor(cmd: TfCommand): string {
 function observationKey(cmd: TfCommand): string {
   const base = cmd.attrs['path'] ?? cmd.attrs['cmd'] ?? cmd.attrs['handle'];
   if (base !== undefined) return base;
+  // v0.4.0：tf-call 的稳定目标 = 工具名 + 参数指纹（同参数幂等归并，不同参数各自成 key）
+  if (cmd.name === 'tf-call') {
+    return `${cmd.attrs['name'] ?? 'unknown'}:${contentFingerprint(cmd.body ?? '')}`;
+  }
   // tf-code 没有稳定目标：description 优先，缺省用程序体指纹（同 id 重复才归并，不同程序各自成 key）
   if (cmd.name === 'tf-code') {
     return cmd.attrs['description'] !== undefined
@@ -3329,6 +3501,16 @@ export interface LoopEntryConfig {
   segmentMaxChars?: number;
   /** tf-code 默认超时（毫秒）；缺省 = 宿主 provider 默认 */
   codeTimeoutMs?: number;
+  /** v0.4.0 工具面档位（P1）：'core' | 'standard'（默认）| 'full' | 'off'（0.3.x 回退点） */
+  toolSurface?: string;
+  /** v0.4.0 原生通道开关（默认 false——§15 默认文本；schema token 成本见 StreamDriverConfig.nativeTools） */
+  nativeTools?: boolean;
+  /** v0.4.0 tf-call 通用调用通道（默认 true；toolSurface=off 强制关） */
+  callCommand?: boolean;
+  /** v0.4.0 toolSet 准入收紧（R5：beta 默认 false；P6 复跑后再默认开） */
+  strictAdmission?: boolean;
+  /** v0.4.0 模式切换（P4）：控制页/CLI 暴露 PresetRouter（空白会话三向切换；已开回合具名失败） */
+  presetRouter?: boolean;
   /** 修复限制 3/4：宿主缺 storage/sessionPersistence/plugin record 模块时的本地文件持久化兜底
    *  （JSONL 会话日志 + 文件台账 + 本地 KvUnit）。默认开启；false = 维持 v0.1 内存降级行为。 */
   persistFallback?: boolean;
@@ -3340,6 +3522,11 @@ export interface LoopEntryConfig {
   lang?: string;
   /** 接管自证：注册成功后向 stderr 打一行横幅（探针 A 实测 preset 激活对 CLI 静默，排障只能靠插件自证日志） */
   announceTakeover?: boolean;
+}
+
+/** v0.4.0：装配 config 的工具面档位归一（未知值回 standard + 告警由调用方负责；'off' = 0.3.x 回退点）。 */
+export function asSurfaceProfile(value: string | undefined): SurfaceProfile {
+  return value === 'core' || value === 'standard' || value === 'full' || value === 'off' ? value : 'standard';
 }
 
 /**
@@ -3374,7 +3561,8 @@ export default function apply(ctx: {
   // v0.2.1：全部服务读取走 getService —— Cordis 对未 inject 的属性裸读会抛
   // "cannot get property ... without inject"，v0.2.0 因此整层接管未激活（见 cordis-compat.ts）。
   const llm = getService<{ stream(options: StreamRequestOptions): AsyncIterable<StreamChunkLike> }>(ctx, 'llm');
-  const tools = getService<{ execute(input: ToolBatchInputLike): Promise<ToolBatchResultLike> }>(ctx, 'tools');
+  // v0.4.0：tools 服务取全量面（resolve/schemas 给 ToolSurface；execute 给工具批）
+  const tools = getService<{ execute(input: ToolBatchInputLike): Promise<ToolBatchResultLike>; resolve?(context: unknown): unknown; schemas?(scope: unknown, toolSet?: unknown): unknown }>(ctx, 'tools');
   if (llm === undefined || typeof llm.stream !== 'function') {
     throw new Error('[stream-loop] ctx.llm.stream 不可用：entry 挂载失败（需要 dsh-llm 服务在位）');
   }
@@ -3400,6 +3588,7 @@ export default function apply(ctx: {
     maxParallelToolCalls: number;
     maxReentries: number;
     budgetTokens: number | undefined;
+    toolSurface: ReturnType<typeof asSurfaceProfile>;
   } => {
     const preset = modeConfig(control.mode);
     return {
@@ -3410,6 +3599,7 @@ export default function apply(ctx: {
       maxParallelToolCalls: config.maxParallelToolCalls ?? preset.maxParallelToolCalls,
       maxReentries: config.maxReentries ?? preset.maxReentries,
       budgetTokens: config.budgetTokens ?? preset.budgetTokens,
+    toolSurface: asSurfaceProfile(config.toolSurface ?? preset.toolSurface),
     };
   };
   const effective = resolveEffective();
@@ -3419,6 +3609,8 @@ export default function apply(ctx: {
   // 形状不符或缺失 → 通道关闭（协议文本不声明 tf-code），告警不静默（红线 5）。
   // v0.2.1：ptcRuntime 是可选服务，只经 getService 探测（裸读即装载期抛错）。
   const ptcRuntime = getService<unknown>(ctx, 'ptcRuntime');
+  // v0.4.0（P5）：当前会话驱动器引用（createDriver 闭包回填；tf-code 全绑定按面生成）。
+  const currentDriverRef: { driver?: { surfaceNames(): readonly string[] } } = {};
   const codeExecutor = looksLikePtcRuntime(ptcRuntime)
     ? createCodeExecutor(ptcRuntime, { executeTools: (input) => tools.execute(input as never) })
     : undefined;
@@ -3458,6 +3650,12 @@ export default function apply(ctx: {
         systemPrompt: config.systemPrompt,
         protocolText: config.protocolText,
         invariants: config.invariants,
+        // v0.4.0 工具面（P1/P2）：档位缺省 standard（对等优先，§16 决议 2）；nativeTools
+        // 缺省关（§15 默认文本）；strictAdmission 缺省关（R5，P6 再收紧）
+        toolSurface: live.toolSurface,
+        nativeTools: config.nativeTools === true,
+        callCommand: config.callCommand !== false,
+        strictAdmission: config.strictAdmission === true,
       };
       // F6 恢复意图：意图日志端口（fsync 落盘；enableIntents: false 关闭——回退点）。
       // 写前意图在派发前落盘、写后回执落定即记；崩溃后"有意图无回执"= 写入可能已发生。
@@ -3477,6 +3675,9 @@ export default function apply(ctx: {
         {
           stream: (options) => llm.stream(options),
           executeTools: (input) => tools.execute(input),
+          // v0.4.0（P1）：宿主 tools 全量面（resolve/schemas）——方法缺失或解析失败时
+          // ToolSurfaceHolder 自行降级 L2（protocol-only，一行注入 + 台账）
+          ...(tools === undefined ? {} : { toolsService: tools as unknown as ToolsServiceLike }),
           ...(codeExecutor === undefined ? {} : { executeCode: codeExecutor }),
           // v0.3.1 思考过程实时帧：宿主事件总线在位（cordis ctx.emit）才接线；
           // 发射契约由驱动器保证（revision/index 递增、异常熔断），宿主无监听器时是 no-op。
@@ -3506,6 +3707,7 @@ export default function apply(ctx: {
         },
         cfg,
       );
+      currentDriverRef.driver = driver;
       // K2：会话工作区解析（tf-code resolve 透传用）。会话 header.cwd（会话原始目录）
       // 优先，缺省回退宿主 workingDirectory 服务的部署默认目录；两者都不可得则不传，
       // 由宿主按自己的默认语义解析。插件不复制宿主的优先级规则。
@@ -3574,6 +3776,7 @@ export default function apply(ctx: {
         maxParallelToolCalls: live.maxParallelToolCalls,
         maxReentries: live.maxReentries,
         budgetTokens: live.budgetTokens ?? null,
+        toolSurface: live.toolSurface,
       },
       modes: publicModeCatalog(),
       updatedAt: persisted.updatedAt ?? null,

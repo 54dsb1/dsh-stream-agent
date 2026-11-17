@@ -2,6 +2,57 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0-beta.1] - 2026-11-18
+
+**能力对等 beta（G1-G3）+ 工具面真实化（P1）+ 通用调用通道（P2/G2）+ 对等装配面（P3）+ 模式切换（P4）+ PTC 对等（P5）+ 基线度量（P0）。**
+设计文档：`upgrade-plan/v0.4.0-stream-mode-design.md`（2026-11-18 评审定案，决议见 §16）。
+自 0.3.1 分叉；`check` 扩到 6 项（命令表 ≤14 + preset↔矩阵一致）。
+
+### Added
+
+- **工具面真实化（P1）——`src/entry/tool-surface.ts`（新模块）**：会话首请求从宿主
+  `ctx.tools.resolve / ctx.tools.schemas` 解析并冻结准入视图；此后只允许新增（additions-only）；
+  解析失败沿用旧面（degraded=stale 一行注入 + 台账）。降级阶梯 L0-L2（L3 装载期拒绝，0.3.0 已有）。
+  无宿主面（headless/离线）= 稳态 protocol-only（0.3.x 行为，不注行不记账——mock/评测零噪声）。
+  配置：`toolSurface: core|standard|full|off`（默认 standard，off=回退点）、
+  `nativeTools`（默认 false——schema 的每请求成本由 tf-call 逐调用成本替代）、
+  `strictAdmission`（默认 false，R5 决议：beta 不透传 toolSet，P6 复跑后再收紧）。
+- **tf-call 通用调用通道（P2/G2）**：协议命令表 11→14（=§6.4 硬上限，检查5 把关）：tf-call + tf-ask（阻塞提问，`q`/`header`/`options` 逗号标签）+ tf-skill（技能装载）。tf-call 的 body = JSON
+  参数对象透传 `ctx.tools.execute`；unknown-tool 结构化失败注入带前缀匹配建议（不回灌全表）；
+  bad-json-arguments 结构化失败；观测按宿主工具名分族（obs.ts 扩族：skill/agent/job/ask
+  高增益候选，office/goal 回执族）。协议段 533 字符（DEFAULT_CALL_PROTOCOL_SECTION，含两条专用语法）。
+- **对等装配面（P3）**：`preset/stream/cordis.patch.yml` 从 4 行扩到 16 行（与 ptc preset
+  同款全量：web/skill/goal/plan/jobs/schedule/ask/todo/present/office/subagent）；
+  workflow 不启用（§5.2 非目标，与 ptc 对齐）。检查6 把关 preset↔矩阵一致性。
+- **模式切换（P4/G3）——`src/entry/preset-router.ts`（新模块）**：空白会话三向切换
+  （standard↔ptc↔stream）；已开回合 `agent-preset/locked` 原样上抛（不自行判断、不包装）；
+  服务缺席返回 undefined（无切换面）。控制页（ui/）GET 附 preset 名册（只读展示），
+  切换本体在宿主"新建会话选择 preset"入口。控制页/状态面新增 `toolSurface` 能力档字段
+  （modes.ts：模式提供档位默认值——lean=core、compat=off、balanced/power=standard，不是第五个模式）。
+- **PTC 对等（P5）**：tf-code 绑定从固定 3 个（write/read/pwsh）扩为按会话冻结工具面生成
+  （固定三个恒在——旧程序体只增不减）；绑定并发上限 `maxParallelBindings`（默认 4，
+  对齐 ptc maxParallelSubCalls 语义）。
+- **基线度量（P0）——`eval/tools/surface-baseline.cjs`**：对等矩阵 + schema 源文本成本
+  （standard 面可提取 ≈17.4KB/27 块，真机成本待复测）+ stream 固定协议段字符数（src 导入实测）。
+  产出：`docs/capability-parity.md` + `eval/runs/surface-baseline-2026-11-18.{txt,json}`。
+
+### Changed
+
+- **`npm run check` 4 项 → 6 项**：新增检查5（协议命令表 ≤14 硬上限，G2/§6.4）与
+  检查6（preset 声明 ↔ 对等矩阵一致，R3 漂移把关）。
+- 控制页状态面（runtime + fallback）与模式目录新增能力档字段；README 命令表 12 条（上限 14）。
+- tf-code 绑定缺省面从固定三件变为"固定三件 + 会话冻结面"（无面 = 0.3.x 行为，回退点不变）。
+
+### 已知限制（beta 边界，如实记录）
+
+- 真机三臂复跑（P6/G4 token 门槛）未执行：本版为能力面交付，T1 ≤ 0.3.1×1.15 的门槛判定
+  待有 key 的实机批次（`docs/capability-parity.md` 的 schema 成本为静态近似下界）。
+- 宿主管理的 deferLoading 投放需要 request/header + developer/message 事件（E6 红线：本插件
+  不写）→ T2 由 tool-surface 自管：nativeTools 开启时 core 档白名单声明 + additions-only；
+  非 core 工具可达性走 tf-call（不声明 schema），这是省 token 的主线。
+- `exit_plan_mode` 的对等是语义等价（tf-plan + 收束判定），不是宿主 plan-mode 状态机
+  （矩阵如实标注）。
+
 ## [0.3.1] - 2026-11-18
 
 **桌面端思考过程显示修复 + 第三方评审反馈修复合集。** 两部分内容并入同一补丁版本：

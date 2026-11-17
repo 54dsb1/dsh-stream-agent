@@ -23,6 +23,9 @@
  *   <tf-glob pattern="src/**" id="gl1"/>
  *   <tf-bash cmd="npm test" id="b1"/>
  *   <tf-peek handle="obs:read:c3@v1" from_line="10" to_line="20" id="p1"/>
+ *   <tf-call name="web_search" id="c1" depends_on="w1">{"query":"..."}</tf-call>
+ *   <tf-ask q="选择哪种方案？" id="a1" options="方案A,方案B"/>
+ *   <tf-skill name="skill-name" id="s1"/>
  *   <tf-final id="f1" summary="任务完成说明"/>
  *
  * 规则：
@@ -54,7 +57,8 @@
 
 export type TfCommandName =
   | 'tf-write' | 'tf-read' | 'tf-edit' | 'tf-append' | 'tf-grep' | 'tf-glob'
-  | 'tf-bash' | 'tf-peek' | 'tf-final' | 'tf-code' | 'tf-plan';
+  | 'tf-bash' | 'tf-peek' | 'tf-final' | 'tf-code' | 'tf-plan'
+  | 'tf-call' | 'tf-ask' | 'tf-skill';
 
 interface CommandSchema {
   required: readonly string[];
@@ -85,10 +89,19 @@ const COMMAND_SCHEMAS: Readonly<Record<TfCommandName, CommandSchema>> = {
   'tf-plan': { required: [], optional: [], hasBody: true },
   // 程序体 = PTC 的 async TS 函数体（可擦除语法）；description 只进台账，timeout 为毫秒数
   'tf-code': { required: [], optional: ['timeout', 'description'], hasBody: true },
+  // v0.4.0 通用调用通道（G2：净增 1）：name = 本会话冻结工具面内的宿主工具名；
+  // body = JSON 对象（参数原样透传给 ctx.tools.execute）。parser 只做 schema 校验，
+  // 工具名/JSON 的语义校验在驱动器（unknown-tool / bad-json-arguments 结构化失败）。
+  'tf-call': { required: ['name'], optional: [], hasBody: true },
+  // v0.4.0 高频例外（§6.4，命令表 12→14）：阻塞式提问与技能装载值一条专用语法——
+  // tf-ask 的回答要作为问句语义在流内可见（familyHint=ask）；tf-skill 是会话级状态变更。
+  // 参数刻意极简（JSON 免转义）；复杂形状（多问题/选项描述）走 tf-call body。
+  'tf-ask': { required: ['q'], optional: ['header', 'options'], hasBody: false },
+  'tf-skill': { required: ['name'], optional: [], hasBody: false },
 };
 
 const COMMAND_NAMES: readonly TfCommandName[] =
-  ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan'];
+  ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan', 'tf-call', 'tf-ask', 'tf-skill'];
 
 export interface TfCommand {
   name: TfCommandName;
@@ -96,7 +109,7 @@ export interface TfCommand {
   id: string;
   /** 除 depends_on 外的全部属性（path/cmd/handle/from_line/...） */
   attrs: Readonly<Record<string, string>>;
-  /** 仅 tf-write / tf-code 有；原文，无转义还原（tf-code = PTC 程序体） */
+  /** 仅 tf-write / tf-code / tf-call 有；原文，无转义还原（tf-code = PTC 程序体；tf-call = JSON 参数） */
   body?: string;
   /** 依赖命令 id 列表（去空、去重、保序） */
   depends_on: readonly string[];

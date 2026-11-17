@@ -58,6 +58,11 @@ export interface ModeConfigPatch {
   maxReentries: number;
   /** 任务级 token 预算（O5 阶梯分母）；undefined = 阶梯关闭 */
   budgetTokens?: number;
+  /** v0.4.0 能力档（P4）：工具面档位默认值。**不是第五个模式**——它是本模式的装配级
+   *  默认（新会话生效），显式 config.toolSurface 永远压过它（§8.1：能力档在新会话/装配时
+   *  解析，会话内不突变）。lean=core（首请求 schema 最省）、compat=off（0.3.x 回退）、
+   *  balanced/power=standard（对等优先）。 */
+  toolSurface?: 'core' | 'standard' | 'full' | 'off';
 }
 
 export interface ModeSpec {
@@ -109,6 +114,7 @@ export const MODES: readonly ModeSpec[] = [
       persistFallback: true,
       maxParallelToolCalls: 3,
       maxReentries: 8,
+      toolSurface: 'standard',
     },
   },
   {
@@ -140,6 +146,7 @@ export const MODES: readonly ModeSpec[] = [
       maxParallelToolCalls: 2,
       maxReentries: 6,
       budgetTokens: 60_000,
+      toolSurface: 'core',
     },
   },
   {
@@ -170,6 +177,7 @@ export const MODES: readonly ModeSpec[] = [
       persistFallback: true,
       maxParallelToolCalls: 1,
       maxReentries: 12,
+      toolSurface: 'off',
     },
   },
   {
@@ -200,6 +208,7 @@ export const MODES: readonly ModeSpec[] = [
       persistFallback: true,
       maxParallelToolCalls: 3,
       maxReentries: 10,
+      toolSurface: 'standard',
     },
   },
 ];

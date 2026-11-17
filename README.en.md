@@ -131,7 +131,7 @@ Mode → config mapping (explicit config > mode > built-in defaults):
 One-line decision guide: **stay on `balanced`; switch to `lean` when the bill matters;
 `compat` when diffing against the native loop; `power` for programmatic data work.**
 
-## 4. The tf-* protocol (11 commands)
+## 4. The tf-* protocol (14 commands, the v0.4.0 hard cap)
 
 The parser (`src/kernel/parser.ts`) is the authority; full semantics in
 [docs/protocol.md](docs/protocol.md).
@@ -148,6 +148,9 @@ The parser (`src/kernel/parser.ts`) is the authority; full semantics in
 | `tf-peek` | Fetch a line range from a handle | Injected on demand |
 | `tf-plan` | Declare/revise the plan and acceptance items (`- [id] description` lines) | State lives driver-side; requests carry **diffs only** |
 | `tf-final` | Finish (summary must contain the answer verbatim) | Flagged premature while acceptance items are unverified (F5) |
+| `tf-ask` (v0.4.0) | Blocking user question (`q` required; `header`/`options` comma-separated optional; maps to host ask_user_question) | The answer is injected in full (ask family, high); complex multi-question shapes via tf-call body |
+| `tf-skill` (v0.4.0) | Load a skill (`name`; maps to host skill) | Skill instructions injected in full (skill family, high); loading is session-level |
+| `tf-call` (v0.4.0) | Universal call channel: `name` = a host tool name in this session's frozen surface, body = JSON argument object (web/skill/job/schedule/goal/ask/todo/present/office/subagent all reachable) | Results classified by host tool family (read-type injected, write-type ledger); unknown-tool injects nearest-name suggestions; off with `toolSurface: off` or no host face (zero protocol chars) |
 | `tf-code` | Programmatic tool calls (**off by default**; `power` mode or explicit opt-in) | Values within the cap injected in full; over-limit → skeleton+handle; failures carry `kind` + retry verdict |
 
 Common attributes: `id` (auto-numbered when omitted), `depends_on` (cycles detected and

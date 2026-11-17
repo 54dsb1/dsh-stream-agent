@@ -113,7 +113,7 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 
 一句话决策：**默认 `balanced`；账单敏感换 `lean`；排障对照换 `compat`；写程序处理数据换 `power`。**
 
-## 4. tf-* 协议（11 条命令）
+## 4. tf-* 协议（14 条命令，v0.4.0 硬上限）
 
 语法权威是 `src/kernel/parser.ts`；完整闭环语义见 [docs/protocol.md](docs/protocol.md)。
 
@@ -130,6 +130,9 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 | `tf-plan` | 声明/修订计划与验收项（`- [id] 描述` 行） | 状态在驱动器侧，请求只注差分 |
 | `tf-final` | 收尾（summary 必须含答案原文） | 有未验证验收项时判过早（F5） |
 | `tf-code` | 程序化工具调用（**默认关闭**；`power` 或显式开启） | 上限内值完整注入；超限骨架+句柄；失败 `kind` + 可重试结论 |
+| `tf-ask`（v0.4.0） | 阻塞式提问（`q` 必填；`header`/`options` 逗号分隔可选；映射宿主 ask_user_question） | 用户回答完整注入（ask 族 high）；复杂多问/选项描述走 tf-call body |
+| `tf-skill`（v0.4.0） | 装载技能（`name` = 技能名；映射宿主 skill） | 技能说明完整注入（skill 族 high）；装载是会话级行为 |
+| `tf-call`（v0.4.0） | 通用调用通道：`name` = 本会话工具面内的宿主工具名，body = JSON 参数对象（web/skill/job/schedule/goal/ask/todo/present/office/subagent 等全部可达） | 按宿主工具分族处理（读类注入、写类回执）；unknown-tool 注入带相近工具名建议；`toolSurface: off` 或无宿主面时关闭（协议段 0 字符） |
 
 公共属性：`id`（缺省自动编号）、`depends_on`（依赖，环会被检测并具名失败）、
 `accepts`（验收关联，F5）。两条省 token 的纪律写在协议文本里：**不要读自己刚写过的文件**
@@ -272,7 +275,7 @@ npm run release:dry
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/protocol.md](docs/protocol.md) | 协议语法与闭环语义（11 条命令 + F5/F6/F7 语义） |
+| [docs/protocol.md](docs/protocol.md) | 协议语法与闭环语义（12 条命令 + F5/F6/F7 + tf-call 语义） |
 | [docs/limitations.md](docs/limitations.md) | 已知限制（按"你会不会踩到"排序，每条带取证） |
 | [docs/adr-001-segment-boundary.md](docs/adr-001-segment-boundary.md) | 长会话段边界 ADR（整块丢弃 vs 宿主压缩的决策） |
 | [docs/disabled-lines-audit.md](docs/disabled-lines-audit.md) | 禁用行审计表（S5：每条停用/保留的依据） |

@@ -127,7 +127,7 @@ const presetRows = insertRows(join(pkgRoot, 'preset.yml'));
   for (const readmePath of readmes) {
     const text = readFileSync(readmePath, 'utf8');
     // 命令表：0.3.0 全部 tf-* 命令都要在 README 出现
-    for (const cmd of ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan']) {
+    for (const cmd of ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan', 'tf-call', 'tf-ask', 'tf-skill']) {
       if (!text.includes(cmd)) failures.push(`检查4 ${readmePath.split(/[\\/]/).pop()} 缺命令 ${cmd}`);
     }
     // K1 装配断言：enableCode: false 必须在 patch/preset，README 不得宣称默认开启
@@ -137,10 +137,56 @@ const presetRows = insertRows(join(pkgRoot, 'preset.yml'));
   notes.push(`检查4 README 命令表/enableCode 断言：通过（dist ${distCount} 个文件，README 数字由 npm test 实测回填）`);
 }
 
+// ---- 检查 5（v0.4.0 G2）：协议命令表 ≤ 14（11 tf-* 基础 + tf-call + tf-ask + tf-skill 上限）----
+{
+  const parserSrc = readFileSync(join(pkgRoot, 'src', 'kernel', 'parser.ts'), 'utf8');
+  const namesBlock = parserSrc.match(/const COMMAND_NAMES: readonly TfCommandName\[\] =\s*\[([^\]]*)\]/);
+  if (namesBlock === null) {
+    failures.push('检查5 parser.ts 缺 COMMAND_NAMES 清单（命令表唯一权威）');
+  } else {
+    const commands = namesBlock[1].split(',').map((s) => s.trim().replace(/'/g, '')).filter((s) => s.startsWith('tf-'));
+    if (commands.length > 14) {
+      failures.push(`检查5 协议命令表 ${commands.length} 条 > 14 硬上限（G2/§6.4：第 15 条必须走 ADR + 退役一条）`);
+    } else {
+      notes.push(`检查5 协议命令表 ${commands.length}/14：${commands.join(', ')}`);
+    }
+    const readmePath = join(pkgRoot, 'README.md');
+    if (existsSync(readmePath)) {
+      const readme = readFileSync(readmePath, 'utf8');
+      const countMatch = readme.match(/(\d+)\s*(?:条|个)?(?:命令|指令)/);
+      if (countMatch !== null && Number(countMatch[1]) !== commands.length) {
+        failures.push(`检查5 README 宣称 ${countMatch[1]} 条命令，parser 实际 ${commands.length} 条`);
+      }
+    }
+  }
+}
+
+// ---- 检查 6（v0.4.0 R3）：preset 声明行 ↔ 对等矩阵一致（G1 的装配面取证）----
+{
+  const presetPath = join(pkgRoot, 'preset', 'stream', 'cordis.patch.yml');
+  const parityPath = join(pkgRoot, 'docs', 'capability-parity.md');
+  if (!existsSync(presetPath) || !existsSync(parityPath)) {
+    failures.push('检查6 缺 preset/stream/cordis.patch.yml 或 docs/capability-parity.md（R3 一致性检查的两侧）');
+  } else {
+    const preset = readFileSync(presetPath, 'utf8');
+    const parity = readFileSync(parityPath, 'utf8');
+    const requiredRows = ['dsh-tool-fs', 'dsh-tool-fs-search', 'dsh-tool-jobs', 'dsh-tool-schedule', 'dsh-tool-skill', 'dsh-skill-filesystem', 'dsh-tool-goal', 'dsh-command-goal', 'dsh-tool-subagent', 'dsh-tool-ask-user', 'dsh-tool-todo', 'dsh-tool-web', 'dsh-tool-present', 'dsh-tool-office'];
+    for (const row of requiredRows) {
+      if (!preset.includes(`name: '@deepseek-ai/${row}'`)) failures.push(`检查6 preset/stream 缺宿主包行 ${row}（矩阵声明可达，装配缺行 = 不可达，G1 漂移）`);
+    }
+    if (preset.includes('dsh-tool-workflow') || preset.includes('dsh-workflow-ptc')) {
+      failures.push('检查6 preset/stream 声明了 workflow 行（§5.2 非目标：与 ptc 对齐停用）');
+    }
+    const matrixRows = parity.split('\n').filter((l) => l.startsWith('| ') && !l.includes('模型可见工具') && !l.includes('---'));
+    if (matrixRows.length < 15) failures.push(`检查6 矩阵行数 ${matrixRows.length} < 15（G1 逐工具取证不全）`);
+    else notes.push(`检查6 preset 声明 ↔ 矩阵一致：${requiredRows.length} 个宿主包行齐备，${matrixRows.length} 行矩阵全覆盖，workflow 未声明`);
+  }
+}
+
 for (const note of notes) console.log(`[check] ${note}`);
 if (failures.length > 0) {
   console.error('[check] 失败：');
   for (const f of failures) console.error(`  - ${f}`);
   process.exit(1);
 }
-console.log('[check] 4/4 全绿：entry 集 / inject / 装载顺序 / README 数字与命令表。');
+console.log('[check] 6/6 全绿：entry 集 / inject / 装载顺序 / README 数字与命令表 / 命令表上限 / 矩阵一致。');

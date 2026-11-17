@@ -278,6 +278,13 @@ export function createCodeExecutor(
                                                                                 
                                                        
                       
+                                                     
+                                                                
+                                    
+                                               
+                                                              
+                                                
+                                 
    ,
 )               {
   return async (input) => {
@@ -298,26 +305,47 @@ export function createCodeExecutor(
       }, maxWallMs);
     }
 
+    // v0.4.0（P5）：绑定并发闸（简单信号量：上限内直接过，超上限 FIFO 排队）。
+    const maxParallelBindings = Math.max(1, deps.maxParallelBindings ?? 4);
+    let inFlight = 0;
+    const waiters                    = [];
+    const acquireBindingSlot = async ()                => {
+      if (inFlight < maxParallelBindings) {
+        inFlight += 1;
+        return;
+      }
+      await new Promise      ((resolve) => waiters.push(resolve));
+      inFlight += 1;
+    };
+    const releaseBindingSlot = ()       => {
+      inFlight -= 1;
+      const next = waiters.shift();
+      if (next !== undefined) next();
+    };
+    const runBinding = (name        , args         )                   =>
+      (async () => {
+        const over = quota.onSubcall();
+        if (over !== null) throw new Error(`quota-exceeded: ${over}`);
+        await acquireBindingSlot();
+        try {
+          return await runOneBinding(deps, name, args, input.callId, controller.signal, input.agent);
+        } finally {
+          releaseBindingSlot();
+        }
+      })();
+
+    // 绑定集 = 固定三绑定（旧程序体不破，§8.4）+ 冻结工具面（P5：与 ptc 的"SDK 由 toolSet
+    // 生成"同构；面内新增工具按名挂载，面缺席 = 0.3.x 行为）。
+    const surfaceNames = deps.surfaceToolNames?.() ?? [];
+    const fixedNames = ['write', 'read', 'pwsh'];
+    const bindingNames = [...fixedNames, ...surfaceNames.filter((n) => !fixedNames.includes(n))];
     const bindings = [
       {
         global: 'tools',
-        functions: {
-          write: (args         ) => {
-            const over = quota.onSubcall();
-            if (over !== null) throw new Error(`quota-exceeded: ${over}`);
-            return runOneBinding(deps, 'write', args, input.callId, controller.signal, input.agent);
-          },
-          read: (args         ) => {
-            const over = quota.onSubcall();
-            if (over !== null) throw new Error(`quota-exceeded: ${over}`);
-            return runOneBinding(deps, 'read', args, input.callId, controller.signal, input.agent);
-          },
-          pwsh: (args         ) => {
-            const over = quota.onSubcall();
-            if (over !== null) throw new Error(`quota-exceeded: ${over}`);
-            return runOneBinding(deps, 'pwsh', args, input.callId, controller.signal, input.agent);
-          },
-        },
+        functions: Object.fromEntries(bindingNames.map((name) => [
+          name,
+          (args         ) => runBinding(name, args),
+        ])),
       },
     ];
 
