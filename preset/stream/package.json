@@ -1,6 +1,6 @@
 {
   "name": "@hugesb/dsh-stream-agent-preset-stream",
-  "version": "0.3.1",
+  "version": "0.4.0-beta.1",
   "private": true,
   "description": "S4 preset-stream 独立 bundle：只声明 stream preset 的映射工具面（write/read/edit/pwsh/bash/grep/glob）。不进主 bundle patch——B 形态安装（装进既有 profile）不得污染其 preset 列表。",
   "type": "module",
