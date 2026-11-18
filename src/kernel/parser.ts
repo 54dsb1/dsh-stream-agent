@@ -45,6 +45,10 @@
  *   其余（calls 包装行等）以 malformed(dsml-wrapper) 上报后丢弃，只记台账不注入。
  * - 未闭合即流终止 → truncated 事件（loop 据此决定重入策略）；
  * - depends_on 环 → cycle 事件（路径首尾相同，如 [a, b, a]）。
+ * - 孤立闭合标签（v0.3.1 截断修复）：ground 模式下出现的 `</tf-xxx>`（前面没有配对打开，
+ *   典型是模型把自闭合命令又"关闭"了一次）一律按 malformed(stray-close-tag) 记账后丢弃，
+ *   绝不作 prose 透传——0.3.1 真机证据：这类残片会以纯文本落进 assistant/message，
+ *   桌面端正文里出现裸的 `</tf-bash>`。
  *
  * 事件类型：text / command / malformed / truncated / cycle / done。
  * 命令闭合立即 emit，不等流结束；"当前可执行集合"用 readyCommands() 查询
@@ -130,7 +134,7 @@ export type ParserEvent =
 // ---------------------------------------------------------------------------
 
 type Mode = 'ground' | 'header' | 'body';
-type TagProbe = 'tag' | 'prose' | 'tf-unknown' | 'need-more' | 'dsml';
+type TagProbe = 'tag' | 'prose' | 'tf-unknown' | 'close-tag' | 'need-more' | 'dsml';
 
 export class TfStreamParser {
   private buf = '';
@@ -196,6 +200,10 @@ export class TfStreamParser {
       } else if (tailProbe === 'dsml') {
         if (lt > 0) events.push({ type: 'text', text: this.buf.slice(0, lt) });
         events.push({ type: 'malformed', raw: tail, reason: 'dsml-wrapper' });
+      } else if (tail.startsWith('</tf-') && (tailProbe === 'close-tag' || tailProbe === 'need-more')) {
+        // v0.3.1：孤立闭合标签（含被流截断的半截）——记账丢弃，不进 prose
+        if (lt > 0) events.push({ type: 'text', text: this.buf.slice(0, lt) });
+        events.push({ type: 'malformed', raw: tail, reason: `stray-close-tag:${closeTagName(tail)}` });
       } else if (this.buf !== '') {
         events.push({ type: 'text', text: this.buf });
       }
@@ -241,6 +249,16 @@ export class TfStreamParser {
     }
     const probe = probeTag(this.buf.slice(lt));
     if (probe === 'need-more') return false;
+    if (probe === 'close-tag') {
+      // v0.3.1：孤立闭合标签——前面没有配对打开（自闭合命令被多关一次、或模型手写了
+      // 残片）。按协议违规记账后丢弃，绝不作为 prose 落进正文。
+      const gt = this.buf.indexOf('>', lt);
+      const raw = gt === -1 ? this.buf.slice(lt) : this.buf.slice(lt, gt + 1);
+      if (lt > 0) events.push({ type: 'text', text: this.buf.slice(0, lt) });
+      this.buf = gt === -1 ? '' : this.buf.slice(gt + 1);
+      events.push({ type: 'malformed', raw, reason: `stray-close-tag:${closeTagName(raw)}` });
+      return true;
+    }
     if (probe === 'prose') {
       // '<' 是普通文本的一部分：原样透传，从 '<' 之后继续扫
       events.push({ type: 'text', text: this.buf.slice(0, lt + 1) });
@@ -440,6 +458,12 @@ function isDsmlTag(raw: string): boolean {
   return DSML_TAG_RE.test(raw);
 }
 
+/** 从孤立闭合标签原文取命令名（`</tf-bash>` → `tf-bash`；半截标签 → `?`）。 */
+function closeTagName(raw: string): string {
+  const m = /^<\/\s*(tf-[a-z0-9-]*)/.exec(raw);
+  return m === null ? '?' : m[1]!;
+}
+
 /**
  * 尝试把 DSML 头部改写为等价 tf-* 头部。
  * 可改写形态：`<｜｜DSML｜｜ invoke name="tf-xxx" 其余属性/>`（或配对打开）——
@@ -539,6 +563,15 @@ function probeTag(s: string): TagProbe {
   // DSML 噪声（v0.3.1）："<" 后直接跟全角竖线（U+FF5C）——协议没有任何合法形式以
   // "<｜"（或 "</｜"）开头，无需等待更多数据即可判定（不再作为 prose 透传）。
   if (s[1] === '｜' || (s[1] === '/' && s[2] === '｜')) return 'dsml';
+  // 孤立闭合标签（v0.3.1 截断修复）：'</tf-xxx>' 只在 body 模式由 stepBody 消费；
+  // 出现在 ground = 没有配对打开。判 'close-tag' 后调用方记账丢弃（绝不落进 prose）。
+  // 必须放在已知命令名扫描之前：'</tf-' 永远不匹配 '<tf-' 候选，留到最后会被误判 prose。
+  if (s.startsWith('</')) {
+    if ('</tf-'.startsWith(s)) return 'need-more'; // '</' / '</t' / '</tf' / '</tf-'：闭合标签开头
+    if (/^<\/tf-[a-z0-9-]*\s*>/.test(s)) return 'close-tag';
+    if (/^<\/tf-?[a-z0-9-]*$/.test(s)) return 'need-more'; // 还没等到 '>'
+    return 'prose'; // '</div>' 之类：确属正文
+  }
   for (const name of COMMAND_NAMES) {
     const open = `<${name}`;
     if (s.length <= open.length) {

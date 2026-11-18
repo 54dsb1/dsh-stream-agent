@@ -31,6 +31,7 @@ import { ContextRenderer, renderHash } from '../kernel/render.ts';
 import type { RenderMessage } from '../kernel/render.ts';
 import { ObservationLedger } from '../kernel/obs.ts';
 import type { ObservationResult } from '../kernel/obs.ts';
+import { checkFinalSummary } from '../kernel/final.ts';
 import {
   appendLedgerRecord,
   createJsonlPersistence,
@@ -747,6 +748,17 @@ export class SingleStreamDriver {
   #segmentKeepFrom = 0;
   /** ok 的 tf-final 候选（解析序）；任务最终答案取最后一个（过早 final 可被后继覆盖） */
   #finalCandidates: Array<{ cmdId: string; summary: string; turn: number; step: number }> = [];
+  /** v0.3.1 截断修复：回合级命令序（跨请求单调递增）。
+   *  final 之后又发过命令 → 这条 final 已被后续工作作废，必须在流末重发（#lastNonFinalOrder > #lastFinalOrder）。 */
+  #cmdOrder = 0;
+  #lastFinalOrder = 0;
+  #lastNonFinalOrder = 0;
+  /** 已提示过的 final 拒绝（key = 拒绝 kind）；同类问题只注入一次，二次不放行也不重复烧注入 */
+  #reportedFinalRejects = new Set<string>();
+  /** 重复命令的原结果回灌队列（幂等重发不重执行，但把内容回灌给丢失上下文的模型） */
+  #pendingReplays: Array<{ cmdId: string; name: string; handle: string }> = [];
+  #replays = 0;
+  #replayCapped = false;
   /** v0.3.1：当前流内的 prose 累积（parser 的 text 事件拼接；落盘 assistant/message 的正文）。
    *  0.3.0 落盘的是整段原文（含 tf-* 标记与 DSML 噪声）——桌面端过程区把协议标记渲染成乱码，
   *  本版起落盘纯 prose：命令事实在台账（plugin:tf-agent/*），会话日志只留用户可读内容。 */
@@ -1150,6 +1162,14 @@ export class SingleStreamDriver {
     this.#reentryCount = 0;
     this.#finalNudges = 0;
     this.#finalOnlyRequests = 0;
+    // v0.3.1：final 收束闸的回合级状态（命令序按回合重置——上一回合的 final 不得收敛本回合）
+    this.#cmdOrder = 0;
+    this.#lastFinalOrder = 0;
+    this.#lastNonFinalOrder = 0;
+    this.#reportedFinalRejects.clear();
+    this.#pendingReplays = [];
+    this.#replays = 0;
+    this.#replayCapped = false;
     let reason: TurnEndReason = { kind: 'blocked', detail: 'turn loop exited without convergence' };
 
     while (true) {
@@ -1256,9 +1276,19 @@ export class SingleStreamDriver {
         this.#ledgerWrite('plugin:tf-agent/fault', { fault: `stream-${streamOutcome.finish.kind}`, detail: finishDetail(streamOutcome.finish), turn });
       }
 
-      // ---- 过早 final 检测（真连 R3/R4 教训）：占位 final 不算收敛，注入引导重发 ----
-      const lastFinal = this.#finalCandidates.length > 0 ? this.#finalCandidates[this.#finalCandidates.length - 1] : undefined;
+      // ---- final 收束闸（真连 R3/R4 教训 + v0.3.1 截断修复）----
+      // 四类拒绝，任一成立都说明"这条 final 不能作为交付答案"：
+      //   ① depends_on 未满足 / ② 仍有命令未完成（原有过早判定）
+      //   ③ summary 是占位（placeholder / 占位 / 空……）—— 0.3.1 真机证据：写成
+      //      `summary="placeholder"` 的 final 被照单全收，用户侧看到的就是"截断 + 一句占位"
+      //   ④ 这条 final 之后又发过命令 —— 模型写完 final 又继续干活，旧答案已过期，
+      //      必须在本流末尾重新声明（0.3.1 同一会话：第 4 步的 final 被第 7 步复用为答案）
+      // 拒绝只注入一次（同 cmdId+kind）：二次不放行、也不重复烧注入，交给 nudge 护栏收束。
+      const candidate = this.#finalCandidates.length > 0 ? this.#finalCandidates[this.#finalCandidates.length - 1] : undefined;
+      // 回合归属：上一回合的 final（或 resume 回放 turn=0）不得充当本回合答案
+      const lastFinal = candidate !== undefined && candidate.turn === turn ? candidate : undefined;
       let prematureFinal: string | undefined;
+      let rejectedFinal: string | undefined;
       if (lastFinal !== undefined && level !== 'final-only') {
         const finalRec = this.#commands.get(lastFinal.cmdId);
         const unmetDeps = (finalRec?.cmd.depends_on ?? []).filter((d) => this.#commands.get(d)?.status !== 'ok');
@@ -1276,9 +1306,32 @@ export class SingleStreamDriver {
             prematureFinal = `tf-final 过早：计划有 ${open.length} 项验收未验证（${open.map(([id]) => id).join(', ')}）——完成对应命令并用 accepts="..." 声明回执，或用 tf-plan 修订计划（显式移除不再需要的项）。`;
           }
         }
+        // ③④ 内容面：占位 summary / 过期 final
+        let hardIssue: { kind: string; detail: string } | undefined;
+        if (prematureFinal === undefined) {
+          const summaryIssue = checkFinalSummary(lastFinal.summary);
+          if (summaryIssue !== null) {
+            hardIssue = { kind: summaryIssue.kind, detail: `tf-final 无效：${summaryIssue.detail}` };
+          } else if (this.#lastFinalOrder > 0 && this.#lastNonFinalOrder > this.#lastFinalOrder) {
+            hardIssue = {
+              kind: 'stale',
+              detail: 'tf-final 无效：这条 final 之后又发出了命令（答案已过期）——请在本流末尾用新 id 重新输出 tf-final，summary 写最终答案原文',
+            };
+          }
+        }
+        if (hardIssue !== undefined) {
+          // key 只按 kind：换新 id 再写一次占位/过期 final，是同一个毛病，不再重复烧注入
+          if (this.#reportedFinalRejects.has(hardIssue.kind)) {
+            // 已提示过仍未改：不重复注入，也不放行收敛（走 nudge / blocked，如实收场）
+            rejectedFinal = hardIssue.detail;
+          } else {
+            this.#reportedFinalRejects.add(hardIssue.kind);
+            prematureFinal = hardIssue.detail;
+          }
+        }
       }
 
-      const finalSeen = this.#finalSeen && prematureFinal === undefined;
+      const finalSeen = lastFinal !== undefined && prematureFinal === undefined && rejectedFinal === undefined;
       // steer 在本流期间到达 → 不能带着未消费的 steer 收敛（对齐内建：插话必须被下一步看到）
       const pendingSteerCount = this.#pendingSteers.length;
       const needsReentry = issues.length > 0 || injections.blocks.length > 0 || prematureFinal !== undefined || pendingSteerCount > 0;
@@ -1327,7 +1380,12 @@ export class SingleStreamDriver {
         } else if (finalOnlyGate) {
           reason = { kind: 'blocked', detail: '预算进入 final-only 档：停止一切注入，降级交付（已完成/未完成见台账）' };
         } else if (nudgeExhausted) {
-          reason = { kind: 'blocked', detail: '流终止且无 tf-final、无重入事由（提示一次后仍未收敛）' };
+          reason = {
+            kind: 'blocked',
+            detail: rejectedFinal !== undefined
+              ? `final 被拒且未重发（${rejectedFinal}）：不把占位/过期答案当交付`
+              : '流终止且无 tf-final、无重入事由（提示一次后仍未收敛）',
+          };
         } else {
           reason = { kind: 'blocked', detail: `重入次数达到上限 ${this.#cfg.maxReentries}` };
         }
@@ -1342,6 +1400,10 @@ export class SingleStreamDriver {
       this.#renderer.appendHandleDelta(delta);
 
       let tail = injections.blocks;
+      // v0.3.1：重复命令的原结果回灌。只在此处（确实要发下一请求）才物化——
+      // 上面所有收敛/阻断分支都已 break，不会白记账、也不会白读内容。
+      const replays = this.#materializeReplays();
+      if (replays.length > 0) tail = [...tail, ...replays];
       if (tail.length === 0 && !finalSeen) {
         if (level === 'final-only') {
           // O5 >90% 档：停止一切注入，输出降级交付（已完成/未完成/已排除见台账），只收 tf-final
@@ -1354,7 +1416,12 @@ export class SingleStreamDriver {
         } else {
           // 无重入事由但也没 tf-final：一次性提示（护栏防无限循环）
           this.#finalNudges += 1;
-          tail = [{ role: 'user' as const, content: '[tf-stream:nudge] 输出已终止但未收到 tf-final。若任务已完成请输出 tf-final；否则继续输出剩余 tf-* 命令。' }];
+          tail = [{
+            role: 'user' as const,
+            content: rejectedFinal !== undefined
+              ? `[tf-stream:nudge] 上一条 tf-final 被拒（${rejectedFinal}）。请继续任务并在流末尾用新 id 重发 tf-final，summary 写最终答案原文；任务确实没做完就如实写明未完成项。`
+              : '[tf-stream:nudge] 输出已终止但未收到 tf-final。若任务已完成请输出 tf-final；否则继续输出剩余 tf-* 命令。',
+          }];
           this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'missing-final-nudge' });
         }
       }
@@ -1372,10 +1439,6 @@ export class SingleStreamDriver {
     }
     this.#ledgerWrite('plugin:tf-agent/step', { turn, steps: step, requests: this.#requestCount, usage: { ...this.#usage }, reason: reason.kind });
     return reason;
-  }
-
-  get #finalSeen(): boolean {
-    return this.#commands.size > 0 && [...this.#commands.values()].some((rec) => rec.cmd.name === 'tf-final' && rec.status === 'ok');
   }
 
   // ------------------------------------------------------------------ 流消费
@@ -1636,6 +1699,10 @@ export class SingleStreamDriver {
   }
 
   #onCommand(cmd: TfCommand, turn: number, step: number): void {
+    // v0.3.1：回合级命令序（跨请求单调）。final 之后又发过非 final 命令 → 那条 final 过期
+    //（模型写完 final 又继续干活；旧答案不能当成交付内容）。
+    const order = ++this.#cmdOrder;
+    if (cmd.name !== 'tf-final') this.#lastNonFinalOrder = order;
     const prev = this.#commands.get(cmd.id);
     if (prev !== undefined) {
       // ---- 重复 id 语义（对齐上游 ThinkFlow DESIGN.md：重复 id 不能伪造成功）----
@@ -1649,12 +1716,18 @@ export class SingleStreamDriver {
         // tf-final 无副作用，且模型反复复用同一 id 更新答案（deepseek-flash 真连实证）：
         // 同 id 携带新 summary = 覆盖最终答案（last-wins）；同 summary = 幂等原回执。
         // "重复 id 不能伪造成功"不受影响——final 不产生副作用，只是声明。
+        // v0.3.1：无论覆盖还是幂等，都算"本流末尾又声明了一次" → 刷新 final 序（不再判过期）。
+        this.#lastFinalOrder = order;
         if (commandFingerprint(prev.cmd) === fp) {
           this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: 'duplicate-idempotent: 返回原回执' });
         } else {
           const summary = cmd.attrs['summary'] ?? '';
           const cand = this.#finalCandidates.find((c) => c.cmdId === cmd.id);
-          if (cand !== undefined) cand.summary = summary;
+          if (cand !== undefined) {
+            cand.summary = summary;
+            cand.turn = turn;
+            cand.step = step;
+          }
           this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: summary });
           this.#record({ seq: ++DRIVER_SEQ, kind: 'final', summary });
           this.#ledgerWrite('plugin:tf-agent/final', { summary, turn, step, cmdId: cmd.id, superseded: true });
@@ -1669,6 +1742,7 @@ export class SingleStreamDriver {
             handle: prev.handle,
           });
           this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'duplicate-idempotent' });
+          this.#queueReplay(cmd, prev);
         } else {
           this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'rejected', detail: 'duplicate-id: 同 id 已被不同内容占用，请换新 id' });
         }
@@ -1695,12 +1769,68 @@ export class SingleStreamDriver {
       // 引导用新 id 重发（2026-11-15 真连 R3/R4 教训：占位 final 会永久占用 finalSeen）。
       record.status = 'ok';
       record.detail = cmd.attrs['summary'] ?? '';
+      this.#lastFinalOrder = order;
       this.#finalCandidates.push({ cmdId: cmd.id, summary: record.detail, turn, step });
       this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: record.detail });
       this.#record({ seq: ++DRIVER_SEQ, kind: 'final', summary: record.detail });
       this.#ledgerWrite('plugin:tf-agent/final', { summary: record.detail, turn, step, cmdId: cmd.id });
     }
     this.#dispatchReady(turn, step);
+  }
+
+  /**
+   * v0.3.1 截断修复：重复命令的原结果回灌（幂等语义不变，不重执行）。
+   *
+   * 为什么需要：观测内容只在"易变尾"注入一次，跨请求即消失（历史里只剩句柄目录行）。
+   * 模型丢失上下文后最自然的动作就是把同一条 read/glob 再发一次——0.3.1 只回
+   * "duplicate-idempotent（handle=…）"，模型仍然一无所获，于是原地打转（真机会话
+   * `session-84274277` 第 3–7 步连续 glob 同一 pattern），最后用 `summary="placeholder"`
+   * 收场。这里把原观测按既有上限回灌一次，给模型一条低成本的恢复路径。
+   */
+  #queueReplay(cmd: TfCommand, prev: CommandRecord): void {
+    if (prev.status !== 'ok') return;
+    if (prev.handle === undefined || prev.handle === '') return;
+    if (!REPLAYABLE_COMMANDS.has(cmd.name)) return;
+    if (this.#pendingReplays.length >= MAX_REPLAY_INJECTIONS) {
+      // 同一条重复命令反复重发：只记一次 fault，不重复刷台账
+      if (!this.#replayCapped) {
+        this.#replayCapped = true;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'replay-capped', detail: `重复命令回灌已达上限 ${MAX_REPLAY_INJECTIONS}` });
+        this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'replay-capped', cap: MAX_REPLAY_INJECTIONS });
+      }
+      return;
+    }
+    // 只登记意图：内容在真正装配进下一次请求时才 peek（收敛路径直接丢弃，
+    // 不占 injected 计数——injected 口径是"确实进入模型上下文的观测负载"）。
+    this.#pendingReplays.push({ cmdId: cmd.id, name: cmd.name, handle: prev.handle });
+  }
+
+  /** 把待回灌的重复命令物化成注入块（仅在轮到它们进入下一次请求时调用）。 */
+  #materializeReplays(): RenderMessage[] {
+    if (this.#pendingReplays.length === 0) return [];
+    const limit = this.#cfg.readFeedbackLimit ?? DEFAULT_READ_FEEDBACK_LIMIT;
+    const out: RenderMessage[] = [];
+    for (const item of this.#pendingReplays) {
+      const content = this.#obs.peek(item.handle, 1, Number.MAX_SAFE_INTEGER);
+      if (content === null || content === '') continue;
+      this.#replays += 1;
+      const body = content.length <= limit
+        ? content
+        : `${content.slice(0, limit)}\n……（原结果超长，已截断 ${content.length - limit} 字符；用 tf-peek handle="${item.handle}" from_line=.. to_line=.. 精确取回）`;
+      out.push({
+        role: 'user',
+        content: `[tf-stream:replay id=${item.cmdId} name=${item.name} handle=${item.handle}]\n`
+          + '这条命令与之前完全相同（幂等）：没有重复执行，以下回灌它的原结果。\n'
+          + `${body}\n（需要其它行段用 tf-peek handle="${item.handle}" from_line=.. to_line=..）`,
+      });
+      this.#record({
+        seq: ++DRIVER_SEQ, kind: 'observation',
+        handle: item.handle, key: `replay:${item.cmdId}`, infoGain: 'high', reason: 'duplicate-replay',
+      });
+      this.#ledgerWrite('plugin:tf-agent/command', { cmdId: item.cmdId, name: item.name, status: 'duplicate-replay', handle: item.handle, chars: content.length });
+    }
+    this.#pendingReplays = [];
+    return out;
   }
 
   /** 派发所有就绪命令（依赖全部 ok、未派发），并发上限 maxParallelToolCalls。
@@ -2418,6 +2548,18 @@ function readFeedbackBody(full: string | null, skeleton: string, limit: number):
   const omitted = full.length - headCut - tailCut;
   return `${full.slice(0, headCut)}\n……（中段省略 ${omitted} 字符；tf-peek handle=<句柄> from_line=.. to_line=.. 精确取回）……\n${full.slice(full.length - tailCut)}`;
 }
+
+/** v0.3.1 截断修复：可回灌原结果的重复命令（信息类，无副作用）。
+ *  模型把同一条读/搜/命令又发一次时，原实现只回"duplicate-idempotent（handle=…）"——
+ *  上下文里已没有内容（观测只在易变尾注入一次），模型拿不到任何事实，只能再猜再读，
+ *  直到用占位 final 收场。幂等语义不变（不重复执行），但把原结果回灌一次。
+ *  v0.4.0：加入 tf-call（通用调用通道是 v0.4 的主要取数路径——web_search / 宿主只读工具
+ *  重发同样会"空手打转"）。回灌只复读上次观测，不重跑工具，故对写类工具也无副作用；
+ *  仍以"有 handle 才回灌"为闸（无内容可回灌时自然跳过）。 */
+const REPLAYABLE_COMMANDS: ReadonlySet<string> = new Set(['tf-read', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-call']);
+
+/** 每回合最多回灌次数（防"模型原地打转 → 每步都回灌"的 token 黑洞；超限记 fault 不静默） */
+const MAX_REPLAY_INJECTIONS = 4;
 
 /** K4：识别取消类错误（AbortError / DOMException AbortError / 显式 abort 消息），与超时分账。 */
 function isAbortError(error: unknown): boolean {

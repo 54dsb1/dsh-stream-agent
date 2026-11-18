@@ -2,6 +2,43 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-11-18
+
+**任务半途截断修复（与 0.3.1 同一套修法，移植到 0.4 能力面）。beta 交付。**
+
+0.4.0 自 0.3.1 分叉，分叉点在截断修复之前——因此 0.3.1 的四条根因在 0.4 线上同样成立。
+本版把 `a8b4111`（v0.3.1 截断修复）按三条命令路径逐一移植，并补上 0.4 新增通道的适配。
+除截断修复外无其它运行时变更（能力面与 0.4.0-beta.1 相同）。
+
+### Fixed（任务半途截断 —— 占位 final / 过期 final / 重复命令 / 孤立闭合标签）
+
+- **占位 final 被照单全收**：新增 `src/kernel/final.ts`（纯函数、零 IO）做 summary 质量闸：
+  空 → `empty`，占位形态（`placeholder` / `占位` / `TODO` / `TBD` / `N/A` / `待补` /
+  纯标点 …）→ `placeholder`；判据刻意保守（`done`、`已完成` 这类短答案放行，不猜"够不够
+  详细"）。被拒 → 注入 `[tf-stream:error]` 结构化原因，同类拒绝只注入一次；屡教不改 →
+  `blocked` 如实收场，不把占位当交付。
+- **过期 final 仍被当答案**：回合级命令序（`#cmdOrder` / `#lastFinalOrder` /
+  `#lastNonFinalOrder`）——final 之后又发出任何非 final 命令即判 `stale`，必须在本流末尾
+  重新声明；final 候选按**回合归属**过滤（上一回合 / resume 回放 `turn=0` 不得收敛本回合）；
+  同 id 覆盖式重发刷新 final 序，不误判过期。
+- **重复命令空手而归**：观测只在"易变尾"注入一次，跨请求即消失；模型丢上下文后重发同一条
+  命令，旧实现只回 `duplicate-idempotent（handle=…）`。新增 `#queueReplay` /
+  `#materializeReplays`：幂等语义不变（**不重复执行**），原结果按既有上限回灌
+  （`[tf-stream:replay]` + handle 与 `tf-peek` 指引），每回合上限 4 次，超限记
+  `replay-capped`。回灌**延迟物化**——只在真要发下一次请求时 `peek`，收敛/阻断路径直接丢弃，
+  不占 `injected` 计数。0.4 适配：`tf-call`（通用调用通道，0.4 的主取数路径）并入可回灌集合
+  ——`web_search` 等宿主工具重发同样会空手打转；回灌只复读上次观测、不重跑工具，仍有
+  "有 handle 才回灌"为闸。
+- **孤立闭合标签落进正文**：`</tf-xxx>` 在 ground 态无配对打开（自闭合命令被多关一次、或
+  模型手写残片），旧 parser 判 prose 透传 → 桌面端正文出现裸协议残片。现按
+  `malformed(stray-close-tag:<name>)` 记账丢弃，跨 chunk 与流末半截同样处理；`</div>` 这类
+  普通 HTML 闭合不误伤。0.4 的 14 条命令表（tf-call / tf-ask / tf-skill）由通用正则覆盖，
+  无需逐名登记。
+
+回归：**320 用例全绿**，新增 9 条——`K1` 占位 final 被拒后重发真答案、`K2` final 后又发命令
+判过期、`K3` 重复命令回灌原结果、`K4` 屡教不改不交付占位答案；解析器 4 条（孤立标签 /
+跨 chunk / 流末半截 / HTML 闭合不误伤）；`S15` tf-call 重复回灌（0.4 通道适配）。
+
 ## [0.4.0-beta.1] - 2026-11-18
 
 **能力对等 beta（G1-G3）+ 工具面真实化（P1）+ 通用调用通道（P2/G2）+ 对等装配面（P3）+ 模式切换（P4）+ PTC 对等（P5）+ 基线度量（P0）。**

@@ -388,3 +388,63 @@ test('S14. 命令表上限（G2）：14 条到达硬上限，检查5 口径与 p
   const count = names![1]!.split(',').filter((s) => s.includes('tf-')).length;
   assert.equal(count, 14, 'tf-call + tf-ask + tf-skill = 14（§6.4 硬上限）');
 });
+
+test('S15. tf-call 重复（幂等）→ 回灌原结果（v0.3.1 截断修复在 v0.4 通用通道同样生效）', async () => {
+  // 0.3.1 真机形态：模型丢失上下文后把同一条取数命令再发一次，若只回
+  // "duplicate-idempotent（handle=…）"，模型手里仍然没有内容，只能再猜再读，
+  // 最后用占位 final 收场。这里断言：不重执行（executed 只 1 次）+ 原结果回灌进下一请求。
+  const executed: Array<{ name: string; arguments: string }> = [];
+  const requestTexts: string[] = [];
+  const scripts: StreamChunkLike[][] = [
+    [
+      { type: 'block-start', index: 0, blockType: 'text' } as never,
+      { type: 'text-delta', index: 0, text: '<tf-call name="web_search" id="c1">{"query":"dsh parity"}</tf-call>' } as never,
+      { type: 'finish', reason: { kind: 'stop' } } as never,
+    ],
+    [
+      { type: 'block-start', index: 0, blockType: 'text' } as never,
+      { type: 'text-delta', index: 0, text: '<tf-call name="web_search" id="c1">{"query":"dsh parity"}</tf-call>' } as never,
+      { type: 'finish', reason: { kind: 'stop' } } as never,
+    ],
+    [
+      { type: 'block-start', index: 0, blockType: 'text' } as never,
+      { type: 'text-delta', index: 0, text: '<tf-final id="f2" summary="搜索结果：dsh parity 已确认"/>' } as never,
+      { type: 'finish', reason: { kind: 'stop' } } as never,
+    ],
+  ];
+  let request = 0;
+  const session = {
+    id: 's-replay',
+    header: { id: 's-replay' },
+    append() { return { seq: 1 }; },
+  };
+  const driver = new SingleStreamDriver({
+    stream: (options) => {
+      requestTexts.push(options.messages.map((m) => m.content.map((b) => b.text ?? '').join('\n')).join('\n'));
+      const chunks = scripts[Math.min(request, scripts.length - 1)]!;
+      request += 1;
+      return (async function* () { for (const c of chunks) yield c; })();
+    },
+    executeTools: async (input: ToolBatchInputLike) => {
+      for (const call of input.calls) executed.push({ name: call.name, arguments: call.arguments });
+      return {
+        results: input.calls.map((call) => ({
+          callId: call.id,
+          result: { content: [{ type: 'text', text: `ok: ${call.name} ${call.arguments}` }], isError: false },
+        })),
+        additionalContexts: [],
+        concluded: false,
+      };
+    },
+    toolsService: fakeToolsService(),
+  }, { provider: 'mock', model: 'm' });
+  driver.setIdentity('s-replay', 't');
+  driver.setAgent({ session, id: 'a' });
+  driver.pushUserTask('回灌演练');
+  const reason = await driver.runTurn();
+  assert.equal(reason.kind, 'completed');
+  assert.equal(executed.length, 1, '同 id 同内容不重执行（幂等语义不变）');
+  assert.ok(requestTexts[2] !== undefined, `应发生第三次请求，实际 ${requestTexts.length}`);
+  assert.ok(requestTexts[2]!.includes('[tf-stream:replay'), '第三次请求应携带回灌块');
+  assert.ok(requestTexts[2]!.includes('ok: web_search'), '回灌块必须带原结果内容（幂等不等于空手）');
+});
