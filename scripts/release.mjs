@@ -25,6 +25,8 @@ const WIN = process.platform === 'win32';
 const NPM = WIN ? 'npm.cmd' : 'npm';
 const DRY = has('dry-run');
 const YES = has('yes');
+/** 一次性验证码（账号 2FA=auth-and-writes 时 npm publish 需要）：NPM_OTP=123456 npm run release */
+const OTP = (process.env.NPM_OTP ?? '').trim();
 
 /* ── 输出 ─────────────────────────────────────────────── */
 const C = process.stdout.isTTY
@@ -348,6 +350,7 @@ if (!has('no-npm')) {
   }
   const distTag = targetVer.pre ? 'alpha' : 'latest';
   const pubArgs = ['publish', '--access', 'public', '--tag', distTag];
+  if (OTP !== '') pubArgs.push(`--otp=${OTP}`);
   if (DRY) {
     warn(`dry-run：本节将执行 npm ${pubArgs.join(' ')}`);
     try {
@@ -360,16 +363,26 @@ if (!has('no-npm')) {
       npmRun(pubArgs, { inherit: true });
     } catch (e) {
       const out = String(e.stdout || '') + String(e.stderr || '');
-      if (/E403|403/.test(out) && /two-factor|2fa/i.test(out)) {
+      // 2FA 墙的三种表现（npm 版本不同）：E403 two-factor / E401 otp / E404 …/-/v1/done?authId=
+      // （11.x 的 otplease 会先开网页鉴权流程轮询 /-/v1/done，超时后把 authId 失效报成 404——
+      //  这个 404 是症状不是原因，真正的因是账号 2FA=auth-and-writes 且本次 PUT 没带 OTP）
+      const otpWall =
+        /EOTP|two-factor|2fa/i.test(out) ||
+        /\/v1\/done|authId/i.test(out) ||
+        (/E40[13]/.test(out) && /otp/i.test(out));
+      if (otpWall) {
         die(
-          'npm 拒绝了发布：账号要求 2FA，网页登录的会话 token 不能直接发布',
+          'npm 拒绝了发布：账号 2FA=auth-and-writes，本次 PUT 没带一次性验证码',
           [
-            '两个办法（推荐第一个，配一次以后就不用管）：',
-            '  1. 建 Granular Access Token 并勾选 “Bypass two-factor authentication”',
-            '     https://www.npmjs.com/settings/<你的用户名>/tokens → Generate New Token',
-            '     权限 Read and write、scopes 选 @' + (pkg.name.split('/')[0].slice(1) || '') + '，然后写入：',
+            '（若报的是 E404 GET /-/v1/done?authId=…，那是网页鉴权流程超时的症状，不是包名/权限问题）',
+            '三个办法：',
+            '  1. 本次直接带码（30 秒一换）：NPM_OTP=123456 npm run release',
+            '     —— 或不经脚本：npm publish --access public --otp=123456',
+            '  2. 一劳永逸：建 Granular Access Token 并勾选 “Bypass two-factor authentication”',
+            '     https://www.npmjs.com/settings/' + (pkg.name.split('/')[0].slice(1) || '') + '/tokens → Generate New Token',
+            '     权限 Read and write、Packages 选 All packages，然后写入：',
             '     npm config set //registry.npmjs.org/:_authToken=npm_xxx',
-            '  2. 临时用验证码：npm publish --otp=123456',
+            '  3. 不想每次带码也不建新令牌：把账号 2FA 降为 auth-only（写操作免码，安全性下降，不建议）',
           ].join('\n'),
         );
       }
