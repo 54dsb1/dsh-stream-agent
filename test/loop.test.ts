@@ -1187,3 +1187,207 @@ describe('J. 饥饿升格接线（08 号评测前修复的回归）', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// K. v0.3.1 截断修复（真机会话 session-84274277：任务做一半 + 占位答案）
+// ---------------------------------------------------------------------------
+
+describe('K. final 收束闸（v0.3.1 截断修复）', () => {
+  const fast = { charsPerChunk: 0, delayMs: 0 };
+  let harness: Harness;
+  beforeEach(() => { harness?.cleanup(); });
+
+  it('K1. 占位 summary 的 tf-final 不算收敛：结构化拒绝 → 重发真答案才收场', async () => {
+    const scenarios: Scenario[] = [
+      {
+        name: 'real-final',
+        match: { promptIncludes: 'summary 是占位内容' },
+        chunking: fast,
+        steps: [
+          { type: 'text', text: '补上答案。\n' },
+          { type: 'commands', commands: ['<tf-final id="f2" summary="a.txt 共 1 行，内容为 内容A"/>'] },
+          { type: 'finish', reason: 'stop' },
+        ],
+      },
+      {
+        name: 'placeholder-final',
+        match: { promptIncludes: '占位演练' },
+        chunking: fast,
+        steps: [
+          { type: 'text', text: '开始。\n' },
+          { type: 'commands', commands: ['<tf-final id="f1" summary="placeholder"/>'] },
+          { type: 'finish', reason: 'stop' },
+        ],
+      },
+    ];
+    harness = makeHarness({ task: '占位演练：把 a.txt 的内容报出来。', scenarios });
+    try {
+      const reason = await harness.driver.runTurn();
+      assert.equal(reason.kind, 'completed', '占位 final 被拒后应重入并最终收敛');
+      const snap = harness.driver.snapshot();
+      assert.equal(snap.requestCount, 2, `占位 final 必须触发一次重入，实际 ${snap.requestCount}`);
+      const finals = snap.records.filter((r) => r.kind === 'final');
+      const last = finals[finals.length - 1];
+      assert.ok(last !== undefined && last.kind === 'final');
+      assert.ok(last.summary.includes('内容A'), `最终答案必须是真答案，实际 ${last.summary}`);
+      assert.ok(
+        faultsOf(snap).some((f) => f.fault === 'premature-final' && f.detail.includes('占位')),
+        '应记 premature-final fault',
+      );
+      const req2 = harness.wireRequests[1]!.contentTexts.join('\n');
+      assert.ok(req2.includes('[tf-stream:error') && req2.includes('tf-final 无效'), '拒绝理由必须结构化注入给模型');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('K2. final 之后又发命令 = 答案过期：不得用旧 final 收敛', async () => {
+    const scenarios: Scenario[] = [
+      {
+        name: 'restated-final',
+        match: { promptIncludes: '答案已过期' },
+        chunking: fast,
+        steps: [
+          { type: 'text', text: '重新声明结果。\n' },
+          { type: 'commands', commands: ['<tf-final id="f2" summary="x.txt 已写入，内容 X"/>'] },
+          { type: 'finish', reason: 'stop' },
+        ],
+      },
+      {
+        name: 'final-then-work',
+        match: { promptIncludes: '过期演练' },
+        chunking: fast,
+        steps: [
+          { type: 'text', text: '先声明完成，然后继续干活。\n' },
+          {
+            type: 'commands',
+            commands: [
+              '<tf-final id="f1" summary="done"/>',
+              '<tf-write path="x.txt" id="w1">X</tf-write>',
+            ],
+          },
+          { type: 'finish', reason: 'stop' },
+        ],
+      },
+    ];
+    harness = makeHarness({ task: '过期演练：写 x.txt 并报告结果。', scenarios });
+    try {
+      const reason = await harness.driver.runTurn();
+      assert.equal(reason.kind, 'completed');
+      const snap = harness.driver.snapshot();
+      assert.equal(snap.requestCount, 2, `过期 final 必须触发一次重入，实际 ${snap.requestCount}`);
+      const finals = snap.records.filter((r) => r.kind === 'final');
+      const last = finals[finals.length - 1];
+      assert.ok(last !== undefined && last.kind === 'final');
+      assert.ok(last.summary.includes('x.txt'), `交付的必须是重发后的答案，实际 ${last.summary}`);
+      assert.ok(
+        faultsOf(snap).some((f) => f.detail.includes('答案已过期')),
+        '应记"答案已过期"的拒绝',
+      );
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('K3. 重复命令幂等但不空手：原结果回灌给丢失上下文的模型', async () => {
+    const scenarios: Scenario[] = [
+      {
+        name: 'after-replay',
+        match: { promptIncludes: '[tf-stream:replay' },
+        chunking: fast,
+        steps: [
+          { type: 'text', text: '拿到回灌内容，收尾。\n' },
+          { type: 'commands', commands: ['<tf-final id="f3" summary="a.txt 内容为 内容A"/>'] },
+          { type: 'finish', reason: 'stop' },
+        ],
+      },
+      {
+        name: 'duplicate-read',
+        match: { promptIncludes: '[tf-stream:receipt' },
+        chunking: fast,
+        steps: [
+          { type: 'text', text: '再读一次。\n' },
+          { type: 'commands', commands: ['<tf-read path="a.txt" id="r1" depends_on="w1"/>'] },
+          { type: 'finish', reason: 'stop' },
+        ],
+      },
+      {
+        name: 'write-then-read',
+        match: { promptIncludes: '回灌演练' },
+        chunking: fast,
+        steps: [
+          { type: 'text', text: '写后读。\n' },
+          {
+            type: 'commands',
+            commands: [
+              '<tf-write path="a.txt" id="w1">内容A</tf-write>',
+              '<tf-read path="a.txt" id="r1" depends_on="w1"/>',
+            ],
+          },
+          { type: 'finish', reason: 'stop' },
+        ],
+      },
+    ];
+    harness = makeHarness({ task: '回灌演练：写 a.txt 再读回来。', scenarios });
+    try {
+      const reason = await harness.driver.runTurn();
+      assert.equal(reason.kind, 'completed');
+      const snap = harness.driver.snapshot();
+      assert.equal(snap.requestCount, 3, `重发同一条 read 应带来一次回灌请求，实际 ${snap.requestCount}`);
+      const req3 = harness.wireRequests[2]!.contentTexts.join('\n');
+      assert.ok(req3.includes('[tf-stream:replay'), '第三次请求应携带回灌块');
+      assert.ok(req3.includes('内容A'), '回灌块必须带原结果内容（幂等不等于空手）');
+      assert.ok(
+        snap.records.some((r) => r.kind === 'observation' && r.reason === 'duplicate-replay'),
+        '回灌应记一条 observation',
+      );
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('K4. 屡教不改的占位 final：如实 blocked，绝不把占位当交付', async () => {
+    const scenarios: Scenario[] = [
+      {
+        name: 'still-placeholder',
+        match: { promptIncludes: '[tf-stream:nudge]' },
+        chunking: fast,
+        steps: [
+          { type: 'text', text: '……\n' },
+          { type: 'commands', commands: ['<tf-final id="f3" summary="placeholder"/>'] },
+          { type: 'finish', reason: 'stop' },
+        ],
+      },
+      {
+        name: 'second-placeholder',
+        match: { promptIncludes: 'summary 是占位内容' },
+        chunking: fast,
+        steps: [
+          { type: 'text', text: '再占位一次。\n' },
+          { type: 'commands', commands: ['<tf-final id="f2" summary="TODO"/>'] },
+          { type: 'finish', reason: 'stop' },
+        ],
+      },
+      {
+        name: 'first-placeholder',
+        match: { promptIncludes: '屡教不改' },
+        chunking: fast,
+        steps: [
+          { type: 'text', text: '占位收尾。\n' },
+          { type: 'commands', commands: ['<tf-final id="f1" summary="placeholder"/>'] },
+          { type: 'finish', reason: 'stop' },
+        ],
+      },
+    ];
+    harness = makeHarness({ task: '屡教不改：报出结果。', scenarios });
+    try {
+      const reason = await harness.driver.runTurn();
+      assert.equal(reason.kind, 'blocked', '占位答案不得被当作完成');
+      assert.ok(reason.kind === 'blocked' && reason.detail.includes('final 被拒'), `reason 应说明 final 被拒，实际 ${JSON.stringify(reason)}`);
+      // 同 kind 的拒绝只注入一次：第 2 条占位 final 起不再烧注入，走 nudge → blocked
+      assert.equal(harness.driver.snapshot().requestCount, 3, '拒绝注入一次 + nudge 一次，共 3 个请求');
+    } finally {
+      harness.cleanup();
+    }
+  });
+});

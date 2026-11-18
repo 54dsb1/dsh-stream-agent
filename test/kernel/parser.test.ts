@@ -406,3 +406,45 @@ test('DSML 跨 chunk 边界：闭合跨流仍能改写（增量喂入）', () =>
   assert.equal(cmds[0].name, 'tf-glob');
   assert.equal(cmds[0].id, 'gl1');
 });
+
+// ---------------------------------------------------------------------------
+// 孤立闭合标签（v0.3.1「任务半途截断」修复）
+// 真机证据：模型给自闭合命令又补了一次闭合，`</tf-bash>` 以纯文本落进正文，
+// 桌面端过程区里就能看到裸协议残片。
+// ---------------------------------------------------------------------------
+
+test('孤立闭合标签不进 prose：记 malformed(stray-close-tag) 后丢弃', () => {
+  const p = new TfStreamParser();
+  const events = feedAll(p, ['先看一眼\n<tf-glob pattern="**/*" id="gl4"/>\n继续\n</tf-bash>\n']);
+  const text = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
+  assert.equal(text, '先看一眼\n\n继续\n\n');
+  assert.ok(!text.includes('</tf-bash>'), '裸闭合标签不得进正文');
+  const mal = events.filter((e) => e.type === 'malformed') as Array<{ reason: string }>;
+  assert.equal(mal.length, 1);
+  assert.equal(mal[0]!.reason, 'stray-close-tag:tf-bash');
+  assert.equal(commandsOf(events).length, 1, '正常命令不受影响');
+});
+
+test('孤立的配对式闭合（跨 chunk）同样丢弃', () => {
+  const p = new TfStreamParser();
+  const events = feedAll(p, ['abc</t', 'f-write>xyz']);
+  const text = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
+  assert.equal(text, 'abcxyz');
+  assert.ok(events.some((e) => e.type === 'malformed' && (e as { reason: string }).reason === 'stray-close-tag:tf-write'));
+});
+
+test('流末尾半截闭合标签：不留在 prose 里', () => {
+  const p = new TfStreamParser();
+  const events = feedAll(p, ['文字</tf-ba']);
+  const text = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
+  assert.equal(text, '文字');
+  assert.ok(events.some((e) => e.type === 'malformed' && (e as { reason: string }).reason.startsWith('stray-close-tag')));
+});
+
+test('普通 HTML 闭合标签仍按正文透传（不过度拦截）', () => {
+  const p = new TfStreamParser();
+  const events = feedAll(p, ['正文 </div> 结束，</tf 不在标签位']);
+  const text = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
+  assert.ok(text.includes('</div>'), 'HTML 闭合标签属于正常正文');
+  assert.equal(events.filter((e) => e.type === 'malformed').length, 0);
+});
