@@ -257,13 +257,26 @@ export function createMockModel(config                 )            {
       .flatMap((m) => m.content)
       .map((b) => b.text ?? '')
       .join('\n');
-    const matched = config.scenarios.find((s) => {
-      if (!s.match) return false;
-      if (s.match.model !== undefined && s.match.model !== options.model) return false;
-      if (s.match.promptIncludes !== undefined && !prompt.includes(s.match.promptIncludes)) return false;
-      return true;
-    });
-    return matched ?? config.scenarios[0] ; // 无 match 的首个剧本作兜底
+    // v0.3.2：按 marker 在提示中的**最后出现位置**选剧本（等价于"响应最新注入"）。
+    // 0.3.1 取首个匹配；驱动器把历史观测转正进追加区后，旧 marker 会留在历史里，
+    // 首匹配会让同一个剧本无限重演（G1/D1 的假失败就是这么来的）。
+    let best                      ;
+    let bestAt = -1;
+    for (const s of config.scenarios) {
+      if (!s.match) continue;
+      if (s.match.model !== undefined && s.match.model !== options.model) continue;
+      if (s.match.promptIncludes !== undefined) {
+        const at = prompt.lastIndexOf(s.match.promptIncludes);
+        if (at === -1) continue;
+        if (at > bestAt) {
+          best = s;
+          bestAt = at;
+        }
+        continue;
+      }
+      if (best === undefined) best = s;
+    }
+    return best ?? config.scenarios[0] ; // 无 match 的首个剧本作兜底
   }
 
   function* chunkify(text        , charsPerChunk        )                    {

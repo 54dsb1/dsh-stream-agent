@@ -26,9 +26,23 @@ import { createHash } from 'node:crypto';
 
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
 
+/** v0.3.2：assistant 消息的宿主来源元数据。宿主 LlmRuntime.forAdapter（dsh-llm
+ *  lib/index.js:2277；GitHub master packages/llm/llm/src/index.ts 同源无防护）对请求里的
+ *  每条 assistant 消息读 `message.source.replayState`——source 缺失 = TypeError
+ *  "Cannot read properties of undefined (reading 'replayState')"，流以 error finish 收场，
+ *  回合中断（真机 session-8f22c7a0 seq 121 实证：正文首次落追加区后的下一请求必崩）。
+ *  replayState 本身可选（dsh-llm types.d.ts:15），缺失时宿主按"无原生回放"处理。 */
+export interface RenderMessageSource {
+  kind: 'model';
+  provider: string;
+  model: string;
+}
+
 export interface RenderMessage {
   role: MessageRole;
   content: string;
+  /** 仅 assistant 消息需要；user/system 消息宿主不读 source。 */
+  source?: RenderMessageSource;
 }
 
 /** 与 03 号分派 obs.ts 的 directoryDelta(sinceSeq) 返回结构兼容（结构化类型，不 import）。 */
@@ -161,6 +175,8 @@ interface AppendBlock {
   kind: AppendBlockKind;
   role: MessageRole;
   content: string;
+  /** v0.3.2：assistant 追加块携带宿主来源（stableMessages 装配时透传进请求）。 */
+  source?: RenderMessageSource;
 }
 
 interface TailBlock {
@@ -241,7 +257,8 @@ export class ContextRenderer {
     if (msg.role === 'system') {
       throw new Error('appendHistory 不接受 system 消息：system 属于稳定前缀');
     }
-    this.#appendBlocks.push({ kind: 'history', role: msg.role, content: msg.content });
+    // v0.3.2：source 必须保留（assistant 块不带 source = 请求在宿主 forAdapter 崩溃）。
+    this.#appendBlocks.push({ kind: 'history', role: msg.role, content: msg.content, ...(msg.source === undefined ? {} : { source: msg.source }) });
   }
 
   /**
@@ -317,11 +334,16 @@ export class ContextRenderer {
 
   // ------------------------------------------------------------------- 装配
 
-  /** 稳定段 = 稳定前缀 ++ 追加区（不含易变尾）。 */
+  /** 稳定段 = 稳定前缀 ++ 追加区（不含易变尾）。v0.3.2：assistant 块的 source 随装配
+   *  透传（宿主 forAdapter 读 assistant 消息的 source.replayState，缺失即崩）。 */
   stableMessages(): RenderMessage[] {
     return [
       ...this.#prefix,
-      ...this.#appendBlocks.map((b) => ({ role: b.role, content: b.content })),
+      ...this.#appendBlocks.map((b) => (
+        b.source === undefined
+          ? { role: b.role, content: b.content }
+          : { role: b.role, content: b.content, source: b.source }
+      )),
     ];
   }
 

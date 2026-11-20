@@ -46,6 +46,19 @@
  *   典型是模型把自闭合命令又"关闭"了一次）一律按 malformed(stray-close-tag) 记账后丢弃，
  *   绝不作 prose 透传——0.3.1 真机证据：这类残片会以纯文本落进 assistant/message，
  *   桌面端正文里出现裸的 `</tf-bash>`。
+ * - DSML 参数式调用（v0.3.2 截断修复）：模型原生调用格式还有"父标签 + parameter 子标签"
+ *   形态（真机取证 session-e4b9a89c 第 6/9 步）：
+ *     <｜｜DSML｜｜ invoke name="tf-read">
+ *     <｜｜DSML｜｜ parameter name="path" string="true">README.md</｜｜DSML｜｜ parameter>
+ *     </｜｜DSML｜｜ invoke>
+ *   0.3.1 只认「invoke 头部内联属性」形态，parameter 子标签被逐条判 malformed，而标签之间的
+ *   属性值（README.md / r10 / 命令行）作为 prose 漏进正文——用户侧看到的就是"截断的正文 +
+ *   `README.md r10` 这种残片"，且命令根本没执行。本版把整个 invoke 块缓冲到闭合，按
+ *   parameter 归集成属性后一次性发命令；块内文本不再作为 prose 透传。块未闭合即流终止时，
+ *   非正文命令（属性已齐）照常发命令（能救则救），正文命令按 truncated 丢弃（不写半截文件）。
+ * - 非正文命令的配对开标签（v0.3.2）：`<tf-read ...>` 少了 `/` 时，0.3.1 会进入 body 模式
+ *   一直吞到流末尾（整个后续输出消失）。现在非正文命令一旦出现下一个 `<tf-` / `</tf-`
+ *   即视为已闭合（命令照常派发），流末尾仍未闭合也发命令并把剩余文本按 prose 归还。
  *
  * 事件类型：text / command / malformed / truncated / cycle / done。
  * 命令闭合立即 emit，不等流结束；"当前可执行集合"用 readyCommands() 查询
@@ -120,13 +133,17 @@ export type ParserEvent =
 // 流式解析器
 // ---------------------------------------------------------------------------
 
-type Mode = 'ground' | 'header' | 'body';
+type Mode = 'ground' | 'header' | 'body' | 'dsml';
 type TagProbe = 'tag' | 'prose' | 'tf-unknown' | 'close-tag' | 'need-more' | 'dsml';
 
 export class TfStreamParser {
   private buf = '';
   private mode: Mode = 'ground';
   private ended = false;
+
+  /** DSML 参数式调用块缓冲（v0.3.2）：从无内联属性的 invoke 开标签起，缓冲到块闭合。 */
+  private dsmlBuf = '';
+  private dsmlName: TfCommandName | null = null;
 
   // body 中间态
   private bodyName: TfCommandName | null = null;
@@ -160,7 +177,24 @@ export class TfStreamParser {
     if (this.ended) return [];
     this.ended = true;
     const events: ParserEvent[] = [];
-    if (this.mode === 'header') {
+    if (this.mode === 'dsml') {
+      // v0.3.2：DSML 参数式块未闭合即流终止。非正文命令只要属性齐全就照常发（能救则救）；
+      // 正文命令（tf-write/tf-edit/tf-append/tf-code）不写半截内容——按 truncated 上报。
+      const block = this.dsmlBuf + this.buf;
+      const expected = this.dsmlName;
+      this.dsmlBuf = '';
+      this.dsmlName = null;
+      this.buf = '';
+      this.mode = 'ground';
+      const parsed = parseDsmlBlock(block, expected, { allowIncompleteBody: false });
+      for (const bad of parsed.malformed) {
+        events.push({ type: 'malformed', raw: bad.raw, reason: bad.reason });
+      }
+      for (const cmd of parsed.commands) {
+        this.emitCommand(events, cmd.name, cmd.attrs, cmd.dependsOn, cmd.body, cmd.raw);
+      }
+      events.push({ type: 'truncated', raw: block, reason: 'unclosed-dsml-invoke' });
+    } else if (this.mode === 'header') {
       if (isDsmlTag(this.buf)) {
         // DSML 尾巴（feed 期间已进 header 模式但流终止）：malformed 上报，不进 prose
         events.push({ type: 'malformed', raw: this.buf, reason: 'dsml-wrapper' });
@@ -169,11 +203,33 @@ export class TfStreamParser {
         events.push({ type: 'truncated', raw: this.buf, reason: 'unclosed-command-tag' });
       }
     } else if (this.mode === 'body') {
-      events.push({
-        type: 'truncated',
-        raw: this.bodyRawOpen + this.bodyBuf + this.buf,
-        reason: `unclosed-command-body:${this.bodyName}`,
-      });
+      if (!COMMAND_SCHEMAS[this.bodyName!].hasBody) {
+        // v0.3.2：非正文命令的配对开标签缺闭合——命令本身是完整的（属性齐），
+        // 不能因为模型少写一个 '/' 就把整条命令连同后续输出一起丢掉。
+        const name = this.bodyName!;
+        const attrs = this.bodyAttrs!;
+        const deps = this.bodyDeps!;
+        const rawOpen = this.bodyRawOpen;
+        const trailing = this.bodyBuf + this.buf;
+        this.buf = '';
+        this.bodyName = null;
+        this.bodyAttrs = null;
+        this.bodyDeps = null;
+        this.bodyRawOpen = '';
+        this.bodyBuf = '';
+        this.mode = 'ground';
+        if (trailing.trim() !== '') {
+          events.push({ type: 'malformed', raw: trailing, reason: 'unexpected-body' });
+        }
+        this.emitCommand(events, name, attrs, deps, undefined, rawOpen + trailing);
+        if (trailing.trim() !== '') events.push({ type: 'text', text: trailing });
+      } else {
+        events.push({
+          type: 'truncated',
+          raw: this.bodyRawOpen + this.bodyBuf + this.buf,
+          reason: `unclosed-command-body:${this.bodyName}`,
+        });
+      }
     } else {
       // ground：残留的 "<tf-" 片段（尚无法判定是否标签）→ truncated；
       // DSML 尾巴（协议违规，v0.3.1）→ malformed 上报后丢弃，不作为 prose 泄漏；
@@ -224,6 +280,7 @@ export class TfStreamParser {
   private step(events: ParserEvent[]): boolean {
     if (this.mode === 'ground') return this.stepGround(events);
     if (this.mode === 'header') return this.stepHeader(events);
+    if (this.mode === 'dsml') return this.stepDsml(events);
     return this.stepBody(events);
   }
 
@@ -269,12 +326,32 @@ export class TfStreamParser {
     // DSML 噪声（v0.3.1）：先于普通解析处理——`invoke name="tf-xxx" ...` 形态改写回
     // 等价 tf-* 头部（命令不丢）；其余包装行按 malformed 上报后丢弃（不进 prose）。
     if (isDsmlTag(raw)) {
-      const dsml = parseDsmlHeader(raw, close.selfClosing);
-      if (dsml === null) {
+      // v0.3.2：参数式 invoke → 进入块缓冲，按 parameter 归集属性。
+      // 0.3.1 只认内联属性形态，parameter 子标签之间的值会作为 prose 泄漏（真机残片
+      // `README.md r10` / `Get-ChildItem ... b902` 均由此产生）。
+      // v0.3.2 补充：带内联属性的 invoke 同样缓冲（parseDsmlBlock 本就合并内联属性与
+      // parameter——parameter 覆盖同名内联键）。此前内联属性走 parseDsmlHeader 进 body
+      // 模式，非正文命令的 DSML 包装残片会被吞到流末才以 malformed 露出
+      // （真机 session-8f22c7a0 step 2：三条闭合标签残片）。
+      const dsml = parseDsmlTag(raw, close.selfClosing);
+      if (
+        dsml !== null
+        && dsml.name === 'invoke'
+        && !dsml.closing
+        && !close.selfClosing
+        && dsml.commandName !== null
+      ) {
+        this.dsmlBuf = raw;
+        this.dsmlName = dsml.commandName;
+        this.mode = 'dsml';
+        return true;
+      }
+      const inline = parseDsmlHeader(raw, close.selfClosing);
+      if (inline === null) {
         events.push({ type: 'malformed', raw, reason: 'dsml-wrapper' });
         return true;
       }
-      const parsed = parseHeader(dsml.synthetic);
+      const parsed = parseHeader(inline.synthetic);
       if ('error' in parsed || parsed.name === null) {
         events.push({ type: 'malformed', raw, reason: 'dsml-wrapper' });
         return true;
@@ -318,8 +395,35 @@ export class TfStreamParser {
 
   private stepBody(events: ParserEvent[]): boolean {
     const name = this.bodyName!;
+    const schema = COMMAND_SCHEMAS[name];
     const closeTag = `</${name}>`;
     const closeIdx = this.buf.indexOf(closeTag);
+    // v0.3.2：非正文命令的配对开标签（少写 '/'）不得吞掉后续输出——遇到下一个
+    // `<tf-` / `</tf-` 即视为本命令结束，命令照常派发，剩余文本回到 ground 继续解析。
+    // v0.3.2 补充：DSML 标签同样是边界（包装残片立即露出，不吞到流末）。
+    if (!schema.hasBody) {
+      const boundary = findNonBodyBoundaryWithDsml(this.buf);
+      if (boundary !== -1 && (closeIdx === -1 || boundary < closeIdx)) {
+        const body = this.bodyBuf + this.buf.slice(0, boundary);
+        const raw = this.bodyRawOpen + body;
+        this.buf = this.buf.slice(boundary);
+        this.mode = 'ground';
+        const attrs = this.bodyAttrs!;
+        const deps = this.bodyDeps!;
+        this.bodyName = null;
+        this.bodyAttrs = null;
+        this.bodyDeps = null;
+        this.bodyRawOpen = '';
+        this.bodyBuf = '';
+        if (body.trim() !== '') {
+          events.push({ type: 'malformed', raw: body, reason: 'unexpected-body' });
+          // 非正文命令后面的文本是模型 prose（不是命令输入）——归还正文，避免"输出变少"。
+          events.push({ type: 'text', text: body });
+        }
+        this.emitCommand(events, name, attrs, deps, undefined, raw);
+        return true;
+      }
+    }
     if (closeIdx === -1) {
       // 闭合标签可能被拆在 chunk 边界上：扣留末尾至多 closeTag.length-1 个字符
       const keep = Math.min(closeTag.length - 1, this.buf.length);
@@ -339,11 +443,43 @@ export class TfStreamParser {
     this.bodyRawOpen = '';
     this.bodyBuf = '';
 
-    if (!COMMAND_SCHEMAS[name].hasBody && body !== '') {
+    if (!schema.hasBody && body !== '') {
+      // 非正文命令带正文：命令本身仍有效（属性齐），正文只记账不当作命令输入。
+      // v0.3.2 起不再丢弃命令——0.3.1 会整条判 malformed，模型侧表现为"命令没执行"。
       events.push({ type: 'malformed', raw, reason: 'unexpected-body' });
+      this.emitCommand(events, name, attrs, deps, undefined, raw);
       return true;
     }
-    this.emitCommand(events, name, attrs, deps, COMMAND_SCHEMAS[name].hasBody ? body : undefined, raw);
+    this.emitCommand(events, name, attrs, deps, schema.hasBody ? body : undefined, raw);
+    return true;
+  }
+
+  /**
+   * v0.3.2：DSML 参数式 invoke 块。缓冲到块闭合后一次性归集为命令：
+   * 块内 `<｜｜DSML｜｜ parameter name="k">value</...>` 的 value 归入属性 k，
+   * 不再作为 prose 泄漏；块内裸文本按命令正文处理（hasBody 命令）。
+   */
+  private stepDsml(events: ParserEvent[]): boolean {
+    if (this.buf !== '') {
+      this.dsmlBuf += this.buf;
+      this.buf = '';
+    }
+    const term = findDsmlInvokeEnd(this.dsmlBuf, this.dsmlName);
+    if (term === null) return false;
+    const block = this.dsmlBuf.slice(0, term.end);
+    const rest = this.dsmlBuf.slice(term.end);
+    const expected = this.dsmlName;
+    this.dsmlBuf = '';
+    this.dsmlName = null;
+    this.mode = 'ground';
+    this.buf = rest;
+    const parsed = parseDsmlBlock(block, expected, { allowIncompleteBody: true });
+    for (const bad of parsed.malformed) {
+      events.push({ type: 'malformed', raw: bad.raw, reason: bad.reason });
+    }
+    for (const cmd of parsed.commands) {
+      this.emitCommand(events, cmd.name, cmd.attrs, cmd.dependsOn, cmd.body, cmd.raw);
+    }
     return true;
   }
 
@@ -471,6 +607,341 @@ function parseDsmlHeader(raw: string, selfClosing: boolean): { synthetic: string
   return { synthetic: `<${name}${attrsPart}${selfClosing ? '/>' : '>'}` };
 }
 
+// ---------------------------------------------------------------------------
+// DSML 参数式 invoke（v0.3.2）
+// ---------------------------------------------------------------------------
+
+interface DsmlTag {
+  /** 标签名（invoke / calls / parameter …，已去掉 DSML 前缀） */
+  name: string;
+  closing: boolean;
+  selfClosing: boolean;
+  /** 标签内 key="value" 属性 */
+  attrs: Record<string, string>;
+  /** invoke 的 name 属性是合法 tf-* 命令名时给出 */
+  commandName: TfCommandName | null;
+}
+
+/** 解析单个 DSML 标签原文（不含前后空白）。非 DSML 形态返回 null。 */
+function parseDsmlTag(raw: string, selfClosing: boolean): DsmlTag | null {
+  if (!isDsmlTag(raw)) return null;
+  let inner = raw.slice(1);
+  const closing = inner.startsWith('/');
+  if (closing) inner = inner.slice(1);
+  if (inner.endsWith('/>')) inner = inner.slice(0, -2);
+  else if (inner.endsWith('>')) inner = inner.slice(0, -1);
+  const m = inner.match(/^｜+DSML｜*\s*([a-zA-Z][a-zA-Z0-9_-]*)([\s\S]*)$/);
+  if (m === null) return null;
+  const name = m[1]!;
+  const attrs = parseAttrPairs(m[2]!);
+  const commandName = attrs['name'] !== undefined && COMMAND_NAMES.includes(attrs['name'] as TfCommandName)
+    ? (attrs['name'] as TfCommandName)
+    : null;
+  return { name, closing, selfClosing, attrs, commandName };
+}
+
+/** v0.3.2：属性值的 XML 实体解码。模型带 XML 习惯输出属性（真机 session-8f22c7a0
+ *  step 5：`command="... Write-Output &quot;EXIT=$LASTEXITCODE&quot;"`——实体原样进了
+ *  PowerShell，命令解析报错，白白烧一步）。只解码有界实体集 + 数字引用；`&` 本身
+ *  不在实体里的原样保留（不猜）。 */
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&(lt|gt|quot|apos|amp);/g, (_, name: string) => (
+      name === 'lt' ? '<' : name === 'gt' ? '>' : name === 'quot' ? '"' : name === 'apos' ? '\'' : '&'
+    ))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(parseInt(dec, 10)));
+}
+
+/** 从 `k="v" k2="v2"` 属性段提取键值（引号内允许 '>'；重复键后者覆盖，交由 schema 兜底）。 */
+function parseAttrPairs(segment: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const re = /([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*"([^"]*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(segment)) !== null) attrs[m[1]!] = decodeXmlEntities(m[2]!);
+  return attrs;
+}
+
+/**
+ * 非正文命令配对开标签的恢复边界（基础版，仅 tf 标签）：下一个 `<tf-` / `</tf-` 的
+ * 位置（-1 = 没有）。DSML 块缓冲的消费（findDsmlInvokeEnd）也用它——缓冲块内部的
+ * DSML 标签属于块本身，绝不能当边界（否则 `<｜` 即块结束 = 解析死循环）。
+ */
+function findNonBodyBoundary(buf: string): number {
+  const a = buf.indexOf('<tf-');
+  const b = buf.indexOf('</tf-');
+  if (a === -1) return b;
+  if (b === -1) return a;
+  return Math.min(a, b);
+}
+
+/**
+ * v0.3.2：body 模式的扩展边界（tf 标签 + DSML 标签）。只在 stepBody 的非正文分支
+ * 使用——真机（session-8f22c7a0 step 2）里 DSML invoke 走完内联路径后，parameter/
+ * invoke/closes 包装残片被 body 模式整体吞掉、到流末才以 malformed 露出；DSML 标签
+ * 出现即视为本命令结束（残片按既有 malformed 纪律处理，绝不作为 prose 透传）。
+ */
+function findNonBodyBoundaryWithDsml(buf: string): number {
+  const base = findNonBodyBoundary(buf);
+  const c = buf.indexOf('<｜');
+  const d = buf.indexOf('</｜');
+  let min = base;
+  for (const v of [c, d]) {
+    if (v === -1) continue;
+    if (min === -1 || v < min) min = v;
+  }
+  return min;
+}
+
+/** DSML 段结束位置（含结束标签本身）：`</invoke>` / `</tf-name>` / （非正文）下一个 tf 标签。 */
+function findDsmlInvokeEnd(buf: string, name: TfCommandName | null): { end: number } | null {
+  let end = -1;
+  const invokeClose = /<\/\s*｜+DSML｜*\s*invoke\s*>/g;
+  const m = invokeClose.exec(buf);
+  if (m !== null) end = m.index + m[0].length;
+  if (name !== null) {
+    const tagClose = buf.indexOf(`</${name}>`);
+    if (tagClose !== -1 && (end === -1 || tagClose + name.length + 3 < end)) {
+      end = tagClose + name.length + 3;
+    }
+    if (!COMMAND_SCHEMAS[name].hasBody) {
+      const boundary = findNonBodyBoundary(buf);
+      if (boundary !== -1 && (end === -1 || boundary < end)) end = boundary;
+    }
+  }
+  return end === -1 ? null : { end };
+}
+
+interface DsmlCommand {
+  name: TfCommandName;
+  attrs: Record<string, string>;
+  dependsOn: readonly string[];
+  body?: string;
+  raw: string;
+}
+
+type DsmlToken =
+  | { kind: 'tag'; tag: DsmlTag; raw: string }
+  | { kind: 'text'; text: string };
+
+/** 把 DSML 块切成「DSML 标签 / 文本」两类 token；非 DSML 的 '<' 留在文本里。 */
+function tokenizeDsmlBlock(block: string): DsmlToken[] {
+  const out: DsmlToken[] = [];
+  let i = 0;
+  while (i < block.length) {
+    const lt = block.indexOf('<', i);
+    if (lt === -1) {
+      out.push({ kind: 'text', text: block.slice(i) });
+      break;
+    }
+    if (lt > i) out.push({ kind: 'text', text: block.slice(i, lt) });
+    const after = block.slice(lt);
+    if (!/^<\/?｜/.test(after)) {
+      out.push({ kind: 'text', text: '<' });
+      i = lt + 1;
+      continue;
+    }
+    const close = scanHeaderClose(after);
+    if (close === null) {
+      out.push({ kind: 'text', text: after });
+      break;
+    }
+    const raw = after.slice(0, close.end + 1);
+    const tag = parseDsmlTag(raw, close.selfClosing);
+    if (tag === null) out.push({ kind: 'text', text: raw });
+    else out.push({ kind: 'tag', tag, raw });
+    i = lt + close.end + 1;
+  }
+  return out;
+}
+
+/**
+ * 解析一个 DSML invoke 块（可能含 parameter 子标签）。
+ *
+ * - `parameter name="k"` 的标签间文本 → 属性 k（多行原样，去掉首尾各一个换行）；
+ * - 正文类参数（content/body/code/text）→ 命令 body（hasBody 命令）；
+ * - 块内裸文本 → hasBody 命令的 body；tf-final 无 summary 时兜底为最终答案；
+ * - 非正文命令带正文 → malformed(unexpected-body) 但命令仍发（不丢工作）；
+ * - `allowIncompleteBody=false` 时，未闭合的正文命令不回放（避免写半截文件）。
+ */
+function parseDsmlBlock(
+  block: string,
+  expected: TfCommandName | null,
+  opts: { allowIncompleteBody: boolean },
+): { commands: DsmlCommand[]; malformed: Array<{ raw: string; reason: string }> } {
+  const commands: DsmlCommand[] = [];
+  const malformed: Array<{ raw: string; reason: string }> = [];
+  let cur: {
+    name: TfCommandName | null;
+    attrs: Record<string, string>;
+    text: string;
+    params: Record<string, string>;
+    paramName: string | null;
+    paramValue: string;
+    raw: string;
+    complete: boolean;
+  } | null = null;
+
+  const flush = (complete: boolean): void => {
+    if (cur === null) return;
+    const item = cur;
+    cur = null;
+    if (item.paramName !== null) item.params[item.paramName] = trimParamValue(item.paramValue);
+    const name = item.name ?? expected;
+    if (name === null) {
+      malformed.push({ raw: item.raw, reason: 'dsml-unknown-invoke' });
+      return;
+    }
+    const schema = COMMAND_SCHEMAS[name];
+    const attrs: Record<string, string> = { ...item.attrs };
+    const bodyKeys = ['content', 'body', 'code', 'text'];
+    let bodyFromParam: string | undefined;
+    for (const key of bodyKeys) {
+      if (item.params[key] !== undefined) {
+        bodyFromParam = item.params[key];
+        delete item.params[key];
+      }
+    }
+    for (const [k, v] of Object.entries(item.params)) attrs[k] = v;
+    if (!complete && schema.hasBody && !opts.allowIncompleteBody) {
+      malformed.push({ raw: item.raw + item.text, reason: 'unclosed-dsml-body' });
+      return;
+    }
+    let body: string | undefined;
+    if (schema.hasBody) {
+      // v0.3.2：块以命令自身的配对闭合（</name>）终止时，闭合标签会被 tokenizer 当作
+      // 块内文本累积——剥掉尾部闭合，正文才干净（与 body 模式的消费语义一致）。
+      let text = item.text;
+      if (bodyFromParam === undefined) {
+        const closeTag = `</${name}>`;
+        const closeIdx = text.lastIndexOf(closeTag);
+        if (closeIdx !== -1 && text.slice(closeIdx).trim() === closeTag) {
+          text = text.slice(0, closeIdx);
+        }
+      }
+      body = bodyFromParam ?? text.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+    } else if (bodyFromParam !== undefined || item.text.trim() !== '') {
+      malformed.push({ raw: item.raw + item.text, reason: 'unexpected-body' });
+      if (name === 'tf-final' && attrs['summary'] === undefined) {
+        attrs['summary'] = (bodyFromParam ?? item.text).trim();
+      }
+    }
+    const validated = validateCommandAttrs(name, attrs);
+    if ('error' in validated) {
+      malformed.push({ raw: item.raw, reason: `dsml-invoke:${validated.error}` });
+      return;
+    }
+    commands.push({ name, attrs: validated.attrs, dependsOn: validated.dependsOn, body, raw: item.raw });
+  };
+
+  for (const token of tokenizeDsmlBlock(block)) {
+    if (token.kind === 'text') {
+      if (cur === null) {
+        if (token.text.trim() !== '') malformed.push({ raw: token.text, reason: 'dsml-text' });
+        continue;
+      }
+      if (cur.paramName !== null) cur.paramValue += token.text;
+      else cur.text += token.text;
+      continue;
+    }
+    const tag = token.tag;
+    if (tag.name === 'calls') continue;
+    if (tag.name === 'invoke') {
+      if (tag.closing) {
+        flush(true);
+        continue;
+      }
+      flush(true);
+      if (tag.commandName === null) {
+        malformed.push({ raw: token.raw, reason: 'dsml-unknown-invoke' });
+        continue;
+      }
+      const { name: _n, ...rest } = tag.attrs;
+      cur = {
+        name: tag.commandName,
+        attrs: rest,
+        text: '',
+        params: {},
+        paramName: null,
+        paramValue: '',
+        raw: token.raw,
+        complete: false,
+      };
+      if (tag.selfClosing) flush(true);
+      continue;
+    }
+    if (tag.name === 'parameter') {
+      if (tag.closing) {
+        if (cur !== null && cur.paramName !== null) {
+          cur.params[cur.paramName] = trimParamValue(cur.paramValue);
+          cur.paramName = null;
+          cur.paramValue = '';
+        }
+        continue;
+      }
+      if (cur === null) {
+        malformed.push({ raw: token.raw, reason: 'dsml-stray-parameter' });
+        continue;
+      }
+      const key = tag.attrs['name'];
+      if (key === undefined) {
+        malformed.push({ raw: token.raw, reason: 'dsml-parameter-without-name' });
+        continue;
+      }
+      cur.paramName = key;
+      cur.paramValue = '';
+      if (tag.selfClosing) {
+        cur.params[key] = '';
+        cur.paramName = null;
+      }
+      continue;
+    }
+    malformed.push({ raw: token.raw, reason: `dsml-unknown-tag:${tag.name}` });
+  }
+  flush(false);
+  return { commands, malformed };
+}
+
+/** parameter 值：去掉首尾各一个换行（模型习惯把值写在标签下一行）。 */
+function trimParamValue(value: string): string {
+  return value.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+}
+
+/** 属性 schema 校验（parseHeader 与 DSML 块共用；校验失败返回结构化 error）。 */
+function validateCommandAttrs(
+  name: TfCommandName,
+  attrs: Record<string, string>,
+): { attrs: Record<string, string>; dependsOn: readonly string[] } | { error: string } {
+  const schema = COMMAND_SCHEMAS[name];
+  const allowed = new Set([...COMMON_ATTRS, ...schema.required, ...schema.optional]);
+  for (const key of Object.keys(attrs)) {
+    if (!allowed.has(key)) return { error: `unknown-attribute:${key}` };
+  }
+  for (const req of schema.required) {
+    if (attrs[req] === undefined) return { error: `missing-attribute:${req}` };
+  }
+  for (const key of ['from_line', 'to_line']) {
+    if (attrs[key] !== undefined && !/^\d+$/.test(attrs[key])) {
+      return { error: `bad-integer-attribute:${key}` };
+    }
+  }
+  return { attrs, dependsOn: buildDependsOn(attrs) };
+}
+
+/** depends_on：逗号分隔，去空、去重、保序。 */
+function buildDependsOn(attrs: Record<string, string>): string[] {
+  const dependsOn: string[] = [];
+  if (attrs['depends_on'] === undefined) return dependsOn;
+  const seen = new Set<string>();
+  for (const part of attrs['depends_on'].split(',')) {
+    const d = part.trim();
+    if (d === '' || seen.has(d)) continue;
+    seen.add(d);
+    dependsOn.push(d);
+  }
+  return dependsOn;
+}
+
 type HeaderParse =
   | { name: TfCommandName; attrs: Record<string, string>; dependsOn: readonly string[] }
   | { name: null; attrs: Record<string, string>; dependsOn: readonly string[] }
@@ -504,40 +975,18 @@ function parseHeader(raw: string): HeaderParse {
     if (!attr) return { error: `bad-attribute-syntax:${rest.slice(0, 20)}` };
     const key = attr[1];
     if (key in attrs) return { error: `duplicate-attribute:${key}` };
-    attrs[key] = attr[2];
+    attrs[key] = decodeXmlEntities(attr[2]);
     rest = rest.slice(attr[0].length);
   }
 
   // depends_on：逗号分隔，去空、去重、保序
-  const dependsOn: string[] = [];
-  if (attrs['depends_on'] !== undefined) {
-    const seen = new Set<string>();
-    for (const part of attrs['depends_on'].split(',')) {
-      const d = part.trim();
-      if (d === '') continue;
-      if (!seen.has(d)) {
-        seen.add(d);
-        dependsOn.push(d);
-      }
-    }
-  }
+  const dependsOn = buildDependsOn(attrs);
 
   if (known === null) return { name: null, attrs, dependsOn };
 
-  const schema = COMMAND_SCHEMAS[known];
-  const allowed = new Set([...COMMON_ATTRS, ...schema.required, ...schema.optional]);
-  for (const key of Object.keys(attrs)) {
-    if (!allowed.has(key)) return { error: `unknown-attribute:${key}` };
-  }
-  for (const req of schema.required) {
-    if (attrs[req] === undefined) return { error: `missing-attribute:${req}` };
-  }
-  for (const key of ['from_line', 'to_line']) {
-    if (attrs[key] !== undefined && !/^\d+$/.test(attrs[key])) {
-      return { error: `bad-integer-attribute:${key}` };
-    }
-  }
-  return { name: known, attrs, dependsOn };
+  const validated = validateCommandAttrs(known, attrs);
+  if ('error' in validated) return { error: validated.error };
+  return { name: known, attrs: validated.attrs, dependsOn: validated.dependsOn };
 }
 
 /**

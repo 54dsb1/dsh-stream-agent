@@ -2,6 +2,131 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.2] - 2026-11-21
+
+**宿主一致性补丁 + 会话中途截断修复（v0.3.2 发布版）。** 本条目合并三个批次的修复：
+宿主一致性两案（2026-11-18）、会话中途截断四根因（真机 `session-e4b9a89c`）、以及
+对照 GitHub 上游 `deepseek-ai/deepseek-harness` 源码后的宿主契约冲突修复
+（真机 `session-8f22c7a0`，2026-11-20——"修复后截断仍发生"的最后一层根因）。
+
+### Fixed（宿主契约冲突 —— 对照 GitHub 上游源码定位，真机 `session-8f22c7a0`）
+
+**现象**：截断修复后的会话（23:31）仍然中断：缓存命中已到 88%，1 轮 6 步、1 分 51 秒
+结束，最终答案是一句"我将重写实现文件"的意图陈述，任务没做。逐事件解码日志 + 对照
+上游 `packages/llm/llm/src/index.ts`（master）后确认四个**独立**因素叠加：
+
+- **assistant 线消息缺 `source`（崩溃主因）**：宿主 `LlmRuntime.forAdapter` 对请求里的
+  每条 assistant 消息读 `message.source.replayState`（上游 master 与 rc.1 均无防护）——
+  "正文落追加区"用 role:'assistant' 但不带 source，**正文首次落史后的下一请求必崩**
+  （TypeError: Cannot read properties of undefined (reading 'replayState')，日志 seq 121），
+  流以 error finish 收场 → 回合 blocked。现在 assistant 历史块与线消息一律携带
+  `source = {kind:'model', provider, model}`（`RenderMessage.source` / `modelSource()`；
+  replayState 可选，缺失按"无原生回放"处理——上游 `validateReplay` 契约）。
+- **nudge 一次性预算误杀生产性回合**：nudge 在"写文件步"被消耗后，任何后续无注入的
+  步骤（纯写步不产生观测注入）直接 `nudgeExhausted` → blocked——即使模型正在干活。
+  现在改为**进度感知**：nudge 后有新 ok 命令即不算提示失效（继续给机会），只有零产出的
+  连续 nudge（真打转）才收束；整体仍由 maxReentries / O5 预算兜底（C3 零产出语义不变）。
+- **XML 实体未解码**：模型带 XML 习惯写属性——`cmd="... Write-Output &quot;EXIT=1&quot;"`
+  的实体原样进 PowerShell，命令解析报错，白烧一步。属性值统一解码有界实体集
+  （lt/gt/quot/apos/amp + 数字引用；单遍替换，`&amp;quot;` 不二次展开）。
+- **DSML 内联属性 invoke 走 body 模式吞包装残片**：带内联属性的 invoke 此前走
+  `parseDsmlHeader` 进 body 模式，非正文命令把 parameter/invoke/closes 包装残片整体
+  吞到流末才以 malformed 露出（日志 seq 33-35 三条）。现在全部 invoke 统一走块缓冲
+  （内联属性与 parameter 合并，parameter 覆盖同名键）；非正文命令的恢复边界纳入 DSML
+  标签（残片立即露出，不再吞到流末）；块以命令自身配对闭合终止时剥掉尾部闭合标签。
+
+### Fixed（宿主一致性 —— 历史加载失败 + 工具调用"卡住"，真机 `session-1da5f8fc`）
+
+两案同源：插件的 duck-type 面缺了宿主侧的形状/事件契约，与 0.3.0 的"工具生命周期"案同类。
+
+- **历史加载失败（`message must have model source`）**：assistant/message 的 source 只有
+  `{kind:'model'}`，缺宿主校验器要求的非空 `provider`/`model`——日志读取时整条判 corrupt。
+  现在 source 携带实时 provider/model（无路由信息时落 'unknown' 兜底）；存量损坏日志用
+  `node scripts/repair-session-logs.mjs --write` 修复（写前备份）。
+- **回合结束后 UI 永远转圈**：`StreamLoopAgent` 从不发 `agent/status`——桌面端收不到
+  idle 转换。状态转换统一走 `#setStatus`（镜像内建 setPhase 语义），factory 从 `ctx.emit`
+  接线 `emitStatus`。
+- **改审批策略命令报 `agent.inject is not a function`**：新增 `inject(message)`（落盘 +
+  并入下一请求装配，不唤醒空闲 agent）。
+
+### Fixed（会话中途截断 —— v0.3.2 补丁，真机 `session-e4b9a89c`）
+
+**现象**：任务做到一半，模型在思考区写下 "The history is truncated. I don't see the plan
+content"，随后反复重读同一文件、用占位 final 收场；桌面端最终答案只剩
+`I'll start by inspecting the workspace. / README.md r10 / Get-ChildItem ... b902` 这类残片。
+9 步、9 次请求后回合以 `blocked（重入次数达到上限 8）` 结束，用户侧看到的就是"输出被截断、
+不完整"。
+
+**四条根因（逐条修复）**：
+
+- **请求之间没有会话记忆（主因）**：0.3.x 的追加区只放任务与句柄目录行——模型自己的
+  正文、命令、命令结果从不落历史；观测只在"易变尾"注入一次（`#reportedObservations`
+  永不重放），易变尾又每请求整块重建。于是第 3 个请求的提示只剩 system + 任务 + 句柄目录
+  （真机 step 3 `inputTokens=343`，对比 step 2 的 1613），模型如实报告"history is truncated"。
+  现在每步结束把**正文 + 命令摘要**（id/命令/目标/状态/句柄/字符数）落进追加区，已发出的
+  易变尾在下一请求装配后**转正为历史**（只允许事实类块：observation/peek/tool-result/replay；
+  nudge/degraded/error 等瞬态指令不转正）。对齐内建 `dsh-agent-loop` 的
+  `session.deriveMessages()` 语义：历史累积、只追加，前缀单调不变（新增回归断言逐条比对）。
+- **DSML 参数式调用被当噪声（正文残片的直接来源）**：模型原生调用还有一种形态——
+  `<｜｜DSML｜｜ invoke name="tf-read">` 后跟
+  `<｜｜DSML｜｜ parameter name="path">README.md</｜｜DSML｜｜ parameter>`。0.3.1 只认
+  "invoke 头部内联属性"，parameter 子标签逐条判 malformed，**标签之间的值作为 prose 漏进正文**
+  （`README.md r10` / `Get-ChildItem ... b902` 就是 path/id/cmd 的值），命令本身却没执行。
+  现在整个 invoke 块缓冲到闭合，按 parameter 归集成属性后一次性发命令；块内文本不再透传。
+  块未闭合即流终止时：非正文命令（属性已齐）照常发（能救则救），正文命令按 truncated 丢弃
+  （绝不写半截文件）。
+- **非正文命令少写 `/` 吞掉后续输出**：`<tf-read ...>` 进入 body 模式后会一直吞到流末尾，
+  0.3.1 只在流末记一条 truncated，后续命令与正文全部消失。现在遇到下一个 `<tf-` / `</tf-`
+  即视为闭合（命令照发、后续照解析），流末仍未闭合也发命令并把剩余文本归还 prose。
+- **截断没有任何续写事由**：`finish=max-tokens` / 命令体未闭合时，0.3.1 只记台账，回合
+  "安静地"结束在半截输出上。现在强制一次续写注入（`[tf-stream:truncated]`，带已生成内容
+  尾部 ≤800 字符便于从断点续写），回合级上限 `MAX_TRUNCATION_RETRIES=4`，超限如实 blocked。
+- **计划门槛拒绝时不给计划内容**：模型看不到验收项就无法补 `accepts`，final 会被永久拒绝
+  直到重入上限。现在拒绝注入附带计划快照（id + 原文 + 状态）。
+
+**涉及文件**：`src/kernel/parser.ts`（DSML 参数式块 / 非正文命令恢复）、
+`src/entry/loop.ts`（步骤摘要、易变尾转正、截断续写、计划快照）、
+`src/entry/mock-provider.ts`（剧本选择改为"最新 marker 优先"——历史持久后旧 marker 仍在，
+首匹配会让同一剧本无限重演）。
+**回归**：`test/v032-truncation.test.ts` 8 例（T1/T1b/T1c 解析器 DSML 三态、T3/T3b 非正文
+命令恢复、T2 三请求历史保留 + 前缀逐条不变、T4 max-tokens 续写落盘、T5 计划快照）；
+全量 314/314 通过。
+
+### Fixed
+
+- **历史加载失败（`message must have model source`）**：0.3.1 及更早版本写
+  assistant/message 时 source 只有 `{kind:'model'}`，缺宿主校验器
+  （dsh-session `assertMessageEventShape` → `hasProviderModel`）要求的非空
+  `provider`/`model`——日志在读取时整条被判 corrupt，桌面端报"历史加载失败"。
+  现在 `makeAssistantMessage` 携带实时 provider/model（`createSessionEventWriter` 新增
+  `modelInfo` 写入时回调；驱动器 `modelSource()` 随 `applySelection` 运行时换模而动，
+  不缓存）；无路由信息（离线/缺省）时落 `'unknown'` 兜底，形状仍过校验，不谎报模型。
+  **存量损坏日志**：`node scripts/repair-session-logs.mjs --write`（0.3.0 修复脚本扩展：
+  新增 model source 补齐类目 + 本地消息形状复核，`--model-provider`/`--model` 可指定，
+  缺省 deepseek-account / deepseek-flash；写前备份、写后清投影缓存的纪律不变）。
+- **回合结束后 UI 永远转圈**：`StreamLoopAgent` 从不发 `agent/status`——桌面端
+  dsh-api-session-controller 靠它转发 `api-session/status` 收起"运行中"指示，不发 =
+  回合早已结束、UI 仍在"正在分析请求"。现在状态转换统一走 `#setStatus`（镜像内建
+  dsh-agent-loop `setPhase` 语义：只在 idle↔running 真正变化时发；发射异常 fail-open
+  告警不静默），factory 从宿主事件总线（`ctx.emit`）接线 `emitStatus`。
+- **改审批策略命令报 `agent.inject is not a function`**：桌面端 approval/policy 命令路径
+  调 `agent.inject`（dsh-user-approval `setPolicy:127`），duck-type 面缺这个方法。
+  新增 `inject(message)`：落盘 user/message + 并入下一请求装配，**不唤醒空闲 agent**
+  （镜像内建 `send(input,'next-step', false)`；pendingSteers 在 runTurn 每次请求前消费，
+  含下一回合首请求，下一请求必然可见）。
+
+### 测试
+
+- 新增 `test/host-conformance.test.ts`（8 用例）：宿主同款消息形状校验（整条日志逐事件
+  过 `assertMessageEventShape`/`hasProviderModel` 本地镜像）、换模实时 source、unknown
+  兜底、agent/status 转换序列精确性（不重复不遗漏）、发射异常熔断、inject 三态
+  （空闲/运行中/dispose 后）。
+- 新增 `test/v032-conflict.test.ts`（4 用例）：W1 assistant 线消息携带 source（forAdapter
+  契约，崩溃主因）、W2 nudge 后继续产出不中断（进度感知护栏）、W3 属性值 XML 实体解码
+  （`&amp;quot;` 不二次展开）、W4 DSML 内联属性 + parameter 混合形态整体缓冲。
+- 截断修复批次：`test/v032-truncation.test.ts`（8 用例，并行批次交付）。
+- 全量 318/318 通过（0 skip；离线 mock 全链路，零 API 调用）。
+
 ## [0.3.1] - 2026-11-18
 
 **桌面端思考过程显示修复 + 任务半途截断修复 + 第三方评审反馈修复合集。** 三部分内容并入

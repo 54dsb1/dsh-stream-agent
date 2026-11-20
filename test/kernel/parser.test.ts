@@ -348,12 +348,13 @@ test('DSML 包装行：malformed 上报并丢弃，不进 prose（真机形态�
   assert.equal(text, '\n\n\n', 'DSML 标签本身不得作为 prose 透传（标签间空白换行保留）');
   const malformed = events.filter((e) => e.type === 'malformed').map((e) => e as { reason: string });
   assert.ok(malformed.some((m) => m.reason === 'dsml-wrapper'), '包装行应按 dsml-wrapper 上报');
-  // invoke + 配对闭合 → 命令不丢
+  // invoke + 配对闭合 → 命令不丢。v0.3.2 起全部 invoke 统一走块缓冲（含内联属性形态），
+  // 正文约定与 parameter 语义一致：剥首尾各一个换行（内容本身不变）。
   const cmds = commandsOf(events);
   assert.equal(cmds.length, 1);
   assert.equal(cmds[0].name, 'tf-plan');
   assert.equal(cmds[0].id, 'p1');
-  assert.equal(cmds[0].body, '\n- [a1] 验收项\n');
+  assert.equal(cmds[0].body, '- [a1] 验收项');
 });
 
 test('DSML invoke 自闭合：改写回 tf-* 命令（属性透传）', () => {

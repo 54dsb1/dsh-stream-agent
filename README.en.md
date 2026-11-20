@@ -22,7 +22,7 @@ earlier batch — the two are not comparable; see the honest note in
 | ----- | ----- |
 | Host | DeepSeek Harness `0.2.2-rc.1` (type anchor) / `rc.3` (runtime-tested) |
 | Dependencies | Zero npm dependencies; Node ≥ 22.18 (native type stripping) |
-| Tests | 275 cases green, zero API calls (mock full-chain + 20 scenarios + activation/desktop/new-capability/session-format regressions) |
+| Tests | 318 cases green, zero API calls (mock full-chain + 20 scenarios + activation/desktop/new-capability/session-format/host-conformance regressions) |
 | Shape | Single bundle + **dedicated profile** (`profiles/stream` template); `dsh plugin remove` unwinds the whole layer and restores the host loop atomically |
 | Control bar | `dsh-stream-agent bar`: four modes + zh/en + intent triage, onboarding banner on load |
 | Desktop page | Left-rail **Control bar**: status + four mode cards + zh/en switch, **without touching the Electron shell** |
@@ -300,13 +300,13 @@ dsh-stream-agent/
 │                          #   disabled-lines-audit / v0.4.0-plan / TEST-PROPOSITIONS
 ├── scripts/               # build / check-consistency / gate / install-check / install-cycle /
 │                          #   repair-session-logs / release
-└── test/                  # 275 cases (2 kernel + 15 entry suites + 20 mock scenarios; zero API)
+└── test/                  # 318 cases (2 kernel + 21 entry suites + 20 mock scenarios; zero API)
 ```
 
 ## 10. Development
 
 ```bash
-npm test          # 275/275, zero API calls
+npm test          # 318/318, zero API calls
 npm run build     # emits dist/ (25 files) + smoke imports + desktop-page build gates
 npm run check     # R2: assembly & doc consistency (4 checks)
 npm run gate      # R4: release gate (6 items; real-machine items marked honestly)

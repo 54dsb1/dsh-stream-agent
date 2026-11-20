@@ -97,12 +97,19 @@ export function finishMessage(finish                  )         {
                                                                            
                                                  
 
-/** 镜像 types.d.ts:538-580 GenerateOptions（驱动器发出的请求形状） */
+/** 镜像 types.d.ts:538-580 GenerateOptions（驱动器发出的请求形状）。
+ *  v0.3.2：assistant 消息的 messages 项带可选 source（宿主 forAdapter 读
+ *  `message.source.replayState`，缺失即 TypeError → 流 error → 回合中断；
+ *  类型镜像 dsh-llm typert.host.js AssistantProviderMetadata）。 */
                                        
                    
                 
                            
-                                                                                            
+                      
+                 
+                                                       
+                                                                                       
+      
                        
                      
  
@@ -520,6 +527,52 @@ export const DEFAULT_NATIVE_RESULT_LIMIT = 6000;
  *  整块丢弃旧段（ADR-001：整块丢弃路线，显式缓存重置点，原文句柄化可回取）。 */
 export const DEFAULT_SEGMENT_MAX_CHARS = 160_000;
 
+/** v0.3.2：单步正文落追加区的上限（字符）。prose 通常很短；超长只截断历史摘要，
+ *  当期 assistant/message 仍完整落盘（不改变可读输出）。 */
+export const STEP_PROSE_COMMIT_LIMIT = 4000;
+
+/** v0.3.2：同一回合内"输出被截断 → 要求续写"的最大次数。超过即如实 blocked，
+ *  不无限重试（真机 max-tokens 截断的恢复路径需要重发完整命令，次数有界）。 */
+export const MAX_TRUNCATION_RETRIES = 4;
+
+/** v0.3.2：可转正进追加区的易变尾前缀（事实类）。瞬态指令（nudge/degraded/error）不转正。 */
+const DURABLE_TAIL_PREFIXES                    = [
+  '[tf-stream:observation',
+  '[tf-stream:peek',
+  '[tf-stream:tool-result',
+  '[tf-stream:replay',
+];
+
+/** v0.3.2：正文归一化（连续空行压成一个；去首尾空白）——避免 "\n\n\n\n" 的空消息污染正文。 */
+export function normalizeProse(text        )         {
+  return text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** 截断到上限（保留尾部标记，便于台账核对）。 */
+function capText(text        , limit        )         {
+  return text.length <= limit ? text : `${text.slice(0, limit)}…（截断 ${text.length - limit} 字符）`;
+}
+
+/**
+ * v0.3.2：输出截断的续写注入。带已生成内容尾部（≤800 字符）——正文命令被 max-tokens
+ * 截断时，模型可以从断点继续，而不是从头重写整个文件。
+ */
+function truncationNudge(truncation                                 )         {
+  const tail = truncation.raw.length <= 800
+    ? truncation.raw
+    : `…${truncation.raw.slice(truncation.raw.length - 800)}`;
+  const head = truncation.reason === 'max-tokens'
+    ? '上一条请求的输出触及 max tokens 上限，在句子/命令中途被截断。'
+    : `上一条请求的输出在命令中途被截断（${truncation.reason}）。`;
+  return [
+    `[tf-stream:truncated reason=${truncation.reason}] ${head}`,
+    '已完整闭合的命令都已执行，不要重复执行；未闭合的命令没有被执行。',
+    '请从断点继续：把被截断的命令用**新 id**完整重发（正文命令必须给出完整内容，不能只给片段），',
+    '然后继续未完成的工作；任务确实已完成则输出 tf-final（summary 写最终答案原文）。',
+    tail !== '' ? `已生成部分的尾部（供续写定位）：\n${tail}` : '',
+  ].filter((line) => line !== '').join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // ② SingleStreamDriver
 // ---------------------------------------------------------------------------
@@ -644,6 +697,8 @@ export class SingleStreamDriver {
   #requestCount = 0;
   #reentryCount = 0;
   #finalNudges = 0;
+  /** v0.3.2：上次 nudge 时的 ok 命令数（进度感知护栏的基准点；null = 本回合尚未 nudge）。 */
+  #nudgeMark                = null;
   #finalOnlyRequests = 0;
   #deltaCursor = 0; // O3 directoryDelta 游标（obs seq 空间）
   #usage = { inputTokens: 0, outputTokens: 0 };
@@ -685,6 +740,29 @@ export class SingleStreamDriver {
   #pendingReplays                                                         = [];
   #replays = 0;
   #replayCapped = false;
+  /**
+   * v0.3.2 连续性问题（真机 session-e4b9a89c）：请求之间模型看不到自己上一步的正文、
+   * 命令与命令结果——0.3.x 只把观测注入"易变尾"一次（#reportedObservations 永不重放），
+   * 易变尾每请求重建、从不进追加区。于是第 2 个请求之后模型看到的只有 system + 任务 +
+   * 句柄目录行，模型侧原话"history is truncated / I don't have their content in context"，
+   * 随后重复读同一文件、用占位 final 收场。修复：每步的正文 + 命令摘要落进追加区
+   *（assistant/message 语义），已发出的易变尾在下一请求装配后转正为历史（只追加，前缀单调）。
+   */
+  #lastStepDigest   
+                 
+                 
+                  
+                              
+                                                         
+           = null;
+  /** 已随请求发出、尚未转正进追加区的易变尾（含 step 归属，跨回合不转正）。 */
+  #deliveredTail                                                                 = null;
+  /** 本步被截断的事实（parser truncated 事件 / finish=max-tokens）；非空即强制续写一次。 */
+  #truncation                                         = null;
+  #truncationRetries = 0;
+  /** 本步命令 id 与原生调用（摘要用；流开始时重置） */
+  #stepCommandIds           = [];
+  #stepNatives                                      = [];
   /** v0.3.1：当前流内的 prose 累积（parser 的 text 事件拼接；落盘 assistant/message 的正文）。
    *  0.3.0 落盘的是整段原文（含 tf-* 标记与 DSML 噪声）——桌面端过程区把协议标记渲染成乱码，
   *  本版起落盘纯 prose：命令事实在台账（plugin:tf-agent/*），会话日志只留用户可读内容。 */
@@ -809,6 +887,13 @@ export class SingleStreamDriver {
     if (selection.provider !== undefined) this.#cfg.provider = selection.provider;
     if (selection.model !== undefined) this.#cfg.model = selection.model;
     if (selection.reasoningEffort !== undefined) this.#cfg.reasoningEffort = selection.reasoningEffort;
+  }
+
+  /** v0.3.2：assistant 消息宿主来源的实时值（写入时取，不缓存；applySelection 后随动）。
+   *  会话日志与请求装配共用；kind 固定 'model'。空串由 makeAssistantMessage 兜底为
+   *  'unknown'（宿主校验拒绝空字符串）。 */
+  modelSource()                  {
+    return { kind: 'model', provider: this.#cfg.provider, model: this.#cfg.model };
   }
 
   /** Agent 层接线：会话 id（请求路由 stamp）与任务 id（gate 凭据绑定）。 */
@@ -1053,6 +1138,11 @@ export class SingleStreamDriver {
     } finally {
       // K4：回合收束前等待在途命令清理完成（0 后置写），再释放回合 signal。
       await this.#drain();
+      // v0.3.2：回合已结束但最后一步的易变尾还没轮到"下一请求"转正——在此收编，
+      // 保证下个回合（或 resume 后的同会话）仍能看到最后一步的观测事实。
+      if (this.#deliveredTail !== null && this.#deliveredTail.turn === turn) {
+        this.#commitDeliveredTail();
+      }
       if (this.#turnController === controller) this.#turnController = null;
     }
   }
@@ -1065,6 +1155,7 @@ export class SingleStreamDriver {
     // 不重置的话，多任务长会话会在第 N 个回合被历史累计计数误杀（F7 长会话测试实抓）。
     this.#reentryCount = 0;
     this.#finalNudges = 0;
+    this.#nudgeMark = null;
     this.#finalOnlyRequests = 0;
     // v0.3.1：final 收束闸的回合级状态（命令序按回合重置——上一回合的 final 不得收敛本回合）
     this.#cmdOrder = 0;
@@ -1074,9 +1165,14 @@ export class SingleStreamDriver {
     this.#pendingReplays = [];
     this.#replays = 0;
     this.#replayCapped = false;
+    this.#truncationRetries = 0;
+    this.#truncation = null;
     let reason                = { kind: 'blocked', detail: 'turn loop exited without convergence' };
 
     while (true) {
+      // v0.3.2：上一步的正文 + 命令摘要先落追加区（assistant/message 语义），再发下一请求。
+      // 顺序刻意为"摘要 → 易变尾"：模型看到的时间线与真实发生顺序一致。
+      this.#commitStepDigest();
       // ---- steer 注入（修复限制 2）：运行中到达的 steer 在下一请求（内建的"下一步"）生效
       // ——进追加区（只追加，前缀单调不破）；流内不打断：当前流早已跑完才会走到这里。
       if (this.#pendingSteers.length > 0) {
@@ -1098,6 +1194,9 @@ export class SingleStreamDriver {
 
       // ---- REQUEST：装配 + O6 preflight（render() 内置断言，违反即抛 → fail-closed）----
       const messages = this.#renderer.render();
+      // v0.3.2：刚刚发出去的易变尾（上一步的观测/错误/原生结果）转正为追加区历史——
+      // 下一次请求仍可见（缓存读），不再"注入一次就消失"。只追加，前缀单调性不变。
+      this.#commitDeliveredTail();
       const stableHash = this.#renderer.stableHash();
       this.#stableHashes.push(stableHash);
       const fullHash = renderHash(messages);
@@ -1137,6 +1236,16 @@ export class SingleStreamDriver {
       // ---- 收束判定（仅三种重入事由：失败/拒绝、high 观测、peek 需求）----
       const issues = this.#collectIssues();
       const injections = this.#buildInjections(issues, level);
+      // v0.3.2 截断修复：输出在命令中途被截断（max-tokens / 流异常终止 / DSML 块未闭合）时，
+      // 0.3.1 只记一条 truncated 台账、不产生任何重入事由——模型以为任务结束，用户看到
+      // 半截输出。这里强制一次续写注入（带上已生成内容尾部，便于从断点续写）；
+      // 回合级上限 MAX_TRUNCATION_RETRIES，超限如实 blocked，不无限烧请求。
+      if (this.#truncation !== null && level !== 'final-only' && this.#truncationRetries < MAX_TRUNCATION_RETRIES) {
+        this.#truncationRetries += 1;
+        injections.blocks.push({ role: 'user', content: truncationNudge(this.#truncation) });
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'output-truncated', detail: `${this.#truncation.reason}（第 ${this.#truncationRetries} 次续写）` });
+        this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'output-truncated', reason: this.#truncation.reason, retry: this.#truncationRetries, turn });
+      }
       // 饥饿防线（07 号结果 §3.6 上报的断链，08 号评测前按其建议修复）：
       // 升格骨架接入注入通路（按 high 观测同款格式；final-only 档不注入——预算已枯竭）。
       const promoted = this.#obs.noteStep(injections.highInjected);
@@ -1214,9 +1323,14 @@ export class SingleStreamDriver {
       const needsReentry = issues.length > 0 || injections.blocks.length > 0 || prematureFinal !== undefined || pendingSteerCount > 0;
 
       if (prematureFinal !== undefined && lastFinal !== undefined) {
+        // v0.3.2：计划门槛拒绝时附上计划快照——模型看不到计划内容就无法验收
+        //（真机里计划只在创建那一步的易变尾出现过一次，随后彻底消失）。
+        const planBlock = prematureFinal.includes('计划') ? this.#planSnapshot() : '';
         injections.blocks.push({
           role: 'user'         ,
-          content: `[tf-stream:error id=${lastFinal.cmdId} cmd=tf-final] ${prematureFinal}\n建议：先取回所需结果（tf-peek）或补齐未完成命令，然后在流末尾用新 id 重发 tf-final；summary 必须包含最终答案原文（数字/行内容/路径/结论），不得占位。`,
+          content: `[tf-stream:error id=${lastFinal.cmdId} cmd=tf-final] ${prematureFinal}\n`
+            + (planBlock !== '' ? `当前计划：\n${planBlock}\n` : '')
+            + '建议：先取回所需结果（tf-peek）或补齐未完成命令，然后在流末尾用新 id 重发 tf-final；summary 必须包含最终答案原文（数字/行内容/路径/结论），不得占位。',
         });
         this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'premature-final', detail: prematureFinal });
         this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'premature-final', detail: prematureFinal, turn });
@@ -1250,7 +1364,14 @@ export class SingleStreamDriver {
       }
 
       const finalOnlyGate = level === 'final-only' && this.#finalOnlyRequests >= 1;
-      const nudgeExhausted = !needsReentry && !finalSeen && this.#finalNudges >= 1;
+      // v0.3.2：nudge 进度感知护栏。nudge 不再是一次性预算——被提示后模型**继续产出**
+      // （新 ok 命令）就不算"提示失效"，绝不因此中断生产性工作；只有"零产出的连续
+      // nudge"（真打转）才 blocked。整体仍由 maxReentries / O5 预算阶梯兜底。
+      // 真机取证（session-8f22c7a0）：旧语义下 nudge 在写文件步被消耗，随后的崩溃步
+      // （或任何无注入的写步）直接 nudgeExhausted → 任务中断。
+      const okCommandCount = [...this.#commands.values()].filter((r) => r.status === 'ok').length;
+      const progressSinceNudge = this.#nudgeMark === null || okCommandCount > this.#nudgeMark;
+      const nudgeExhausted = !needsReentry && !finalSeen && this.#finalNudges >= 1 && !progressSinceNudge;
       if (this.#aborted || finalOnlyGate || nudgeExhausted || this.#reentryCount >= this.#cfg.maxReentries) {
         if (this.#aborted) {
           reason = { kind: 'aborted', reason: this.#abortReason instanceof Error ? this.#abortReason.message : String(this.#abortReason ?? 'cancelled') };
@@ -1291,8 +1412,10 @@ export class SingleStreamDriver {
           this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'degraded-delivery' });
           this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'degraded-delivery', turn });
         } else {
-          // 无重入事由但也没 tf-final：一次性提示（护栏防无限循环）
+          // 无重入事由但也没 tf-final：进度感知提示（护栏防无限循环——真打转由
+          // nudgeExhausted 的"零产出"判定收束，不靠提示次数）。
           this.#finalNudges += 1;
+          this.#nudgeMark = [...this.#commands.values()].filter((r) => r.status === 'ok').length;
           tail = [{
             role: 'user'         ,
             content: rejectedFinal !== undefined
@@ -1305,6 +1428,12 @@ export class SingleStreamDriver {
       this.#injectedChars += tail.reduce((n, b) => n + b.content.length, 0);
       if (level === 'final-only') this.#finalOnlyRequests += 1;
       this.#renderer.setTail(tail);
+      // v0.3.2：这批尾块会随下一请求发出；发出后由 #commitDeliveredTail 转正为历史。
+      this.#deliveredTail = {
+        turn,
+        step,
+        blocks: tail.map((b) => ({ role: (b.role ?? 'user')                         , content: b.content })),
+      };
       this.#reentryCount += 1;
     }
 
@@ -1347,6 +1476,10 @@ export class SingleStreamDriver {
     // 新流：隐式写序的流内序号清零（跨流依赖仍由 depends_on 显式声明）
     this.#streamSeqCounter = 0;
     this.#streamWrites = [];
+    // v0.3.2：本步摘要与截断事实（续写注入 + 追加区转录用）
+    this.#stepCommandIds = [];
+    this.#stepNatives = [];
+    this.#truncation = null;
     const parser = new TfStreamParser();
     const controller = new AbortController();
     this.#activeControllers.add(controller);
@@ -1493,6 +1626,23 @@ export class SingleStreamDriver {
     // 流终止：冲刷 parser（truncated / done）
     for (const event of parser.end()) this.#handleParserEvent(event, turn, step);
 
+    // v0.3.2：finish=max-tokens 本身就是"输出被截断"的硬信号（即使命令恰好闭合，
+    // 正文也可能停在半句）。与 parser 的 truncated 事件合并成一次续写事由。
+    if (finish.kind === 'max-tokens' && this.#truncation === null) {
+      this.#truncation = { reason: 'max-tokens', raw: this.#streamProse };
+    }
+    // 本步摘要：下一步请求装配前落追加区（#commitStepDigest）
+    this.#stepNatives = (finish.kind === 'stop' || finish.kind === 'tool-calls')
+      ? [...natives.values()].map((c) => ({ id: c.id, name: c.name ?? 'unknown' }))
+      : [];
+    this.#lastStepDigest = {
+      turn,
+      step,
+      prose: this.#streamProse,
+      cmdIds: [...this.#stepCommandIds],
+      natives: [...this.#stepNatives],
+    };
+
     // 会话落盘：assistant 消息（成功 → assistant/message；error/aborted → attempt / 中断消息）
     // v0.3.0：原生 tool_call 通道要在**同一条** assistant 消息里广告 tool-call 块，
     // 否则随后宿主写出的 tool/call 在 v4 格式校验里没有生命周期 → 历史加载被判 corrupt。
@@ -1506,7 +1656,9 @@ export class SingleStreamDriver {
     const reasoningText = reasoningParts.join('\n');
     let settlement                                                 ;
     try {
-      settlement = this.#ports.events?.assistantMessage(turn, step, this.#streamProse, {
+      // v0.3.2：落盘正文归一化（去纯空白消息 / 压缩连续空行）——0.3.1 常见 "\n\n\n\n"
+      // 空气泡，桌面端过程区看起来就是"被截断的空白"。
+      settlement = this.#ports.events?.assistantMessage(turn, step, normalizeProse(this.#streamProse), {
         finish,
         usage: usageSeen,
         toolCalls: nativeAds,
@@ -1552,6 +1704,8 @@ export class SingleStreamDriver {
       case 'truncated':
         this.#record({ seq: ++DRIVER_SEQ, kind: 'truncated', raw: event.raw, reason: event.reason });
         this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'truncated-command', reason: event.reason });
+        // v0.3.2：截断不再只是台账——本步结束前由 #turnLoop 强制一次续写注入。
+        this.#truncation = { reason: event.reason, raw: event.raw };
         break;
       case 'cycle':
         // 环上的命令永不就绪 → 收束判定以结构化错误重入
@@ -1574,6 +1728,8 @@ export class SingleStreamDriver {
     // v0.3.1：回合级命令序（跨请求单调）。final 之后又发过非 final 命令 → 那条 final 过期
     //（模型写完 final 又继续干活；旧答案不能当成交付内容）。
     const order = ++this.#cmdOrder;
+    // v0.3.2：本步摘要（含重复 id 的命令——模型确实发过它们，历史要如实）
+    this.#stepCommandIds.push(cmd.id);
     if (cmd.name !== 'tf-final') this.#lastNonFinalOrder = order;
     const prev = this.#commands.get(cmd.id);
     if (prev !== undefined) {
@@ -1703,6 +1859,71 @@ export class SingleStreamDriver {
     }
     this.#pendingReplays = [];
     return out;
+  }
+
+  /**
+   * v0.3.2：把上一步的正文 + 命令摘要落进追加区（assistant/message 语义）。
+   *
+   * 为什么必须有：渲染器只持有"稳定前缀 + 追加区 + 易变尾"。0.3.x 从不往追加区写
+   * assistant/工具事实，易变尾又每请求重建——模型在第 2 个请求起就只看到 system + 任务 +
+   * 句柄目录行。真机 session-e4b9a89c 里模型的原话是"The history is truncated. I don't see
+   * the plan content"，随后反复重读、计划无法验收、9 步后 blocked。
+   *
+   * 对齐内建 dsh-agent-loop 的语义：`session.deriveMessages()` 每步都把完整的
+   * assistant/message（含 tool-call 块）与 tool/result 回放给模型；这里用压缩摘要
+   *（id/命令/目标/状态/句柄/字符数）落追加区，原结果由随后的易变尾转正承载。
+   */
+  #commitStepDigest()       {
+    const digest = this.#lastStepDigest;
+    this.#lastStepDigest = null;
+    if (digest === null) return;
+    const prose = normalizeProse(digest.prose);
+    if (prose !== '') {
+      // v0.3.2：assistant 历史块必须带 source（宿主 forAdapter 无防护读
+      // source.replayState；缺失 = 请求崩溃。provider/model 取驱动器实时路由）。
+      this.#renderer.appendHistory({ role: 'assistant', content: capText(prose, STEP_PROSE_COMMIT_LIMIT), source: this.modelSource() });
+    }
+    const lines           = [];
+    for (const id of digest.cmdIds) {
+      const rec = this.#commands.get(id);
+      if (rec === undefined) continue;
+      const target = rec.cmd.attrs['path'] ?? rec.cmd.attrs['cmd'] ?? rec.cmd.attrs['pattern']
+        ?? rec.cmd.attrs['handle'] ?? rec.cmd.attrs['summary'] ?? '';
+      const detail = rec.detail !== undefined && rec.detail !== '' ? ` · ${capText(rec.detail, 120)}` : '';
+      lines.push(
+        `- ${id} ${rec.cmd.name}${target !== '' ? ` ${capText(target, 120)}` : ''} → ${rec.status}`
+        + `${rec.handle !== undefined ? ` handle=${rec.handle}` : ''}${detail}`,
+      );
+    }
+    for (const native of digest.natives) {
+      lines.push(`- native ${native.name} (callId=${native.id}) → 已执行，结果见随后注入块`);
+    }
+    if (lines.length === 0) return;
+    this.#renderer.appendHistory({
+      role: 'user',
+      content: `[tf-stream:step step=${digest.step} 上一步动作与结果]\n${lines.join('\n')}`,
+    });
+  }
+
+  /** v0.3.2：把已随请求发出的易变尾转正为追加区历史（下一请求仍可见，不再一次性蒸发）。
+   *  只转正"事实类"块（观测/peek/原生结果/回灌）；nudge / degraded / error 这类
+   *  瞬态指令不回灌历史——否则下一回合模型会把过期的"预算告急""final 被拒"当现状。 */
+  #commitDeliveredTail()       {
+    const delivered = this.#deliveredTail;
+    this.#deliveredTail = null;
+    if (delivered === null) return;
+    for (const block of delivered.blocks) {
+      if (!DURABLE_TAIL_PREFIXES.some((prefix) => block.content.startsWith(prefix))) continue;
+      this.#renderer.appendHistory({ role: block.role, content: block.content });
+    }
+  }
+
+  /** F5 计划快照（final 被计划门槛拒绝时随注入一起给出，模型不必凭记忆猜验收项）。 */
+  #planSnapshot()         {
+    if (this.#plan === null) return '';
+    return [...this.#plan.items.entries()]
+      .map(([id, item]) => `- [${id}] ${item.text}（${item.status}）`)
+      .join('\n');
   }
 
   /** 派发所有就绪命令（依赖全部 ok、未派发），并发上限 maxParallelToolCalls。
@@ -2266,9 +2487,13 @@ export class SingleStreamDriver {
             const fp = full === null ? 'unavailable' : contentFingerprint(full);
             blocks.push({
               role: 'user',
+              // v0.3.2 文案修正：写入正文不回灌——跨流步骤后"全文已在你的上下文中"是假的
+              // （真机 session-8f22c7a0：模型自述 "I don't have the exact text visible"，
+              // 被迫全量重写四个文件）。如实说明 + 给 tf-peek 取回路径。
               content: `[tf-stream:receipt handle=${obs.handle ?? ''} path=${rec.cmd.attrs['path']} lines=${lines} sha256=${fp}]`
-                + `\n该路径由你本任务的 tf-write 写入，全文已在你的上下文中，不重复回灌（回验纪律）。`
-                + `写失败会有 [tf-stream:error]；没有错误注入即写成功。确需局部比对用 tf-peek handle="${obs.handle}" from_line=.. to_line=..。`,
+                + `\n该路径由你本任务的 tf-write 写入，写入成功（写失败会有 [tf-stream:error]；没有错误注入即写成功）。`
+                + `写入正文不回灌（回验纪律）——若它是在更早的流步骤写的，你当前上下文里没有原文。`
+                + `需要原文（全量或行段）用 tf-peek handle="${obs.handle}" 取回；需要修改用 tf-edit 的 OLD 精确字面量可先 tf-peek 取回后再改。`,
             });
             highInjected = true;
             continue;
@@ -2506,7 +2731,13 @@ function finishDetail(finish                  )         {
 
 /** RenderMessage → GenerateOptions.messages 线格式（loop-built 请求：首条 system 携带系统提示）。 */
 function toWireMessages(messages                          )                                   {
-  return messages.map((m) => ({ role: m.role, content: [{ type: 'text'         , text: m.content }] }));
+  // v0.3.2：assistant 消息必须携带 source（宿主 LlmRuntime.forAdapter 无防护读
+  // `message.source.replayState`，GitHub master 同源；缺失 = 流 error → 回合中断）。
+  return messages.map((m) => ({
+    role: m.role,
+    content: [{ type: 'text'         , text: m.content }],
+    ...(m.source === undefined ? {} : { source: { ...m.source } }),
+  }));
 }
 
 /**
@@ -2543,6 +2774,22 @@ export function normalizeStreamShim(inner                                )      
 // ---------------------------------------------------------------------------
 
 /**
+ * 会话日志 assistant 消息的 model source（v0.3.2 修复）。
+ * 宿主校验器（dsh-session assertMessageEventShape → hasProviderModel）要求
+ * `source = {kind:'model', provider:<非空字符串>, model:<非空字符串>}`；缺 provider/model
+ * 的日志在读取时抛 `message must have model source`，整条会话被判 corrupt——桌面端
+ * 表现为"历史加载失败"。0.3.1 及更早版本只写了 `{kind:'model'}`，本类型把实时
+ * provider/model 带进写入路径（applySelection 换模后随动）。
+ */
+/** v0.3.2：assistant 消息的宿主来源（会话日志 source 与请求装配的 RenderMessage.source
+ *  共用）。kind 固定 'model'（宿主 forAdapter/validateReplay 都先读 source.kind）。 */
+                                  
+                
+                   
+                
+ 
+
+/**
  * 从 duck-typed Session 构造 TurnEventWriter。
  * 事件形状对照：turn/start {turn}（:731）、step/start {turn,step}（:757）、
  * step/end {turn,step}（:781）、turn/end {turn,reason}（:819）、
@@ -2550,8 +2797,12 @@ export function normalizeStreamShim(inner                                )      
  * assistant/attempt {turn,step,stream}（:924）。assistant message 形状镜像
  * dsh-llm createAssistantMessage（lib/types/message.js:64-73）：{id, role:'assistant',
  * content:[{type:'text',text}], source:{kind:'model', provider, model}}（探针 C 实测可写）。
+ *
+ * v0.3.2：modelInfo 在**写入时**调用（不缓存）——applySelection 运行时换模后随动；
+ * 缺省（离线/无模型路由信息）时 provider/model 落 'unknown'，保证日志形状仍可通过
+ * 宿主校验（空字符串同样会被 hasProviderModel 拒绝）。
  */
-export function createSessionEventWriter(session         )                              {
+export function createSessionEventWriter(session         , modelInfo                        )                              {
   const s = session                                                                                     ;
   if (s === undefined || typeof s.append !== 'function') return undefined;
   const append = (type        , data         , opts          )       => {
@@ -2578,7 +2829,7 @@ export function createSessionEventWriter(session         )                      
           // 中断但有部分正文：assistant/message + interrupted（镜像内建 :891-905）
           return appendSettling('assistant/message', {
             turn, step,
-            message: makeAssistantMessage(text, [], reasoning),
+            message: makeAssistantMessage(text, [], reasoning, modelInfo?.()),
             interrupted: true,
             ...usageField,
             stream: [],
@@ -2592,7 +2843,7 @@ export function createSessionEventWriter(session         )                      
       }
       return appendSettling('assistant/message', {
         turn, step,
-        message: makeAssistantMessage(text, toolCalls, reasoning),
+        message: makeAssistantMessage(text, toolCalls, reasoning, modelInfo?.()),
         ...usageField,
         stream: [],
       }, { surfaceOp: 'append' });
@@ -2604,7 +2855,7 @@ export function createSessionEventWriter(session         )                      
       // （宿主校验器用严格相等比对 name/arguments）。
       append('assistant/message', {
         turn, step,
-        message: makeAssistantMessage('', calls),
+        message: makeAssistantMessage('', calls, undefined, modelInfo?.()),
         stream: [],
       }, { surfaceOp: 'append' });
     },
@@ -2659,7 +2910,7 @@ export function createSessionEventWriter(session         )                      
     finalAnswer(turn, step, text) {
       append('assistant/message', {
         turn, step,
-        message: makeAssistantMessage(text),
+        message: makeAssistantMessage(text, [], undefined, modelInfo?.()),
         stream: [],
       }, { surfaceOp: 'append' });
     },
@@ -2671,17 +2922,24 @@ export function createSessionEventWriter(session         )                      
 
                                                                                                                                                                        
 
-function makeAssistantMessage(text        , toolCalls                                   = [], reasoning         )                                                                                                 {
+/**
+ * 构造 assistant 消息（形状镜像 dsh-llm createAssistantMessage，lib/types/message.js:64-73）。
+ * v0.3.2：source 必须携带非空 provider/model（宿主 hasProviderModel 校验，缺了整条日志
+ * 判 corrupt）；缺写入方未提供或为空串时落 'unknown'——日志保持可加载，不谎报模型。
+ */
+function makeAssistantMessage(text        , toolCalls                                   = [], reasoning         , modelInfo                  )                                                                                                                                  {
   const content                          = [];
   // v0.3.1：reasoning 块在首位（镜像内建 BlockAssembler 的流序：思考先于正文）。
   if (reasoning !== undefined && reasoning.trim() !== '') content.push({ type: 'reasoning', text: reasoning });
   if (text.length > 0) content.push({ type: 'text', text });
   for (const call of toolCalls) content.push({ type: 'tool-call', id: call.id, name: call.name, arguments: call.arguments });
+  const provider = modelInfo?.provider !== undefined && modelInfo.provider !== '' ? modelInfo.provider : 'unknown';
+  const model = modelInfo?.model !== undefined && modelInfo.model !== '' ? modelInfo.model : 'unknown';
   return {
     id: randomUUID(),
     role: 'assistant',
     content,
-    source: { kind: 'model' },
+    source: { kind: 'model', provider, model },
   };
 }
 
@@ -2703,9 +2961,15 @@ function makeAssistantMessage(text        , toolCalls                           
                 
                                                          
                                                                            
-                                                                          
+                                                                           
                                                                      
                              
+                                                       
+                                                              
+                                                                     
+                                          
+                                 
+                                                                                 
                                                           
  
 
@@ -2729,6 +2993,8 @@ export class StreamLoopAgent {
   #selection                                                               ;
   #disposeScope                                   ;
   #disposed = false;
+  /** v0.3.2：agent/status 发射出口（宿主事件总线；缺省 = 不发）。 */
+  #emitStatus                                                                                  = undefined;
 
   constructor(deps                     ) {
     this.id = deps.id;
@@ -2736,6 +3002,7 @@ export class StreamLoopAgent {
     this.#driver = deps.driver;
     this.#storedHandle = deps.storedHandle;
     this.#warning = deps.onWarning ?? (() => {});
+    this.#emitStatus = deps.emitStatus;
     this.#selection = deps.modelSelection ?? { provider: '', model: '' };
     // 作用域 key = agent 实例本身（镜像内建 createScope(loopCtx, this)）。宿主工具执行器
     // selectExecutor(input.agent) 与守卫 chainLayers(exec.agent) 都按 scopeChainOf(agent)
@@ -2810,6 +3077,23 @@ export class StreamLoopAgent {
     if (this.#status === 'idle') this.#startNextTurn();
   }
 
+  /** v0.3.2：桌面端命令路径的通知注入（dsh-user-approval setPolicy:127 实测调用
+   *  `agent.inject(...)`——0.3.1 缺这个方法，改审批策略的命令以
+   *  "agent.inject is not a function" 报错收场）。镜像内建 send(input,'next-step',false)：
+   *  落盘 + 并入"下一步"装配，但**不唤醒空闲 agent**（通知型注入不该自己开回合）。
+   *  pendingSteers 在 runTurn 的每次请求前消费（含下一回合首请求）——无论运行中还是
+   *  空闲都走同一通道，下一请求必然可见；steer/inject 的区别只在唤醒，与内建一致。 */
+  inject(message                                                                                                       )       {
+    if (this.#disposed) throw new Error(`agent "${this.id}": inject after dispose`);
+    const text = message.content
+      .map((block) => (typeof block === 'object' && block !== null && 'text' in block && typeof (block                      ).text === 'string' ? (block                    ).text : ''))
+      .join('\n');
+    debugTrace('inject', { id: this.id, chars: text.length, running: this.#status === 'running' });
+    this.#appendSessionEvent('user/message', message, { surfaceOp: 'append' });
+    if (text.trim() === '') return;
+    this.#driver.pushSteer(text, message);
+  }
+
   /** 桌面端空内容续跑路径读取的 inbox 面（prompt:37548）。修复限制 2 后：
    *  nextStep 如实暴露尚未消费的 steer（已注入装配历史的从队列移除）；
    *  nextTurn 恒为空（单流没有跨回合排队注入）。 */
@@ -2858,11 +3142,23 @@ export class StreamLoopAgent {
     }
   }
 
+  /** v0.3.2：运行态转换统一出口（只在真正变化时发 agent/status，镜像内建 setPhase 语义）。
+   *  发射失败不阻断回合（fail-open，告警不静默）。 */
+  #setStatus(next                    )       {
+    if (this.#status === next) return;
+    this.#status = next;
+    try {
+      this.#emitStatus?.({ agent: this, status: next });
+    } catch (error) {
+      this.#warning(`agent "${this.id}": agent/status 发射失败（不阻断回合）`, error);
+    }
+  }
+
   /** 开下一回合（inbox 逐条串行驱动）。 */
   #startNextTurn()       {
     const next = this.#inbox.shift();
     if (next === undefined) return;
-    this.#status = 'running';
+    this.#setStatus('running');
     this.#running = (async () => {
       try {
         this.#driver.pushUserTask(next.text);
@@ -2874,7 +3170,7 @@ export class StreamLoopAgent {
       } finally {
         this.#running = undefined;
         if (this.#cancelCause !== undefined) {
-          this.#status = 'idle';
+          this.#setStatus('idle');
           if (!this.#cancelCause.keepInbox) this.#inbox.length = 0;
           this.#cancelCause = undefined;
           return;
@@ -2883,7 +3179,7 @@ export class StreamLoopAgent {
           this.#startNextTurn();
           return;
         }
-        this.#status = 'idle';
+        this.#setStatus('idle');
       }
     })();
   }
@@ -3213,6 +3509,16 @@ export function createStreamAgentFactory(deps                        )
           model: args.agentOptions.model ?? '',
           reasoningEffort: args.agentOptions.reasoningEffort,
         },
+        // v0.3.2（UI 卡住修复）：宿主事件总线在位（cordis ctx.emit）才接 agent/status。
+        // 桌面端 dsh-api-session-controller 监听它转发 api-session/status（running 布尔），
+        // 客户端据此收起"运行中"指示——不接线 = 回合结束后 UI 永远转圈。
+        ...(typeof (deps.ctx                      ).emit === 'function'
+          ? {
+              emitStatus: (payload                                                ) => {
+                (deps.ctx                                                      ).emit('agent/status', payload);
+              },
+            }
+          : {}),
         onWarning: warning,
       });
       debugTrace('agent.constructed');
@@ -3612,6 +3918,10 @@ export default function apply(ctx
         }
       };
       const intentSeqState = intentsEnabled ? loadIntentState() : { seq: 0 };
+      // v0.3.2（会话日志 model source 修复）：writer 在 driver 之前构造，provider/model
+      // 却要到**写入时**才取实时值（applySelection 换模后随动）——用可变持有者回填。
+      // 写入只发生在回合协程内（构造早已完成），时序安全。
+      let driverRef                                ;
       const driver = new SingleStreamDriver(
         {
           stream: (options) => llm.stream(options),
@@ -3640,11 +3950,12 @@ export default function apply(ctx
                 },
               }
             : {}),
-          events: createSessionEventWriter(session),
+          events: createSessionEventWriter(session, () => driverRef?.modelSource()),
           onWarning: warning,
         },
         cfg,
       );
+      driverRef = driver;
       // K2：会话工作区解析（tf-code resolve 透传用）。会话 header.cwd（会话原始目录）
       // 优先，缺省回退宿主 workingDirectory 服务的部署默认目录；两者都不可得则不传，
       // 由宿主按自己的默认语义解析。插件不复制宿主的优先级规则。
