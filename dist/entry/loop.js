@@ -2318,7 +2318,11 @@ export class SingleStreamDriver {
     }
 
     rec.status = 'ok';
-    rec.detail = `${contentText.length} chars`;
+    // v0.3.3：detail 显示**写入正文的大小**（cmd.body = 解析器捕获的原文长度）——
+    // 旧实现显示 contentText.length（回执包装 `<path>...Created file...</content>`
+    // 的自身长度 ≈144 字符），模型误读为"文件只有 144 字符"→ 触发全量重写
+    // （真机 session-3d4caf01：白烧 2-3 步 + 1 万思考 token）。
+    rec.detail = `written ${(cmd.body ?? '').length} chars`;
     rec.handle = observation.handle ?? undefined;
     if (cmd.name === 'tf-write' && typeof cmd.attrs['path'] === 'string') {
       // 修复限制 1：登记本任务自写路径（tf-read 命中时只注入回执，掐断"写→读回验"循环）
@@ -2340,7 +2344,9 @@ export class SingleStreamDriver {
     });
     this.#ledgerWrite('plugin:tf-agent/command', {
       cmdId: cmd.id, name: cmd.name, status: 'ok',
-      handle: rec.handle, infoGain: observation.info_gain, chars: contentText.length,
+      handle: rec.handle, infoGain: observation.info_gain,
+      // v0.3.3：写入类命令的 chars = 写入正文的大小（与 digest 一致），不是回执包装长度。
+      chars: (cmd.body ?? '').length,
     });
   }
 

@@ -66,8 +66,24 @@
   上限由模式默认值决定；驱动器直构兜底值同步 8→12。缓存命中同批真机 91%
   （`session-7fbfef8f` 26.6K tok），顺序修复生效。
 
-**回归**：新增 `test/v032-conflict.test.ts` 4 用例（W1 线消息 source / W2 nudge 进度感知 /
-W3 实体解码 / W4 DSML 内联属性混合形态）；全量 327/327 离线通过（零 API 调用）。
+**回归**：新增 `test/v032-conflict.test.ts` 6 用例（W1 线消息 source / W2 nudge 进度感知 /
+W3 实体解码 / W4 DSML 内联属性混合形态 / W6 mangled name 抢救 / W7 写入尺寸如实）+
+`test/v033-wildcard-closer.test.ts` 9 用例；全量 329/329 离线通过（零 API 调用）。
+
+### Fixed（第二轮真机修复 —— 缓存 91% 后的残留截断，真机 `session-d6cd0759`/`3d4caf01`/`7fbfef8f`，2026-11-21）
+
+- **装配清单解除 `maxReentries: 8` 钉死（决定性）**：cordis.patch.yml / preset.yml 的显式
+  钉死按"装配压过模式"规则压制了上限提升——11:57 的会话仍以"重入上限 8"硬杀
+  （模型正重写到一半）。现在上限由模式默认值决定；驱动器直构兜底同步 8→12。
+- **写入类 digest 尺寸如实**：写入成功的摘要行显示 `written N chars`（N = 解析器捕获的
+  正文大小）——旧实现显示回执包装自身的长度（≈144 字符），模型误读为"文件只有 144
+  字符"→ 触发全量重写（`session-3d4caf01`，白烧 2-3 步 + 1 万思考 token）。
+- **mangled DSML name 值抢救**：`name="tf-peek handle="obs:...""`（全部属性塞进
+  name 值、引号数为奇数）——旧实现整条丢弃。三件套：scanHeaderClose 引号不成对时
+  退化为取最后一个 '>'（残片仍等待）；name 值以合法命令名开头时改写为闭合形式；
+  自闭合 invoke 进块缓冲（findDsmlInvokeEnd 自闭合分支，含端点修正）。
+  `session-d6cd0759` seq 110 的整条 tf-peek 现在完整恢复（handle/from_line/to_line/id
+  全部归位）。
 
 
 ## [0.3.2] - 2026-11-21

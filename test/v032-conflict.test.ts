@@ -189,3 +189,48 @@ test('W4. DSML 内联属性 + parameter 混合形态：整体缓冲，命令属�
   assert.ok(!prose.includes('DSML'), '包装残片不得进正文');
   assert.ok(!prose.includes('README.md'), '参数值不得进正文');
 });
+
+// ---------------------------------------------------------------- W6-W8（v0.3.3 第二批：真机 session-d6cd0759/3d4caf01）
+
+test('W6. mangled DSML name 值抢救：属性塞进 name 值（奇数引号）→ 命令完整恢复', () => {
+  // 真机 session-d6cd0759 seq 110 原形态：整条 tf-peek 丢失（dsml-wrapper malformed）
+  const p = new TfStreamParser();
+  const events = p.feed('<｜｜DSML｜｜ invoke name="tf-peek handle="obs:bash:b3@v1" from_line="1" to_line="30" id="p3"/>\n');
+  events.push(...p.end());
+  const cmds = commandsOf(events);
+  assert.equal(cmds.length, 1, `mangled 形态应抢救出完整命令：${JSON.stringify(events.map((e) => e.type))}`);
+  assert.equal(cmds[0]!.name, 'tf-peek');
+  assert.equal(cmds[0]!.id, 'p3');
+  assert.equal(cmds[0]!.attrs['handle'], 'obs:bash:b3@v1');
+  assert.equal(cmds[0]!.attrs['from_line'], '1');
+  assert.equal(cmds[0]!.attrs['to_line'], '30');
+  const prose = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
+  assert.ok(!prose.includes('obs:bash'), '属性值不得泄漏进正文');
+  assert.equal(events.filter((e) => e.type === 'malformed').length, 0, '抢救成功零 malformed');
+});
+
+test('W7. 写入类 digest 尺寸如实：detail = 写入正文大小（不是回执包装长度）', async () => {
+  const responses: ReadonlyArray<readonly StreamChunkLike[]> = [
+    [
+      textDelta('写文件。\n'),
+      textDelta('<tf-write path="m.py" id="w1">\nimport re\nTOTAL=2315\n</tf-write>\n'),
+      finishStop(),
+    ],
+    [
+      textDelta('写入完成（2315 字节文件已落盘），任务完成。\n'),
+      textDelta('<tf-final id="f1" summary="m.py 已写入（import re + TOTAL=2315），任务完成。"/>\n'),
+      finishStop(),
+    ],
+  ];
+  const harness = makeHarness(responses, '写 m.py 后收尾。');
+  try {
+    const reason = await harness.driver.runTurn();
+    assert.equal(reason.kind, 'completed', JSON.stringify(reason));
+    // 第 2 请求的 digest 摘要行：detail 必须是写入正文的大小（26），不是回执包装长度（~144）
+    const second = harness.wireRequests[1]!.map((m) => (m.content as Array<{ text: string }>).map((b) => b.text).join('')).join('\n');
+    assert.ok(second.includes('written 22 chars'), `digest 应显示写入正文大小（written 26 chars）：${second.slice(0, 300)}`);
+    assert.ok(!second.includes('144 chars'), '不得再出现回执包装长度（模型误读为文件大小的根因）');
+  } finally {
+    harness.cleanup();
+  }
+});

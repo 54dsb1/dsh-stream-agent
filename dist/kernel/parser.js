@@ -343,11 +343,12 @@ export class TfStreamParser {
       // 模式，非正文命令的 DSML 包装残片会被吞到流末才以 malformed 露出
       // （真机 session-8f22c7a0 step 2：三条闭合标签残片）。
       const dsml = parseDsmlTag(raw, close.selfClosing);
+      // v0.3.3：自闭合 invoke（`.../>`）同样走缓冲——mangled name 抢救后属性齐全的
+      // 自闭合调用照常发命令（parseDsmlBlock 的 selfClosing 分支立即 flush）。
       if (
         dsml !== null
         && dsml.name === 'invoke'
         && !dsml.closing
-        && !close.selfClosing
         && dsml.commandName !== null
       ) {
         this.dsmlBuf = raw;
@@ -574,6 +575,13 @@ function scanHeaderClose(buf        )                                           
       return { end: i, selfClosing: buf[i - 1] === '/' };
     }
   }
+  // v0.3.3：引号不成对（mangled DSML name 值，奇数个引号——真机 session-d6cd0759
+  // seq 110：`name="tf-peek handle="obs:...`）时严格扫描永不闭合，header 模式等死，
+  // 整条命令在流末按 malformed 丢弃。退化通道：取**最后一个** '>' 作为标签端界
+  //（残片形态没有 '>' 仍返回 null 等更多数据；正常标签引号成对，严格扫描先行命中，
+  // 退化通道不触发）。
+  const gt = buf.lastIndexOf('>');
+  if (gt > 0) return { end: gt, selfClosing: buf[gt - 1] === '/' };
   return null;
 }
 
@@ -642,7 +650,17 @@ function parseDsmlTag(raw        , selfClosing         )                 {
   const m = inner.match(/^｜+DSML｜*\s*([a-zA-Z][a-zA-Z0-9_-]*)([\s\S]*)$/);
   if (m === null) return null;
   const name = m[1] ;
-  const attrs = parseAttrPairs(m[2] );
+  // v0.3.3：mangled name 值抢救——模型把全部属性塞进了 name 值且忘了闭引号
+  // （真机 session-d6cd0759 seq 110：`name="tf-peek handle="obs:bash:b2@v1"
+  //  from_line="1" to_line="30" id="p3"/>`——整条 peek 丢失）。name 值以合法
+  //  tf-* 命令名开头且带空格时，把 "name=\"tf-xxx " 改写为 "name=\"tf-xxx\" "，
+  //  余段还原为正常属性对（引号结构本就完好）。
+  let attrSegment = m[2] ;
+  const nameAttr = /\sname\s*=\s*"(tf-[a-z]+)\s+/.exec(attrSegment);
+  if (nameAttr !== null && COMMAND_NAMES.includes(nameAttr[1]                 )) {
+    attrSegment = attrSegment.replace(nameAttr[0], ` name="${nameAttr[1]}" `);
+  }
+  const attrs = parseAttrPairs(attrSegment);
   const commandName = attrs['name'] !== undefined && COMMAND_NAMES.includes(attrs['name']                 )
     ? (attrs['name']                 )
     : null;
@@ -726,6 +744,13 @@ function findNonBodyBoundaryWithDsml(buf        )         {
 
 /** DSML 段结束位置（含结束标签本身）：`</invoke>` / `</tf-name>` / （非正文）下一个 tf 标签。 */
 function findDsmlInvokeEnd(buf        , name                      )                         {
+  // v0.3.3：缓冲分支现也接收**自闭合** invoke（mangled name 抢救后的形态）——开标签
+  // 自身以 `/>` 结束时它就是块尾。end 约定 = 切片**含端点**（+1 跨过 `>` 本身，
+  // 与 invokeClose/tagClose 分支的"一次过闭合标签"约定一致）。
+  const selfEnd = scanHeaderClose(buf);
+  if (selfEnd !== null && selfEnd.selfClosing && /^\s*<\s*｜+DSML｜*\s*invoke\b/.test(buf)) {
+    return { end: selfEnd.end + 1 };
+  }
   let end = -1;
   const invokeClose = /<\/\s*｜+DSML｜*\s*invoke\s*>/g;
   const m = invokeClose.exec(buf);
