@@ -407,7 +407,8 @@ export class TfStreamParser {
     const name = this.bodyName!;
     const schema = COMMAND_SCHEMAS[name];
     const closeTag = `</${name}>`;
-    const closeIdx = this.buf.indexOf(closeTag);
+    const close = findBodyClose(name, this.buf);
+    const closeIdx = close === null ? -1 : close.index;
     // v0.3.2：非正文命令的配对开标签（少写 '/'）不得吞掉后续输出——遇到下一个
     // `<tf-` / `</tf-` 即视为本命令结束，命令照常派发，剩余文本回到 ground 继续解析。
     // v0.3.2 补充：DSML 标签同样是边界（包装残片立即露出，不吞到流末）。
@@ -434,16 +435,18 @@ export class TfStreamParser {
         return true;
       }
     }
-    if (closeIdx === -1) {
-      // 闭合标签可能被拆在 chunk 边界上：扣留末尾至多 closeTag.length-1 个字符
-      const keep = Math.min(closeTag.length - 1, this.buf.length);
+    if (close === null) {
+      // 闭合标签可能被拆在 chunk 边界上：扣留末尾至多 closeTag.length-1 个字符。
+      // v0.3.3：闭合标签允许空白/属性（</tf-write > / </tf-write path="x">），
+      // 扣留窗口取 64 字符，避免跨 chunk 的带属性闭合被截断后整条正文按 truncated 丢弃。
+      const keep = Math.min(Math.max(closeTag.length - 1, 64), this.buf.length);
       this.bodyBuf += this.buf.slice(0, this.buf.length - keep);
       this.buf = this.buf.slice(this.buf.length - keep);
       return false;
     }
     const body = this.bodyBuf + this.buf.slice(0, closeIdx);
-    const raw = this.bodyRawOpen + body + closeTag;
-    this.buf = this.buf.slice(closeIdx + closeTag.length);
+    const raw = this.bodyRawOpen + body + this.buf.slice(closeIdx, close.end);
+    this.buf = this.buf.slice(close.end);
     this.mode = 'ground';
     const attrs = this.bodyAttrs!;
     const deps = this.bodyDeps!;
@@ -482,7 +485,10 @@ export class TfStreamParser {
     this.dsmlBuf = '';
     this.dsmlName = null;
     this.mode = 'ground';
-    this.buf = rest;
+    // v0.3.3：块以自身配对闭合（</tf-write>）结束时，外层 DSML 包装的收尾标签
+    // （</｜｜DSML｜｜ invoke> / </calls> / parameter）还在 rest 开头。它们属于刚消费的
+    // 块，不是新协议尝试——一并吃掉，避免每步刷三条无意义的 malformed 台账。
+    this.buf = consumeDsmlClosingWrappers(rest);
     const parsed = parseDsmlBlock(block, expected, { allowIncompleteBody: true });
     for (const bad of parsed.malformed) {
       events.push({ type: 'malformed', raw: bad.raw, reason: bad.reason });
@@ -590,6 +596,49 @@ function scanHeaderClose(buf: string): { end: number; selfClosing: boolean } | n
     }
   }
   return null;
+}
+
+/**
+ * v0.3.3：正文命令的闭合标签查找（允许空白与属性）。
+ *
+ * 旧实现只认逐字 `</tf-write>`：模型写成 `</tf-write >` 或 `</tf-write path="x">`
+ * 时永远找不到闭合，整段正文缓冲到流末按 truncated 丢弃——用户侧就是"写到一半没了"。
+ * 这里按标签名找起点，再用与 header 同一个引号感知扫描取端界：
+ *   - 名字后必须是空白 / `>` / `/`（`</tf-writex>` 不算）；
+ *   - 属性值里含 `>` 也不会截半；
+ *   - 跨 chunk 未闭合返回 null（调用方扣留尾部继续等）。
+ */
+function findBodyClose(name: string, buf: string): { index: number; end: number } | null {
+  const needle = `</${name}`;
+  let from = 0;
+  for (;;) {
+    const index = buf.indexOf(needle, from);
+    if (index === -1) return null;
+    const next = buf[index + needle.length];
+    if (next === undefined) return null; // 闭合标签被拆在 chunk 边界：等更多数据
+    if (next === '>' || next === '/' || /\s/.test(next)) {
+      const close = scanHeaderClose(buf.slice(index));
+      if (close !== null) return { index, end: index + close.end + 1 };
+    }
+    from = index + needle.length;
+  }
+}
+
+/**
+ * v0.3.3：吃掉 DSML 块自身的收尾包装标签。
+ *
+ * 模型常写成 `invoke … <tf-write>正文</tf-write> </｜｜DSML｜｜ invoke>`。
+ * 块以 `</tf-write>` 结束时，外层 `</invoke>` / `</calls>` / `</parameter>` 会落在
+ * ground 里被逐条判 malformed（每步刷三条台账），既不是新命令也不是正文。
+ * 只消费紧邻的已知收尾标签，遇见其它内容立即停手。
+ */
+function consumeDsmlClosingWrappers(text: string): string {
+  let rest = text;
+  for (;;) {
+    const m = /^\s*<\/\s*｜+DSML｜*\s*(?:invoke|calls|parameter)\s*>/i.exec(rest);
+    if (m === null) return rest;
+    rest = rest.slice(m[0].length);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -763,9 +812,10 @@ function findDsmlInvokeEnd(buf: string, name: TfCommandName | null): { end: numb
   const m = invokeClose.exec(buf);
   if (m !== null) end = m.index + m[0].length;
   if (name !== null) {
-    const tagClose = buf.indexOf(`</${name}>`);
-    if (tagClose !== -1 && (end === -1 || tagClose + name.length + 3 < end)) {
-      end = tagClose + name.length + 3;
+    // v0.3.3：命令自身的闭合标签允许空白/属性（与 body 模式同一 findBodyClose）。
+    const tagClose = findBodyClose(name, buf);
+    if (tagClose !== null && (end === -1 || tagClose.end < end)) {
+      end = tagClose.end;
     }
     if (!COMMAND_SCHEMAS[name].hasBody) {
       const boundary = findNonBodyBoundary(buf);
@@ -876,10 +926,13 @@ function parseDsmlBlock(
       // 块内文本累积——剥掉尾部闭合，正文才干净（与 body 模式的消费语义一致）。
       let text = item.text;
       if (bodyFromParam === undefined) {
-        const closeTag = `</${name}>`;
-        const closeIdx = text.lastIndexOf(closeTag);
-        if (closeIdx !== -1 && text.slice(closeIdx).trim() === closeTag) {
-          text = text.slice(0, closeIdx);
+        // v0.3.3：闭合标签允许空白/属性（`</tf-write >` / `</tf-write path="x">`）。
+        // 只剥末尾同一行的闭合形态，避免误删正文里提到的同名标签。
+        const idx = text.lastIndexOf(`</${name}`);
+        if (idx !== -1) {
+          const tail = text.slice(idx);
+          const closeRe = new RegExp(`^</${name}\\b[^\\n]*>\\s*$`);
+          if (closeRe.test(tail)) text = text.slice(0, idx);
         }
       }
       body = bodyFromParam ?? text.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
