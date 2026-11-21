@@ -20,7 +20,7 @@ R3 重跑后以同批双臂复算为准。
 | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 宿主  | DeepSeek Harness `0.2.2-rc.1`（类型锚点）/ `rc.3`（运行时实测）                                                                                                     |
 | 依赖  | 零 npm 依赖；Node ≥ 22.18（原生类型擦除）                                                                                                                           |
-| 测试  | 275 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力/会话格式回归）                                                                              |
+| 测试  | 333 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力/会话格式/收束与缓存前缀回归）                                                                              |
 | 形态  | 单 bundle 包 + **专用 profile**（`profiles/stream` 模板）；`dsh plugin remove` 整层消失、宿主 loop 原子恢复                                                          |
 | 控制栏 | `dsh-stream-agent bar`：四模式 + 中英切换 + 意图核对，装载时自动打印上手引导                                                                                       |
 | 桌面页 | 客户端左侧栏「控制栏 / Control bar」：状态 + 四模式 + 中英切换，**不改 Electron 壳**                                                                               |
@@ -104,12 +104,17 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 
 模式 → 配置对应（改模式 = 改这些值；显式配置 > 模式 > 内置默认）：
 
-| 模式 | `selfReadFeedback` | `enableCode` | `persistFallback` | 并行 | 重入 | `budgetTokens` |
+| 模式 | `selfReadFeedback` | `enableCode` | `persistFallback` | 并行 | 停滞重入 | `budgetTokens` |
 | --- | --- | --- | --- | --- | --- | --- |
-| `balanced` | `receipt` | `false` | `true` | 3 | 8 | — |
-| `lean` | `receipt` | `false` | `true` | 2 | 6 | 60,000 |
-| `compat` | `full` | `false` | `true` | 1 | 12 | — |
-| `power` | `receipt` | `true` | `true` | 3 | 10 | — |
+| `balanced` | `receipt` | `false` | `true` | 3 | 12 | — |
+| `lean` | `receipt` | `false` | `true` | 2 | 8 | 60,000 |
+| `compat` | `full` | `false` | `true` | 1 | 16 | — |
+| `power` | `receipt` | `true` | `true` | 3 | 14 | — |
+
+「停滞重入」= **连续没有新增产出**的重入次数上限（v0.4.1 起）。每步都在读/写/跑命令
+（拿到新事实）的重入不计入这个预算——生产性工作不会被次数硬杀；真正兜底的是回合请求
+硬上限（2×重入）与收束期。撞墙时先注入一条收束指令（最多 2 次），仍无 `tf-final`
+则写一条**明确标注未完成**的交付说明，不把半截会话丢给用户。
 
 一句话决策：**默认 `balanced`；账单敏感换 `lean`；排障对照换 `compat`；写程序处理数据换 `power`。**
 
@@ -257,13 +262,13 @@ dsh-stream-agent/
 │                          #   disabled-lines-audit / v0.4.0-plan / TEST-PROPOSITIONS
 ├── scripts/               # build / check-consistency / gate / install-check / install-cycle /
 │                          #   repair-session-logs / release
-└── test/                  # 275 用例（kernel 2 套 + entry 15 套 + 20 mock 场景；零 API）
+└── test/                  # 333 用例（kernel 2 套 + entry 22 套 + 20 mock 场景；零 API）
 ```
 
 ## 10. 开发
 
 ```bash
-npm test          # 275/275，零 API 调用
+npm test          # 333/333，零 API 调用
 npm run build     # 产出 dist/ 25 个文件 + 全量 smoke import + 桌面页构建闸门
 npm run check     # R2：装配与文档一致性 4 项
 npm run gate      # R4：发布门禁 6 项（真机项如实标待复测）

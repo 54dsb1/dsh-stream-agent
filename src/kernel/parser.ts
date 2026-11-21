@@ -331,18 +331,22 @@ export class TfStreamParser {
 
   private stepBody(events: ParserEvent[]): boolean {
     const name = this.bodyName!;
-    const closeTag = `</${name}>`;
-    const closeIdx = this.buf.indexOf(closeTag);
-    if (closeIdx === -1) {
-      // 闭合标签可能被拆在 chunk 边界上：扣留末尾至多 closeTag.length-1 个字符
-      const keep = Math.min(closeTag.length - 1, this.buf.length);
+    // v0.4.1：闭合标签允许尾随空白与属性（`</tf-write >` / `</tf-write path="x">`）。
+    // 旧实现只认逐字 `</tf-write>`：模型写成带空白/属性的形式时永远找不到闭合，整段
+    // 正文缓冲到流末按 truncated 丢弃——用户侧就是"写到一半没了"。
+    const close = findBodyClose(name, this.buf);
+    if (close === null) {
+      // 闭合标签可能被拆在 chunk 边界上：扣留末尾至多（闭合标签长度-1）与 64 的较大者，
+      // 保证带属性的闭合标签不会因跨 chunk 被切半。
+      const keep = Math.min(Math.max(`</${name}>`.length - 1, 64), this.buf.length);
       this.bodyBuf += this.buf.slice(0, this.buf.length - keep);
       this.buf = this.buf.slice(this.buf.length - keep);
       return false;
     }
-    const body = this.bodyBuf + this.buf.slice(0, closeIdx);
+    const closeTag = this.buf.slice(close.index, close.end);
+    const body = this.bodyBuf + this.buf.slice(0, close.index);
     const raw = this.bodyRawOpen + body + closeTag;
-    this.buf = this.buf.slice(closeIdx + closeTag.length);
+    this.buf = this.buf.slice(close.end);
     this.mode = 'ground';
     const attrs = this.bodyAttrs!;
     const deps = this.bodyDeps!;
@@ -428,6 +432,32 @@ export class TfStreamParser {
  * 引号感知地找头部结束 '>'。
  * 属性值（如 cmd="a > b"）里的 '>' 不终止头部。返回 null 表示需要更多数据。
  */
+/**
+ * v0.4.1：正文命令的闭合标签查找（允许空白与属性）。
+ *
+ * 旧实现只认逐字 `</tf-write>`：模型写成 `</tf-write >` 或 `</tf-write path="x">`
+ * 时永远找不到闭合，整段正文缓冲到流末按 truncated 丢弃——用户侧就是"写到一半没了"。
+ * 这里按标签名找起点，再用与 header 同一个引号感知扫描取端界：
+ *   - 名字后必须是空白 / `>` / `/`（`</tf-writex>` 不算）；
+ *   - 属性值里含 `>` 也不会截半；
+ *   - 跨 chunk 未闭合返回 null（调用方扣留尾部继续等）。
+ */
+function findBodyClose(name: string, buf: string): { index: number; end: number } | null {
+  const needle = `</${name}`;
+  let from = 0;
+  for (;;) {
+    const index = buf.indexOf(needle, from);
+    if (index === -1) return null;
+    const next = buf[index + needle.length];
+    if (next === undefined) return null; // 闭合标签被拆在 chunk 边界：等更多数据
+    if (next === '>' || next === '/' || /\s/.test(next)) {
+      const close = scanHeaderClose(buf.slice(index));
+      if (close !== null) return { index, end: index + close.end + 1 };
+    }
+    from = index + needle.length;
+  }
+}
+
 function scanHeaderClose(buf: string): { end: number; selfClosing: boolean } | null {
   let inQuote = false;
   for (let i = 1; i < buf.length; i++) {
@@ -440,6 +470,20 @@ function scanHeaderClose(buf: string): { end: number; selfClosing: boolean } | n
       inQuote = true;
     } else if (ch === '>') {
       return { end: i, selfClosing: buf[i - 1] === '/' };
+    }
+  }
+  // v0.4.1：引号不成对（mangled DSML name 值，奇数个引号——真机 session-d6cd0759
+  // seq 110：`name="tf-peek handle="obs:...`）时严格扫描永不闭合，header 模式等死，
+  // 整条命令在流末按 malformed 丢弃。退化通道：取**第一个**满足"前驱是 `"`（属性
+  // 收尾）或 `/"`（自闭合）"的 '>' 作为标签端界——不能取最后一个 '>'：mangled 开标签
+  // 后面跟着命令正文（Python 代码含 '>'），取最后一个会把正文整段吞进标签再丢弃
+  // （真机 seq 104：整个 selfcheck 脚本被吞）。残片形态（无端界）仍返回 null 等更多
+  // 数据；正常标签引号成对，严格扫描先行命中，退化通道不触发。
+  for (let i = 1; i < buf.length; i++) {
+    if (buf[i] !== '>') continue;
+    const prev = buf[i - 1];
+    if (prev === '"' || (prev === '/' && buf[i - 2] === '"')) {
+      return { end: i, selfClosing: prev === '/' };
     }
   }
   return null;
@@ -475,7 +519,15 @@ function parseDsmlHeader(raw: string, selfClosing: boolean): { synthetic: string
   let inner = raw.slice(1);
   if (selfClosing && inner.endsWith('/>')) inner = inner.slice(0, -2);
   else if (inner.endsWith('>')) inner = inner.slice(0, -1);
-  const rest = inner.replace(/^\/?｜+DSML｜*/, '');
+  const restRaw = inner.replace(/^\/?｜+DSML｜*/, '');
+  // v0.4.1：mangled name 值抢救——模型把全部属性塞进 name 值且忘了闭引号（真机
+  // session-d6cd0759 seq 110：`name="tf-peek handle="obs:bash:b2@v1" from_line="1" .../>`，
+  // 整条命令丢失）。name 值以合法 tf-* 命令名开头且带空格时，把 `name="tf-xxx ` 改写为
+  // `name="tf-xxx" `——余段就是正常属性对（引号结构本就完好）。
+  const mangled = /^(\s*invoke\s+)name\s*=\s*"(tf-[a-z]+)\s+/.exec(restRaw);
+  const rest = mangled !== null && COMMAND_NAMES.includes(mangled[2] as TfCommandName)
+    ? restRaw.replace(mangled[0], `${mangled[1]}name="${mangled[2]}" `)
+    : restRaw;
   const invoke = rest.match(/^\s*invoke\s+name="(tf-[a-z]+)"([\s\S]*)$/);
   if (invoke === null) return null;
   const [, name, attrsPart] = invoke as unknown as [string, string, string];

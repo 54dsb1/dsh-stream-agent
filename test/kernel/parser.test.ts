@@ -368,15 +368,21 @@ test('DSML invoke 自闭合：改写回 tf-* 命令（属性透传）', () => {
   assert.equal(cmds[0].attrs['limit'], '4');
 });
 
-test('DSML 残缺属性（真机 mangled 形态）：malformed 丢弃，不作为 prose 泄漏', () => {
+test('DSML 残缺属性（真机 mangled 形态）：v0.4.1 起抢救为完整命令，不作为 prose 泄漏', () => {
   const p = new TfStreamParser();
   const events = feedAll(p, [
     '<｜｜DSML｜｜ invoke name="tf-read path="data/big-report.md" id="r1" offset="130" limit="15"/>',
   ]);
   const text = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
   assert.equal(text, '', 'mangled DSML 不得进 prose');
-  assert.ok(events.some((e) => e.type === 'malformed'));
-  assert.equal(commandsOf(events).length, 0);
+  // v0.4.1：name 值以合法命令名开头 → 抢救为完整命令（旧实现整条丢弃，模型重试烧一步）
+  const cmds = commandsOf(events);
+  assert.equal(cmds.length, 1, `mangled 形态应抢救出命令：${JSON.stringify(events.map((e) => e.type))}`);
+  assert.equal(cmds[0].name, 'tf-read');
+  assert.equal(cmds[0].id, 'r1');
+  assert.equal(cmds[0].attrs['path'], 'data/big-report.md');
+  assert.equal(cmds[0].attrs['offset'], '130');
+  assert.equal(cmds[0].attrs['limit'], '15');
 });
 
 test('DSML 尾巴（流终止未闭合）：malformed 上报，不进 prose', () => {

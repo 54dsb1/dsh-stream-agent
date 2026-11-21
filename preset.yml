@@ -50,7 +50,8 @@
       inject: [llm, tools, agents, sessions, sessionProjections]
       config:
         maxParallelToolCalls: 3
-        maxReentries: 8
+        # v0.4.1：maxReentries 不钉死——由模式默认值决定（balanced 12 / lean 8 /
+        # compat 16 / power 14）；装配钉死会压制模式档位与上限提升。
         streamIdleTimeoutMs: 30000
         # K1（0.3.0）：tf-code 默认关闭；显式开启见 docs/protocol.md（前提 K2–K6）。
         enableCode: false

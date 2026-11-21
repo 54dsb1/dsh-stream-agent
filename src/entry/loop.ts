@@ -96,7 +96,7 @@ export type StreamChunkLike =
   | { type: 'reasoning-delta'; index: number; text: string }
   | { type: 'tool-call-delta'; index: number; id: string; name?: string; argumentsDelta: string }
   | { type: 'block-end'; index: number; block: { type: string; text?: string; id?: string; name?: string; arguments?: string } }
-  | { type: 'usage'; usage: { inputTokens: number; outputTokens: number } }
+  | { type: 'usage'; usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; totalTokens?: number } }
   | { type: 'finish'; reason: FinishReasonLike };
 
 /** 镜像 types.d.ts:538-580 GenerateOptions（驱动器发出的请求形状） */
@@ -250,8 +250,21 @@ export interface StreamDriverConfig {
   reasoningEffort?: string;
   /** 独立命令并行度上限（可配，默认 3 —— 分派 06 硬性要求 1） */
   maxParallelToolCalls?: number;
-  /** 最大重入次数（防震荡护栏；超出 → turn 以 blocked 终止并如实记录） */
+  /** 最大重入次数（防震荡护栏；超出 → turn 以 blocked 终止并如实记录）。
+   *  v0.4.1：语义收窄为"停滞重入预算"——生产性重入不再计数（见 stallReentries）。 */
   maxReentries?: number;
+  /** v0.4.1：连续零产出重入上限（真正的停滞预算）。缺省 = maxReentries。
+   *  失败的写、被拒的 final、纯 prose 步都算零产出；只读/只 peek 但拿到新信息算产出。 */
+  stallReentries?: number;
+  /** v0.4.1：回合请求硬上限（含生产性重入）。达到后进入兜底交付，绝不无限烧请求。
+   *  缺省 = max(4, maxReentries * 2)。 */
+  maxRequests?: number;
+  /** v0.4.1：收束期最多再给几次请求（到达停滞/硬上限后）。缺省 2。 */
+  closeOutRequests?: number;
+  /** v0.4.1：单请求 tf-read 完整正文注入预算（字符）。超出部分转"预览 + 句柄"，
+   *  下一请求再按需补全——把新内容摊平，避免一次读五个文件造成缓存大块 miss。
+   *  0/负数 = 关闭（回退点）；缺省 DEFAULT_READ_FEEDBACK_BUDGET_PER_REQUEST。 */
+  readFeedbackBudgetPerRequest?: number;
   /** 流空闲看门狗：流在此时长内无任何 chunk → abort（fault-timeout 路径） */
   streamIdleTimeoutMs?: number;
   /** 任务级 token 预算（O5 阶梯分母；缺省 = 阶梯关闭，恒为 normal 档） */
@@ -403,7 +416,7 @@ export type TurnEndReason =
 
 export type DriverRecord =
   | { seq: number; kind: 'request'; turn: number; step: number; provider: string; model: string; level: BudgetLevel; stableHash: string; renderHash: string; injectionBlocks: number }
-  | { seq: number; kind: 'usage'; turn: number; inputTokens: number; outputTokens: number }
+  | { seq: number; kind: 'usage'; turn: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }
   | { seq: number; kind: 'command'; id: string; name: string; status: 'pending' | 'dispatched' | 'ok' | 'failed' | 'rejected'; detail?: string; handle?: string; infoGain?: string }
   | { seq: number; kind: 'malformed'; raw: string; reason: string }
   | { seq: number; kind: 'truncated'; raw: string; reason: string }
@@ -649,6 +662,14 @@ export class SingleStreamDriver {
     reasoningEffort?: string;
     maxParallelToolCalls: number;
     maxReentries: number;
+    /** v0.4.1：连续零产出重入上限（默认 = maxReentries） */
+    stallReentries: number;
+    /** v0.4.1：请求硬上限（默认 max(4, maxReentries*2)） */
+    maxRequests: number;
+    /** v0.4.1：收束期额外请求数（默认 2） */
+    closeOutRequests: number;
+    /** v0.4.1：单请求 tf-read 完整正文注入预算（字符；≤0 关闭） */
+    readFeedbackBudgetPerRequest: number;
     streamIdleTimeoutMs: number;
     budgetTokens?: number;
     /** tf-read 成功反馈完整原文的字符上限（缺省 DEFAULT_READ_FEEDBACK_LIMIT；超长截断保头尾） */
@@ -719,8 +740,26 @@ export class SingleStreamDriver {
   #reentryCount = 0;
   #finalNudges = 0;
   #finalOnlyRequests = 0;
+  /** v0.3.2/v0.4.1：nudge 进度感知的 ok 命令水位（null = 本次 nudge 前无基准） */
+  #nudgeMark: number | null = null;
+  /** v0.4.1：停滞预算（连续零产出重入数）与产出口径基准 */
+  #stallReentries = 0;
+  #progressOkMark = 0;
+  /** v0.4.1：收束期（撞墙后先给一条"立即交付"指令，而不是直接砍） */
+  #closeOutActive = false;
+  #closeOutRequests = 0;
+  /** v0.4.1：本回合命令集（产出口径；含失败命令，"是否真有产出"另看 status） */
+  readonly #turnCommandIds = new Set<string>();
+  /** v0.4.1：本回合是否已写兜底交付（同一回合只写一次） */
+  #fallbackFinalDelivered = false;
+  /** v0.4.1：已随请求发出、待转正为历史的易变尾 */
+  #deliveredTail: { turn: number; step: number; blocks: RenderMessage[] } | null = null;
+  /** v0.4.1：本步摘要（流结束时落史：prose + 命令事实） */
+  #lastStepDigest: { step: number; prose: string; cmdIds: string[] } | null = null;
+  /** v0.4.1：本步命令 id（命令事实的摘要来源） */
+  #stepCommandIds: string[] = [];
   #deltaCursor = 0; // O3 directoryDelta 游标（obs seq 空间）
-  #usage = { inputTokens: 0, outputTokens: 0 };
+  #usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
   #injectedChars = 0;
   #stableHashes: string[] = [];
   #aborted = false;
@@ -843,7 +882,14 @@ export class SingleStreamDriver {
       model: config.model,
       reasoningEffort: config.reasoningEffort,
       maxParallelToolCalls: config.maxParallelToolCalls ?? 3,
-      maxReentries: config.maxReentries ?? 8,
+      maxReentries: config.maxReentries ?? 12,
+      // v0.4.1：生产性重入与停滞重入分账——旧实现把"继续干活"和"原地打转"都算进
+      // maxReentries，13 步的真实任务（读文件/改文件/跑检查）会在干到一半时被硬杀，
+      // 桌面端只剩最后一句 prose（真机 session-6bb805db / 27876fd9）。
+      stallReentries: config.stallReentries ?? config.maxReentries ?? 12,
+      maxRequests: config.maxRequests ?? Math.max(4, (config.maxReentries ?? 12) * 2),
+      closeOutRequests: Math.max(0, config.closeOutRequests ?? 2),
+      readFeedbackBudgetPerRequest: config.readFeedbackBudgetPerRequest ?? DEFAULT_READ_FEEDBACK_BUDGET_PER_REQUEST,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? 30_000,
       budgetTokens: config.budgetTokens,
       selfReadFeedback: config.selfReadFeedback ?? 'receipt',
@@ -1012,10 +1058,18 @@ export class SingleStreamDriver {
   budgetLevel(): BudgetLevel {
     const budget = this.#cfg.budgetTokens;
     if (budget === undefined || budget <= 0) return 'normal';
-    const spent = this.#usage.inputTokens + this.#usage.outputTokens + Math.ceil(this.#injectedChars / 4);
+    const spent = this.#usage.inputTokens + this.#usage.cacheReadTokens + this.#usage.cacheWriteTokens
+      + this.#usage.outputTokens + Math.ceil(this.#injectedChars / 4);
     if (spent >= budget * 0.9) return 'final-only';
     if (spent >= budget * 0.7) return 'high-only';
     return 'normal';
+  }
+
+  /** v0.4.1：缓存命中率（cacheRead / (cacheRead + 未缓存输入)；无请求时为 0）。
+   *  只进台账/评测，不参与控制流——命中率是结果，不是开关。 */
+  #cacheHitRate(): number {
+    const denom = this.#usage.cacheReadTokens + this.#usage.inputTokens;
+    return denom === 0 ? 0 : this.#usage.cacheReadTokens / denom;
   }
 
   // ------------------------------------------------------------------ 任务入口
@@ -1170,6 +1224,16 @@ export class SingleStreamDriver {
     this.#pendingReplays = [];
     this.#replays = 0;
     this.#replayCapped = false;
+    // v0.4.1：收束改造的回合级状态（停滞预算 / 收束期 / 本回合命令集 / 兜底交付标记）
+    this.#stallReentries = 0;
+    this.#progressOkMark = 0;
+    this.#closeOutActive = false;
+    this.#closeOutRequests = 0;
+    this.#turnCommandIds.clear();
+    this.#fallbackFinalDelivered = false;
+    this.#nudgeMark = null;
+    this.#lastStepDigest = null;
+    this.#deliveredTail = null;
     let reason: TurnEndReason = { kind: 'blocked', detail: 'turn loop exited without convergence' };
 
     while (true) {
@@ -1221,6 +1285,10 @@ export class SingleStreamDriver {
 
       // ---- REQUEST：装配 + O6 preflight（render() 内置断言，违反即抛 → fail-closed）----
       const messages = this.#renderer.render();
+      // v0.4.1：**刚随本请求发出的**易变尾在此转正——落位 = 它在本请求 prompt 里的同一
+      // 位置（尾部）。时序红线：digest 在流结束时就地落史（见 #commitStepDigest），
+      // 转正必须先于下一请求的 render，下一请求的公共前缀才能覆盖本请求的全部 prompt。
+      this.#commitDeliveredTail();
       const stableHash = this.#renderer.stableHash();
       this.#stableHashes.push(stableHash);
       const fullHash = renderHash(messages);
@@ -1257,19 +1325,30 @@ export class SingleStreamDriver {
       // v4 格式要求它落在打开的 turn+step 内；此前在 step/end 之后写会被判
       // "assistant/message does not match an open turn and step" → 整条会话 corrupt。
 
+      // v0.4.1：本步的正文 + 命令摘要**就地落史**（流结束即落，不等下一轮循环顶部）。
+      // 0.3.x 的教训：追加区只有 system + 任务 + 句柄目录行时，模型第 2 个请求起就看不到
+      // 自己上一步干了什么，只能重读重猜（真机 "The history is truncated" → 9 步 blocked）。
+      // digest 必须在转正之后追加（转正发生在 render 之后），否则历史错位、每条注入被双重支付。
+      this.#commitStepDigest();
+
       // ---- 收束判定（仅三种重入事由：失败/拒绝、high 观测、peek 需求）----
       const issues = this.#collectIssues();
       const injections = this.#buildInjections(issues, level);
       // 饥饿防线（07 号结果 §3.6 上报的断链，08 号评测前按其建议修复）：
       // 升格骨架接入注入通路（按 high 观测同款格式；final-only 档不注入——预算已枯竭）。
+      // v0.4.1：**先只算块、不挂块**——升格是"补充上下文"，不是重入事由。此前它无条件挂进
+      // injections.blocks，只要本步有一条升格就必然 needsReentry=true：模型已经给出合法
+      // tf-final，却被一块"补充观测"顶掉 completed，回合继续烧请求直到撞墙。
       const promoted = this.#obs.noteStep(injections.highInjected);
-      if (promoted !== null && level !== 'final-only' && !this.#reportedObservations.has(promoted.seq)) {
-        this.#reportedObservations.add(promoted.seq);
-        injections.blocks.push({
+      const promotedBlock: RenderMessage | null = promoted !== null
+        && level !== 'final-only'
+        && !this.#reportedObservations.has(promoted.seq)
+        ? {
           role: 'user',
           content: `[tf-stream:observation handle=${promoted.handle ?? ''} key=starvation-promoted]\n${(promoted.payload as { rendered?: string }).rendered ?? ''}\n（细节用 tf-peek handle="${promoted.handle}" from_line=.. to_line=.. 取回）`,
-        });
-      }
+        }
+        : null;
+      const promotedSeq = promotedBlock === null ? null : promoted.seq;
 
       if (streamOutcome.finish.kind === 'error' || streamOutcome.finish.kind === 'aborted') {
         this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: `stream-${streamOutcome.finish.kind}`, detail: finishDetail(streamOutcome.finish) });
@@ -1334,7 +1413,9 @@ export class SingleStreamDriver {
       const finalSeen = lastFinal !== undefined && prematureFinal === undefined && rejectedFinal === undefined;
       // steer 在本流期间到达 → 不能带着未消费的 steer 收敛（对齐内建：插话必须被下一步看到）
       const pendingSteerCount = this.#pendingSteers.length;
-      const needsReentry = issues.length > 0 || injections.blocks.length > 0 || prematureFinal !== undefined || pendingSteerCount > 0;
+      // v0.4.1：升格块只在"本步没有合法 final"时算重入事由（它补的是上下文，不是任务状态）
+      const needsReentry = issues.length > 0 || injections.blocks.length > 0 || prematureFinal !== undefined
+        || pendingSteerCount > 0 || (promotedBlock !== null && !finalSeen);
 
       if (prematureFinal !== undefined && lastFinal !== undefined) {
         injections.blocks.push({
@@ -1365,32 +1446,93 @@ export class SingleStreamDriver {
         break;
       }
 
-      // 非成功路径（重入 / 阻断 / 取消）：本步到此结束
+      // 非成功路径（重入 / 阻断 / 取消）：本步到此结束。
+      // v0.4.1：step/end 的时机下移到收束判定之后——兜底交付是一条 assistant/message，
+      // v4 校验要求它落在**打开的** turn+step 内，先写 step/end 会被判 corrupt。
+      const finalOnlyGate = level === 'final-only' && this.#finalOnlyRequests >= 1;
+      // v0.3.2 口径：nudge 进度感知。被提示后模型继续产出（新 ok 命令）就不算"提示失效"，
+      // 绝不因此中断生产性工作；只有"零产出的 nudge"（真打转）才收束。
+      const okCommandCount = [...this.#commands.values()].filter((r) => r.status === 'ok').length;
+      const progressSinceNudge = this.#nudgeMark === null || okCommandCount > this.#nudgeMark;
+      const nudgeExhausted = !needsReentry && !finalSeen && this.#finalNudges >= 1 && !progressSinceNudge;
+
+      // v0.4.1 收束改造 —— 真机"任务被砍在半途、用户只看到最后一句 prose"的根因就在这里：
+      // 旧实现 `#reentryCount >= maxReentries` 把**生产性重入**（每步都在读/写/跑命令、
+      // 每步都拿到新事实）与**原地打转**一视同仁，第 12 步 hard blocked；且收束时没有任何
+      // 兜底交付，界面于是停在最后一句 prose 上（session-6bb805db / 27876fd9 / 7fbfef8f）。
+      // 新口径分三账，互不串味：
+      //   ① 停滞预算 #stallReentries——只在"本步没有新增 ok 命令"的重入上累加（真打转）；
+      //      有产出就清零并退出收束期，生产性工作不再被"重入次数"硬杀。
+      //   ② 请求硬上限 #cfg.maxRequests——绝对闸（生产性步骤也计），防 token 黑洞。
+      //   ③ 收束期 #closeOutActive——撞墙但**有事实可交付**时不立刻砍：注入一条"停止探索、
+      //      立即 tf-final"的收束指令（回合内最多 closeOutRequests 次），用尽仍无 final 则
+      //      写一条明确标注未完成的兜底交付（#buildFallbackFinal，台账事实，不伪造结论）。
+      const hardCap = step >= this.#cfg.maxRequests;
+      const stallExhausted = this.#stallReentries >= this.#cfg.stallReentries;
+      const atWall = finalOnlyGate || nudgeExhausted || hardCap || stallExhausted;
+      let wallDetail = '';
+      let closeOut = false;
+      let ending = false;
+      if (this.#aborted) {
+        ending = true;
+        reason = { kind: 'aborted', reason: this.#abortReason instanceof Error ? this.#abortReason.message : String(this.#abortReason ?? 'cancelled') };
+      } else if (atWall) {
+        wallDetail = finalOnlyGate
+          ? '预算进入 final-only 档'
+          : hardCap
+            ? `本回合请求数达到硬上限 ${this.#cfg.maxRequests}`
+            : stallExhausted
+              ? `连续 ${this.#cfg.stallReentries} 次重入无新增产出`
+              : '流终止且无 tf-final、无重入事由（提示一次后仍未收敛）';
+        // 收束期只对"有事实可交付"的回合开放：零产出回合没有可交付内容，多烧一次请求
+        // 只会再得到一段 prose（真机 nudge 空转的形态）。final-only 档与硬上限一律不再
+        // 开放（预算/次数已尽，收束指令救不回来）。
+        const deliverable = this.#productiveOkCount() > 0;
+        const closeOutLeft = this.#cfg.closeOutRequests - this.#closeOutRequests;
+        if (deliverable && !finalSeen && closeOutLeft > 0 && level !== 'final-only' && !hardCap) {
+          this.#closeOutRequests += 1;
+          this.#closeOutActive = true;
+          closeOut = true;
+          this.#record({
+            seq: ++DRIVER_SEQ, kind: 'fault', fault: 'closeout-nudge',
+            detail: `${wallDetail} → 收束第 ${this.#closeOutRequests}/${this.#cfg.closeOutRequests} 次`,
+          });
+          this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'closeout-nudge', detail: wallDetail, attempt: this.#closeOutRequests, turn });
+        } else {
+          ending = true;
+          reason = {
+            kind: 'blocked',
+            detail: rejectedFinal !== undefined
+              ? `final 被拒且未重发（${rejectedFinal}）：不把占位/过期答案当交付${deliverable ? `；${wallDetail}` : ''}`
+              : `${wallDetail} → 回合收束`,
+          };
+        }
+      }
+
+      // v0.4.1：走到这里说明本步不会以"合法 final"收场——升格块这才真正挂上
+      //（成功路径已在上面 break，不会再被补充块顶掉）。
+      if (promotedBlock !== null && promotedSeq !== null) {
+        this.#reportedObservations.add(promotedSeq);
+        injections.blocks.push(promotedBlock);
+      }
+
+      if (ending) {
+        // 兜底交付：必须在 step/end 之前写（assistant/message 需落在打开的 turn+step 内）
+        if (reason.kind === 'blocked') this.#deliverFallbackFinal(turn, step, reason.detail);
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'turn-blocked', detail: reason.kind === 'blocked' ? reason.detail : reason.kind });
+        try {
+          this.#ports.events?.stepEnd(turn, step);
+        } catch (error) {
+          this.#warn('step/end 事件写入失败', error);
+        }
+        break;
+      }
+
+      // 重入路径（含收束期）：本步结束
       try {
         this.#ports.events?.stepEnd(turn, step);
       } catch (error) {
         this.#warn('step/end 事件写入失败', error);
-      }
-
-      const finalOnlyGate = level === 'final-only' && this.#finalOnlyRequests >= 1;
-      const nudgeExhausted = !needsReentry && !finalSeen && this.#finalNudges >= 1;
-      if (this.#aborted || finalOnlyGate || nudgeExhausted || this.#reentryCount >= this.#cfg.maxReentries) {
-        if (this.#aborted) {
-          reason = { kind: 'aborted', reason: this.#abortReason instanceof Error ? this.#abortReason.message : String(this.#abortReason ?? 'cancelled') };
-        } else if (finalOnlyGate) {
-          reason = { kind: 'blocked', detail: '预算进入 final-only 档：停止一切注入，降级交付（已完成/未完成见台账）' };
-        } else if (nudgeExhausted) {
-          reason = {
-            kind: 'blocked',
-            detail: rejectedFinal !== undefined
-              ? `final 被拒且未重发（${rejectedFinal}）：不把占位/过期答案当交付`
-              : '流终止且无 tf-final、无重入事由（提示一次后仍未收敛）',
-          };
-        } else {
-          reason = { kind: 'blocked', detail: `重入次数达到上限 ${this.#cfg.maxReentries}` };
-        }
-        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'turn-blocked', detail: reason.kind === 'blocked' ? reason.detail : reason.kind });
-        break;
       }
 
       // ---- INJECTING：O3 句柄目录差分（追加区）+ 易变尾注入，发下一请求 ----
@@ -1404,7 +1546,10 @@ export class SingleStreamDriver {
       // 上面所有收敛/阻断分支都已 break，不会白记账、也不会白读内容。
       const replays = this.#materializeReplays();
       if (replays.length > 0) tail = [...tail, ...replays];
-      if (tail.length === 0 && !finalSeen) {
+      if (closeOut) {
+        // 收束期：保留失败/拒绝事实块（模型要知道哪里错了），收束指令压在最末
+        tail = [...tail, { role: 'user' as const, content: this.#closeOutNudge(this.#closeOutRequests, wallDetail) }];
+      } else if (tail.length === 0 && !finalSeen) {
         if (level === 'final-only') {
           // O5 >90% 档：停止一切注入，输出降级交付（已完成/未完成/已排除见台账），只收 tf-final
           tail = [{
@@ -1414,8 +1559,10 @@ export class SingleStreamDriver {
           this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'degraded-delivery' });
           this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'degraded-delivery', turn });
         } else {
-          // 无重入事由但也没 tf-final：一次性提示（护栏防无限循环）
+          // 无重入事由但也没 tf-final：进度感知提示（护栏防无限循环——真打转由停滞预算
+          // 与 nudgeExhausted 的"零产出"判定收束，不靠提示次数）
           this.#finalNudges += 1;
+          this.#nudgeMark = okCommandCount;
           tail = [{
             role: 'user' as const,
             content: rejectedFinal !== undefined
@@ -1427,7 +1574,28 @@ export class SingleStreamDriver {
       }
       this.#injectedChars += tail.reduce((n, b) => n + b.content.length, 0);
       if (level === 'final-only') this.#finalOnlyRequests += 1;
+      // v0.4.1 缓存友好排序：durable 块（observation/peek/replay/tool-result）前置，
+      // 非 durable 块（error/nudge/closeout）后置。理由在 #commitDeliveredTail：只有
+      // durable 块会转正进历史，一旦非 durable 块夹在 durable 块**前面**，转正后的历史
+      // 就在那一处与上一请求的 prompt 分叉——其后所有 durable 块（一次读注入可达上万
+      // 字符）全部退化成未缓存输入。两组内部保持原有相对顺序，前缀单调不破。
+      tail = [...tail.filter(isDurableBlock), ...tail.filter((b) => !isDurableBlock(b))];
       this.#renderer.setTail(tail);
+      // v0.4.1：这批尾块会随下一请求发出；发出后由 #commitDeliveredTail 转正为历史。
+      this.#deliveredTail = {
+        turn,
+        step,
+        blocks: tail.map((b) => ({ role: (b.role ?? 'user') as RenderMessage['role'], content: b.content })),
+      };
+      // v0.4.1：停滞计数——判据是"本步是否新增了生产性 ok 命令"，不是重入次数。
+      const productiveNow = this.#productiveOkCount();
+      if (productiveNow > this.#progressOkMark) {
+        this.#progressOkMark = productiveNow;
+        this.#stallReentries = 0;
+        this.#closeOutActive = false;
+      } else if (!closeOut) {
+        this.#stallReentries += 1;
+      }
       this.#reentryCount += 1;
     }
 
@@ -1437,7 +1605,10 @@ export class SingleStreamDriver {
     } catch (error) {
       this.#warn('turn/end 事件写入失败', error);
     }
-    this.#ledgerWrite('plugin:tf-agent/step', { turn, steps: step, requests: this.#requestCount, usage: { ...this.#usage }, reason: reason.kind });
+    this.#ledgerWrite('plugin:tf-agent/step', {
+      turn, steps: step, requests: this.#requestCount, usage: { ...this.#usage },
+      cacheHitRate: this.#cacheHitRate(), reason: reason.kind,
+    });
     return reason;
   }
 
@@ -1475,6 +1646,7 @@ export class SingleStreamDriver {
     this.#activeControllers.add(controller);
     let textBuf = '';
     this.#streamProse = '';
+    this.#stepCommandIds = [];
     let reasoningChars = 0;
     // v0.3.1：思考过程捕获（按块 index 分段，落盘时按到达序拼接为单个 reasoning 块）
     const reasoningParts: string[] = [];
@@ -1588,7 +1760,15 @@ export class SingleStreamDriver {
             usageSeen = chunk.usage;
             this.#usage.inputTokens += chunk.usage.inputTokens;
             this.#usage.outputTokens += chunk.usage.outputTokens;
-            this.#record({ seq: ++DRIVER_SEQ, kind: 'usage', turn, inputTokens: chunk.usage.inputTokens, outputTokens: chunk.usage.outputTokens });
+            // v0.4.1：缓存读/写单列（DISJOINT 口径：input 是未缓存输入）——预算档只加
+            // inputTokens 会系统性低估支出，档位迟迟不升级（METRICS E3）。
+            this.#usage.cacheReadTokens += chunk.usage.cacheReadTokens ?? 0;
+            this.#usage.cacheWriteTokens += chunk.usage.cacheWriteTokens ?? 0;
+            this.#record({
+              seq: ++DRIVER_SEQ, kind: 'usage', turn,
+              inputTokens: chunk.usage.inputTokens, outputTokens: chunk.usage.outputTokens,
+              cacheReadTokens: chunk.usage.cacheReadTokens ?? 0, cacheWriteTokens: chunk.usage.cacheWriteTokens ?? 0,
+            });
             break;
           case 'finish':
             finish = chunk.reason;
@@ -1644,6 +1824,9 @@ export class SingleStreamDriver {
       this.#warn('assistant 事件写入失败', error);
     }
     frameEnd(settlement);
+    // v0.4.1：本步摘要（正文 + 命令事实）。落史时机在 #turnLoop 的 drain 之后
+    // ——与易变尾转正同一轮次，保证下一请求的公共前缀覆盖本请求全部 prompt。
+    this.#lastStepDigest = { step, prose: this.#streamProse, cmdIds: [...this.#stepCommandIds] };
     if (reasoningChars > 0) {
       this.#ledgerWrite('plugin:tf-agent/step', { turn, step, reasoningChars });
     }
@@ -1702,6 +1885,9 @@ export class SingleStreamDriver {
     // v0.3.1：回合级命令序（跨请求单调）。final 之后又发过非 final 命令 → 那条 final 过期
     //（模型写完 final 又继续干活；旧答案不能当成交付内容）。
     const order = ++this.#cmdOrder;
+    // v0.4.1：本回合命令集（产出口径基准）+ 本步命令集（摘要事实来源）
+    this.#turnCommandIds.add(cmd.id);
+    this.#stepCommandIds.push(cmd.id);
     if (cmd.name !== 'tf-final') this.#lastNonFinalOrder = order;
     const prev = this.#commands.get(cmd.id);
     if (prev !== undefined) {
@@ -2351,6 +2537,164 @@ export class SingleStreamDriver {
   }
 
   /**
+   * v0.4.1：本回合的"生产性 ok 命令"数（进度基准）。
+   * 排除 tf-final（声明不是工作）与 tf-plan（计划不是交付）；只读/peek/写/跑命令都算——
+   * 只要模型拿到新信息或改了文件，就不该被"重入次数"硬杀。
+   */
+  #productiveOkCount(): number {
+    let n = 0;
+    for (const id of this.#turnCommandIds) {
+      const rec = this.#commands.get(id);
+      if (rec === undefined || rec.status !== 'ok') continue;
+      if (rec.cmd.name === 'tf-final' || rec.cmd.name === 'tf-plan') continue;
+      n += 1;
+    }
+    return n;
+  }
+
+  /** v0.4.1：本回合 ok 的命令记录（兜底交付取证用；按解析序）。 */
+  #turnOkRecords(): CommandRecord[] {
+    const out: CommandRecord[] = [];
+    for (const id of this.#turnCommandIds) {
+      const rec = this.#commands.get(id);
+      if (rec !== undefined && rec.status === 'ok') out.push(rec);
+    }
+    return out.sort((a, b) => a.cmd.seq - b.cmd.seq);
+  }
+
+  /**
+   * v0.4.1：收束前/硬上限处的兜底交付。用户侧的"输出截断"本质是回合结束时没有
+   * assistant 最终消息，只剩最后一句 prose。这里把台账事实写成一条**明确标注未完成**
+   * 的交付说明（不是伪造模型答案）：已完成什么、最近一次命令输出、哪些没验证。
+   * 零产出回合返回 null（不伪造"已完成"）。
+   */
+  #buildFallbackFinal(detail: string): string | null {
+    const ok = this.#turnOkRecords();
+    if (ok.length === 0) return null;
+    const writes = ok.filter((r) => r.cmd.name === 'tf-write' || r.cmd.name === 'tf-edit' || r.cmd.name === 'tf-append');
+    const bashes = ok.filter((r) => r.cmd.name === 'tf-bash' || r.cmd.name === 'tf-code');
+    const reads = ok.filter((r) => r.cmd.name === 'tf-read' || r.cmd.name === 'tf-grep' || r.cmd.name === 'tf-glob'
+      || r.cmd.name === 'tf-peek' || r.cmd.name === 'tf-call');
+    const lines: string[] = [`[未完成交付] 回合在收束预算内停止（${detail}），没有收到有效的 tf-final。以下为台账事实，不是模型结论：`];
+    let listed = 0;
+    for (const rec of [...writes, ...bashes, ...reads]) {
+      if (listed >= 8) break;
+      const target = rec.cmd.attrs['path'] ?? rec.cmd.attrs['cmd'] ?? rec.cmd.attrs['pattern']
+        ?? rec.cmd.attrs['handle'] ?? rec.cmd.attrs['tool'] ?? '';
+      const size = rec.observation?.payload.kind === 'skeleton'
+        ? (rec.observation.payload as { rendered?: string }).rendered?.length
+        : undefined;
+      lines.push(`- ${rec.cmd.name}${target === '' ? '' : ` ${capText(target, 120)}`} → ok${rec.handle === undefined ? '' : `（${rec.handle}）`}${size === undefined ? '' : `，${size} 字符`}`);
+      listed += 1;
+    }
+    const lastBash = bashes[bashes.length - 1];
+    if (lastBash !== undefined) {
+      const output = this.#obs.peek(lastBash.handle ?? '', 1, Number.MAX_SAFE_INTEGER);
+      if (output !== null && output.trim() !== '') {
+        const tail = output.length <= 700 ? output : `…${output.slice(output.length - 700)}`;
+        lines.push(`最近一次命令输出（尾部 ≤700 字符）：\n${tail}`);
+      }
+    }
+    const unfinished = [...this.#turnCommandIds]
+      .map((id) => this.#commands.get(id))
+      .filter((r): r is CommandRecord => r !== undefined && (r.status === 'failed' || r.status === 'pending' || r.status === 'dispatched'));
+    if (unfinished.length > 0) {
+      lines.push('未完成/未验证：');
+      for (const rec of unfinished.slice(0, 5)) {
+        lines.push(`- ${rec.cmd.id} ${rec.cmd.name} → ${rec.status}${rec.detail === undefined ? '' : `（${capText(rec.detail, 120)}）`}`);
+      }
+    }
+    lines.push('如需继续，请直接说明下一步（例如“继续修 X”）；本回合没有把未验证的工作标成完成。');
+    return capText(lines.join('\n'), 4000);
+  }
+
+  /**
+   * v0.4.1：兜底交付——用户侧"输出截断"的最后一道闸。
+   * 回合在收束预算内仍没拿到 tf-final 时，把**台账事实**写成一条明确标注未完成的
+   * assistant 消息落进会话，而不是让界面停在最后一句 prose 上。
+   * 零产出（无 ok 命令）→ 不写（不伪造"已完成"）；同一回合只写一次。
+   */
+  #deliverFallbackFinal(turn: number, step: number, detail: string): boolean {
+    if (this.#fallbackFinalDelivered) return false;
+    const text = this.#buildFallbackFinal(detail);
+    if (text === null) return false;
+    this.#fallbackFinalDelivered = true;
+    try {
+      this.#ports.events?.finalAnswer?.(turn, step, text);
+    } catch (error) {
+      this.#warn('兜底交付写入失败', error);
+    }
+    this.#record({
+      seq: ++DRIVER_SEQ, kind: 'fault', fault: 'fallback-final',
+      detail: `回合收束但无 tf-final → 已写未完成交付说明（${capText(detail, 120)}）`,
+    });
+    this.#ledgerWrite('plugin:tf-agent/fault', {
+      fault: 'fallback-final', detail, turn, step, commands: this.#productiveOkCount(),
+    });
+    return true;
+  }
+
+  /** v0.4.1：收束期指令（只在到达停滞/硬上限后注入；排在所有事实块之后，模型最后读到它）。 */
+  #closeOutNudge(attempt: number, detail: string): string {
+    const ok = this.#productiveOkCount();
+    const last = attempt >= 2;
+    return [
+      `[tf-stream:closeout attempt=${attempt}] ${last ? '这是最后一次收束机会。' : '进入收束阶段。'}`,
+      `本回合已成功执行 ${ok} 条命令；${detail}`,
+      '停止继续探索/验证：不要再读文件、跑检查或补新功能，除非缺少的结果会改变最终结论。',
+      '立即用 tf-final 交付：summary 写最终答案原文（数字/行内容/路径/结论）+ 未验证项清单；',
+      '任务确实没做完就如实写“未完成：…”，不要用 placeholder/占位/TODO。',
+    ].join('\n');
+  }
+
+  /**
+   * v0.4.1：本步正文 + 命令摘要落追加区（模型下一步还能看到自己干了什么）。
+   *
+   * 0.3.x 的教训：追加区只有 system + 任务 + 句柄目录行时，模型第 2 个请求起就只看到
+   * system + 任务——真机 session-e4b9a89c 里模型的原话是 "The history is truncated.
+   * I don't see the plan content"，随后反复重读、计划无法验收、9 步后 blocked。
+   */
+  #commitStepDigest(): void {
+    const digest = this.#lastStepDigest;
+    this.#lastStepDigest = null;
+    if (digest === null) return;
+    const prose = normalizeProse(digest.prose);
+    if (prose !== '') {
+      this.#renderer.appendHistory({ role: 'assistant', content: capText(prose, STEP_PROSE_COMMIT_LIMIT) });
+    }
+    const lines: string[] = [];
+    for (const id of digest.cmdIds) {
+      const rec = this.#commands.get(id);
+      if (rec === undefined) continue;
+      const target = rec.cmd.attrs['path'] ?? rec.cmd.attrs['cmd'] ?? rec.cmd.attrs['pattern']
+        ?? rec.cmd.attrs['handle'] ?? rec.cmd.attrs['tool'] ?? rec.cmd.attrs['summary'] ?? '';
+      const detail = rec.detail !== undefined && rec.detail !== '' ? ` · ${capText(rec.detail, 120)}` : '';
+      lines.push(
+        `- ${id} ${rec.cmd.name}${target !== '' ? ` ${capText(target, 120)}` : ''} → ${rec.status}`
+        + `${rec.handle !== undefined ? ` handle=${rec.handle}` : ''}${detail}`,
+      );
+    }
+    if (lines.length === 0) return;
+    this.#renderer.appendHistory({
+      role: 'user',
+      content: `[tf-stream:step step=${digest.step} 上一步动作与结果]\n${lines.join('\n')}`,
+    });
+  }
+
+  /** v0.4.1：把已随请求发出的易变尾转正为追加区历史（下一请求仍可见，不再一次性蒸发）。
+   *  只转正"事实类"块（观测/peek/原生结果/回灌）；nudge / degraded / error 这类
+   *  瞬态指令不回灌历史——否则模型会把过期的"预算告急""final 被拒"当现状。 */
+  #commitDeliveredTail(): void {
+    const delivered = this.#deliveredTail;
+    this.#deliveredTail = null;
+    if (delivered === null) return;
+    for (const block of delivered.blocks) {
+      if (!isDurableBlock(block)) continue;
+      this.#renderer.appendHistory({ role: block.role, content: block.content });
+    }
+  }
+
+  /**
    * 结构化重入事由收集（仅三种：失败/拒绝、依赖未满足）。
    * 收集即上报：同一命令只注入一次（模型修复与否由它自己负责，tf-final 是最终裁决）。
    */
@@ -2413,6 +2757,11 @@ export class SingleStreamDriver {
     //    tf-read 成功 → 注入完整原文；超过 READ_FEEDBACK_LIMIT 截断为中段省略 + 头尾保留，
     //    并提示 tf-peek 精确取回；骨架只作为超大文件的替代形态。
     if (level === 'normal' || level === 'high-only') {
+      // v0.4.1：单请求读注入预算（按本请求新注入的正文累减；已注入过的不占额度）。
+      // ≤0 = 关闭预算（回退点：行为等价 0.4.0）。
+      let readBudget = this.#cfg.readFeedbackBudgetPerRequest > 0
+        ? this.#cfg.readFeedbackBudgetPerRequest
+        : Number.POSITIVE_INFINITY;
       for (const rec of this.#commands.values()) {
         const obs = rec.observation;
         if (obs === undefined || obs.info_gain !== 'high') continue;
@@ -2442,6 +2791,14 @@ export class SingleStreamDriver {
             continue;
           }
           body = readFeedbackBody(full, obs.payload.rendered, this.#cfg.readFeedbackLimit ?? DEFAULT_READ_FEEDBACK_LIMIT);
+          // v0.4.1 单请求读注入预算：一次读多文件时不再把每个文件的全文都塞进同一请求
+          //（真机 13 步会话 step 3：单请求 5916 个未缓存 token，占全会话未缓存输入的 47%）。
+          // 预算内给全文，超出给"头 800 字符 + 句柄"，下一请求用 tf-peek 精确补全——
+          // 把大块新内容摊平到多个请求，每个请求只新增它这一步真正要看的那份。
+          if (body.length > readBudget) {
+            body = readPreviewBody(full, obs.payload.rendered, READ_PREVIEW_CHARS);
+          }
+          readBudget = Math.max(0, readBudget - body.length);
         } else if (rec.cmd.name === 'tf-code' && rec.output !== undefined) {
           // F3：code 结果可见性——上限内的首成功/变化值完整注入（省一次 tf-peek 往返）；
           // 句柄仍然有效，需要原文行段时照常 tf-peek。仅 tf-code 显式开启时此路径可达。
@@ -2540,6 +2897,43 @@ function commandFingerprint(cmd: TfCommand): string {
  *  故阈值取宽。 */
 export const DEFAULT_READ_FEEDBACK_LIMIT = 8000;
 
+/** v0.4.1：单请求 tf-read 完整正文注入预算（字符）。一次读五个文件时，旧实现把五份
+ *  全文都塞进同一请求（真机 13 步会话 step 3：5916 个未缓存 token，占全会话未缓存
+ *  输入的 47%）。预算内的文件给全文，超出部分给"头 800 字符 + 句柄"预览，下一请求
+ *  可用 tf-peek 精确补全——把大块新内容摊平，避免一次请求把缓存命中率拉低。
+ *  12000 字符 ≈ 3k tokens；按 8000/文件的单文件上限，通常可容 1-2 份全文。 */
+export const DEFAULT_READ_FEEDBACK_BUDGET_PER_REQUEST = 12_000;
+
+/** v0.4.1：超预算 tf-read 的预览长度（字符）。 */
+const READ_PREVIEW_CHARS = 800;
+
+/** v0.4.1：单步正文落追加区的上限（字符）。prose 通常很短；超长只截断历史摘要，
+ *  当期 assistant/message 仍完整落盘（不改变可读输出）。 */
+export const STEP_PROSE_COMMIT_LIMIT = 4000;
+
+/** v0.4.1：可转正进追加区的易变尾前缀（事实类）。瞬态指令（nudge/degraded/error）不转正。 */
+const DURABLE_TAIL_PREFIXES: readonly string[] = [
+  '[tf-stream:observation',
+  '[tf-stream:peek',
+  '[tf-stream:tool-result',
+  '[tf-stream:replay',
+];
+
+/** v0.4.1：尾块是否会在下一请求转正进追加区（同 DURABLE_TAIL_PREFIXES 判定，单点定义）。 */
+function isDurableBlock(block: { content: string }): boolean {
+  return DURABLE_TAIL_PREFIXES.some((prefix) => block.content.startsWith(prefix));
+}
+
+/** v0.4.1：正文归一化（连续空行压成一个；去首尾空白）——避免空消息污染正文。 */
+export function normalizeProse(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** 截断到上限（保留尾部标记，便于台账核对）。 */
+function capText(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, limit)}…（截断 ${text.length - limit} 字符）`;
+}
+
 function readFeedbackBody(full: string | null, skeleton: string, limit: number): string {
   if (full === null) return `${skeleton}\n（原文不可取回，仅骨架；tf-peek 可按行段重试）`;
   if (full.length <= limit) return full;
@@ -2547,6 +2941,16 @@ function readFeedbackBody(full: string | null, skeleton: string, limit: number):
   const tailCut = Math.max(0, Math.floor(limit * 0.2));
   const omitted = full.length - headCut - tailCut;
   return `${full.slice(0, headCut)}\n……（中段省略 ${omitted} 字符；tf-peek handle=<句柄> from_line=.. to_line=.. 精确取回）……\n${full.slice(full.length - tailCut)}`;
+}
+
+/** v0.4.1：本请求读注入预算已满时的降级正文——头 N 字符 + 取回路径。
+ *  小文件（≤ N 字符）照给全文：它几乎不占额度，没必要为省几百字符把模型推去额外 peek。 */
+function readPreviewBody(full: string | null, skeleton: string, previewChars: number): string {
+  if (full === null) return `${skeleton}\n（原文不可取回，仅骨架；tf-peek 可按行段重试）`;
+  if (full.length <= previewChars) return full;
+  const lines = full.split('\n').length;
+  return `${full.slice(0, previewChars)}\n……（本请求读注入预算已满：共 ${lines} 行 / ${full.length} 字符，此处只给前 ${previewChars} 字符；`
+    + `余下用 tf-peek handle=<句柄> from_line=.. to_line=.. 精确取回）……`;
 }
 
 /** v0.3.1 截断修复：可回灌原结果的重复命令（信息类，无副作用）。

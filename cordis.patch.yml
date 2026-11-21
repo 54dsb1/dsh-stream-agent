@@ -69,7 +69,9 @@
       config:
         announceTakeover: true
         maxParallelToolCalls: 3
-        maxReentries: 8
+        # v0.4.1：maxReentries 不在装配里钉死——由模式默认值决定（balanced 12 / lean 8 /
+        # compat 16 / power 14）。此前钉死 8 按"装配压过模式"规则压制了模式档位与上限提升，
+        # 真机 11 步会话仍以"重入上限 8"硬杀（模型正重写到一半）。
         streamIdleTimeoutMs: 30000
         # K1（0.3.0）：tf-code 默认关闭——协议段 0 字符，模型不会幻觉调用。
         # 显式开启走 power 模式，或把本行改为 true（前提：宿主挂载 @deepseek-ai/dsh-ptc-runtime，

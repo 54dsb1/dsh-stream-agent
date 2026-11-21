@@ -22,7 +22,7 @@ earlier batch — the two are not comparable; see the honest note in
 | ----- | ----- |
 | Host | DeepSeek Harness `0.2.2-rc.1` (type anchor) / `rc.3` (runtime-tested) |
 | Dependencies | Zero npm dependencies; Node ≥ 22.18 (native type stripping) |
-| Tests | 275 cases green, zero API calls (mock full-chain + 20 scenarios + activation/desktop/new-capability/session-format regressions) |
+| Tests | 333 cases green, zero API calls (mock full-chain + 20 scenarios + activation/desktop/new-capability/session-format/closeout-and-prefix regressions) |
 | Shape | Single bundle + **dedicated profile** (`profiles/stream` template); `dsh plugin remove` unwinds the whole layer and restores the host loop atomically |
 | Control bar | `dsh-stream-agent bar`: four modes + zh/en + intent triage, onboarding banner on load |
 | Desktop page | Left-rail **Control bar**: status + four mode cards + zh/en switch, **without touching the Electron shell** |
@@ -121,12 +121,19 @@ benchmarked" — we do not present unmeasured numbers as percentages.
 
 Mode → config mapping (explicit config > mode > built-in defaults):
 
-| Mode | `selfReadFeedback` | `enableCode` | `persistFallback` | Parallel | Reentries | `budgetTokens` |
+| Mode | `selfReadFeedback` | `enableCode` | `persistFallback` | Parallel | Stall reentries | `budgetTokens` |
 | --- | --- | --- | --- | --- | --- | --- |
-| `balanced` | `receipt` | `false` | `true` | 3 | 8 | — |
-| `lean` | `receipt` | `false` | `true` | 2 | 6 | 60,000 |
-| `compat` | `full` | `false` | `true` | 1 | 12 | — |
-| `power` | `receipt` | `true` | `true` | 3 | 10 | — |
+| `balanced` | `receipt` | `false` | `true` | 3 | 12 | — |
+| `lean` | `receipt` | `false` | `true` | 2 | 8 | 60,000 |
+| `compat` | `full` | `false` | `true` | 1 | 16 | — |
+| `power` | `receipt` | `true` | `true` | 3 | 14 | — |
+
+"Stall reentries" (v0.4.1) counts only **consecutive reentries that produced nothing new**.
+Reentries where the model kept reading/writing/running commands do not consume this budget —
+productive work is never killed by a counter. What still binds the turn is the hard request
+cap (2× reentries) plus a close-out window: one closing instruction (up to 2), and if no
+`tf-final` follows, a delivery note that explicitly marks the work as unfinished instead of
+dropping a half-finished session on the user.
 
 One-line decision guide: **stay on `balanced`; switch to `lean` when the bill matters;
 `compat` when diffing against the native loop; `power` for programmatic data work.**
@@ -303,13 +310,13 @@ dsh-stream-agent/
 │                          #   disabled-lines-audit / v0.4.0-plan / TEST-PROPOSITIONS
 ├── scripts/               # build / check-consistency / gate / install-check / install-cycle /
 │                          #   repair-session-logs / release
-└── test/                  # 275 cases (2 kernel + 15 entry suites + 20 mock scenarios; zero API)
+└── test/                  # 333 cases (2 kernel + 22 entry suites + 20 mock scenarios; zero API)
 ```
 
 ## 10. Development
 
 ```bash
-npm test          # 275/275, zero API calls
+npm test          # 333/333, zero API calls
 npm run build     # emits dist/ (25 files) + smoke imports + desktop-page build gates
 npm run check     # R2: assembly & doc consistency (4 checks)
 npm run gate      # R4: release gate (6 items; real-machine items marked honestly)
