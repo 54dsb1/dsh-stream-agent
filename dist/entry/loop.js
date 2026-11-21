@@ -870,7 +870,9 @@ export class SingleStreamDriver {
       model: config.model,
       reasoningEffort: config.reasoningEffort,
       maxParallelToolCalls: config.maxParallelToolCalls ?? 3,
-      maxReentries: config.maxReentries ?? 8,
+      // v0.3.3：兜底值与 balanced 模式默认一致（12）——此前硬编码 8，直构驱动器的调用方
+      // （离线评测/测试）会拿到与桌面装配不一致的旧上限。
+      maxReentries: config.maxReentries ?? 12,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? 30_000,
       budgetTokens: config.budgetTokens,
       selfReadFeedback: config.selfReadFeedback ?? 'receipt',

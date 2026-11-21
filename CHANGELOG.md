@@ -60,6 +60,11 @@
   parseAttrPairs 同款；valueStart 用绝对下标——相对偏移会让 lastIndex 不前进死循环）。
 - **重入上限提升**（balanced 8→12、lean 6→8、compat 12→16、power 10→14）：语义是
   防打转兜底不是任务步数预算（`session-2079562e`：8 步 blocked，任务未完成）。
+- **装配清单解除 `maxReentries: 8` 钉死（决定性修复）**：cordis.patch.yml / preset.yml
+  显式钉死 8——按"装配压过模式"规则，modes.ts 的上限提升从不生效（真机
+  `session-7fbfef8f`：11:57 的会话仍以"重入上限 8"硬杀，模型正重写到一半）。现在
+  上限由模式默认值决定；驱动器直构兜底值同步 8→12。缓存命中同批真机 91%
+  （`session-7fbfef8f` 26.6K tok），顺序修复生效。
 
 **回归**：新增 `test/v032-conflict.test.ts` 4 用例（W1 线消息 source / W2 nudge 进度感知 /
 W3 实体解码 / W4 DSML 内联属性混合形态）；全量 327/327 离线通过（零 API 调用）。

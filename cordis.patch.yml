@@ -69,7 +69,10 @@
       config:
         announceTakeover: true
         maxParallelToolCalls: 3
-        maxReentries: 8
+        # v0.3.3：maxReentries 不在装配里钉死——由模式默认值决定（balanced 12 / lean 8 /
+        # compat 16 / power 14）。语义是"防打转兜底"不是"任务步数预算"：旧钉死 8 曾把
+        # 计划+实现+验收类任务在第 8 步硬杀（真机 session-7fbfef8f/2079562e 取证）。
+        # 真打转由重复命令护栏（replay-capped）与零产出 nudge 收束，上限只兜底。
         streamIdleTimeoutMs: 30000
         # K1（0.3.0）：tf-code 默认关闭——协议段 0 字符，模型不会幻觉调用。
         # 显式开启走 power 模式，或把本行改为 true（前提：宿主挂载 @deepseek-ai/dsh-ptc-runtime，
