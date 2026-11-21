@@ -27,10 +27,8 @@
 export type ToolFamily =
   | 'read' | 'grep' | 'glob' | 'web' | 'test' | 'build'   // 高增益候选族
   | 'code'                                                // tf-code 程序化结果（高增益：首个/变化结果注骨架）
-  | 'skill' | 'agent' | 'job' | 'ask'                     // v0.4.0 tf-call 扩族（高增益：内容型产出必须可见）
   | 'write' | 'append' | 'mkdir'                          // 低增益回执族
   | 'bash'                                                // 成功记 ledger、失败注入（README §5）
-  | 'office' | 'goal'                                     // v0.4.0 tf-call 扩族（低增益回执：产物/状态确认）
   | 'other';                                              // 未识别工具：默认按 low（默认不回灌）
 
 export type InfoGain = 'high' | 'low' | 'none';
@@ -65,16 +63,15 @@ export interface ClassificationContext {
 
 const HIGH_GAIN_FAMILIES: ReadonlySet<ToolFamily> = new Set([
   'read', 'grep', 'glob', 'web', 'test', 'build', 'code',
-  'skill', 'agent', 'job', 'ask',
 ]);
 const LOW_RECEIPT_FAMILIES: ReadonlySet<ToolFamily> = new Set([
-  'write', 'append', 'mkdir', 'bash', 'office', 'goal',
+  'write', 'append', 'mkdir', 'bash',
 ]);
 
 /** 工具名 → 工具族。tf-* 命令名与其同族名一一对应；未知工具归 other。 */
 export function classifyTool(tool: string): ToolFamily {
   const t = tool.toLowerCase();
-  if (t === 'tf-read' || t === 'read' || t === 'read_file' || t === 'cat' || t === 'read_image') return 'read';
+  if (t === 'tf-read' || t === 'read' || t === 'read_file' || t === 'cat') return 'read';
   if (t === 'tf-write' || t === 'write' || t === 'write_file' || t === 'edit' || t === 'tf-edit' || t === 'apply_patch') return 'write';
   if (t === 'tf-peek' || t === 'peek') return 'read';
   if (t === 'tf-bash' || t === 'bash' || t === 'shell') return 'bash';
@@ -84,18 +81,6 @@ export function classifyTool(tool: string): ToolFamily {
   if (t === 'tf-grep' || t === 'grep' || t === 'search' || t === 'grep_search') return 'grep';
   if (t === 'tf-glob' || t === 'glob' || t === 'list' || t === 'ls') return 'glob';
   if (t.startsWith('web') || t === 'fetch' || t === 'http') return 'web';
-  // v0.4.0：tf-call 透传的宿主工具名归类（standard/ptc 面的对等工具）。familyHint 优先级
-  // 高于前缀猜测：ask_user_question 是阻塞交互，回答必须可见（high）；skill 装载改变会话
-  // 行为；subagent 的产出就是报告本体；job/schedule 的 listing/output 是内容型。
-  if (t === 'ask_user_question' || t.startsWith('ask')) return 'ask';
-  if (t === 'skill' || t.endsWith('_skill')) return 'skill';
-  if (t === 'subagent' || t === 'subagent_fork' || t === 'workflow' || t === 'task' || t === 'agent') return 'agent';
-  if (t.startsWith('job_')) return 'job';
-  if (t.startsWith('schedule_')) return 'job';
-  if (t.startsWith('office_') || t === 'present') return 'office';
-  if (t.startsWith('goal') || t.endsWith('_goal')) return 'goal';
-  if (t === 'todo_write') return 'write';
-  if (t === 'exit_plan_mode') return 'ask';
   if (t === 'test' || t === 'run_tests') return 'test';
   if (t === 'build' || t === 'compile') return 'build';
   return 'other';

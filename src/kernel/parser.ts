@@ -23,9 +23,6 @@
  *   <tf-glob pattern="src/**" id="gl1"/>
  *   <tf-bash cmd="npm test" id="b1"/>
  *   <tf-peek handle="obs:read:c3@v1" from_line="10" to_line="20" id="p1"/>
- *   <tf-call name="web_search" id="c1" depends_on="w1">{"query":"..."}</tf-call>
- *   <tf-ask q="选择哪种方案？" id="a1" options="方案A,方案B"/>
- *   <tf-skill name="skill-name" id="s1"/>
  *   <tf-final id="f1" summary="任务完成说明"/>
  *
  * 规则：
@@ -49,6 +46,24 @@
  *   典型是模型把自闭合命令又"关闭"了一次）一律按 malformed(stray-close-tag) 记账后丢弃，
  *   绝不作 prose 透传——0.3.1 真机证据：这类残片会以纯文本落进 assistant/message，
  *   桌面端正文里出现裸的 `</tf-bash>`。
+ * - 畸形闭合变体（v0.3.3）：`</tf-` 紧跟非空白且引号感知存在 '>' 的 token（通配
+ *   `</tf-*>`、带属性 `</tf-write path="x">`）同样是协议闭合尝试——判 close-tag 记账丢弃
+ *   （loop 首次出现时注入定向纠错）。判别式带 `\S` 是为了保住"正文里提到 </tf"的透传语义
+ *   （`</tf 不在标签位` 无 '>' 且 tf 后是空白 → 仍按 prose）。真机证据 2026-11-20：
+ *   `</tf-*>` 两度作为 prose 落进桌面端正文，模型重复犯错且会话无产出收场。
+ * - DSML 参数式调用（v0.3.2 截断修复）：模型原生调用格式还有"父标签 + parameter 子标签"
+ *   形态（真机取证 session-e4b9a89c 第 6/9 步）：
+ *     <｜｜DSML｜｜ invoke name="tf-read">
+ *     <｜｜DSML｜｜ parameter name="path" string="true">README.md</｜｜DSML｜｜ parameter>
+ *     </｜｜DSML｜｜ invoke>
+ *   0.3.1 只认「invoke 头部内联属性」形态，parameter 子标签被逐条判 malformed，而标签之间的
+ *   属性值（README.md / r10 / 命令行）作为 prose 漏进正文——用户侧看到的就是"截断的正文 +
+ *   `README.md r10` 这种残片"，且命令根本没执行。本版把整个 invoke 块缓冲到闭合，按
+ *   parameter 归集成属性后一次性发命令；块内文本不再作为 prose 透传。块未闭合即流终止时，
+ *   非正文命令（属性已齐）照常发命令（能救则救），正文命令按 truncated 丢弃（不写半截文件）。
+ * - 非正文命令的配对开标签（v0.3.2）：`<tf-read ...>` 少了 `/` 时，0.3.1 会进入 body 模式
+ *   一直吞到流末尾（整个后续输出消失）。现在非正文命令一旦出现下一个 `<tf-` / `</tf-`
+ *   即视为已闭合（命令照常派发），流末尾仍未闭合也发命令并把剩余文本按 prose 归还。
  *
  * 事件类型：text / command / malformed / truncated / cycle / done。
  * 命令闭合立即 emit，不等流结束；"当前可执行集合"用 readyCommands() 查询
@@ -61,8 +76,7 @@
 
 export type TfCommandName =
   | 'tf-write' | 'tf-read' | 'tf-edit' | 'tf-append' | 'tf-grep' | 'tf-glob'
-  | 'tf-bash' | 'tf-peek' | 'tf-final' | 'tf-code' | 'tf-plan'
-  | 'tf-call' | 'tf-ask' | 'tf-skill';
+  | 'tf-bash' | 'tf-peek' | 'tf-final' | 'tf-code' | 'tf-plan';
 
 interface CommandSchema {
   required: readonly string[];
@@ -93,19 +107,10 @@ const COMMAND_SCHEMAS: Readonly<Record<TfCommandName, CommandSchema>> = {
   'tf-plan': { required: [], optional: [], hasBody: true },
   // 程序体 = PTC 的 async TS 函数体（可擦除语法）；description 只进台账，timeout 为毫秒数
   'tf-code': { required: [], optional: ['timeout', 'description'], hasBody: true },
-  // v0.4.0 通用调用通道（G2：净增 1）：name = 本会话冻结工具面内的宿主工具名；
-  // body = JSON 对象（参数原样透传给 ctx.tools.execute）。parser 只做 schema 校验，
-  // 工具名/JSON 的语义校验在驱动器（unknown-tool / bad-json-arguments 结构化失败）。
-  'tf-call': { required: ['name'], optional: [], hasBody: true },
-  // v0.4.0 高频例外（§6.4，命令表 12→14）：阻塞式提问与技能装载值一条专用语法——
-  // tf-ask 的回答要作为问句语义在流内可见（familyHint=ask）；tf-skill 是会话级状态变更。
-  // 参数刻意极简（JSON 免转义）；复杂形状（多问题/选项描述）走 tf-call body。
-  'tf-ask': { required: ['q'], optional: ['header', 'options'], hasBody: false },
-  'tf-skill': { required: ['name'], optional: [], hasBody: false },
 };
 
 const COMMAND_NAMES: readonly TfCommandName[] =
-  ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan', 'tf-call', 'tf-ask', 'tf-skill'];
+  ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan'];
 
 export interface TfCommand {
   name: TfCommandName;
@@ -113,7 +118,7 @@ export interface TfCommand {
   id: string;
   /** 除 depends_on 外的全部属性（path/cmd/handle/from_line/...） */
   attrs: Readonly<Record<string, string>>;
-  /** 仅 tf-write / tf-code / tf-call 有；原文，无转义还原（tf-code = PTC 程序体；tf-call = JSON 参数） */
+  /** 仅 tf-write / tf-code 有；原文，无转义还原（tf-code = PTC 程序体） */
   body?: string;
   /** 依赖命令 id 列表（去空、去重、保序） */
   depends_on: readonly string[];
@@ -133,13 +138,17 @@ export type ParserEvent =
 // 流式解析器
 // ---------------------------------------------------------------------------
 
-type Mode = 'ground' | 'header' | 'body';
+type Mode = 'ground' | 'header' | 'body' | 'dsml';
 type TagProbe = 'tag' | 'prose' | 'tf-unknown' | 'close-tag' | 'need-more' | 'dsml';
 
 export class TfStreamParser {
   private buf = '';
   private mode: Mode = 'ground';
   private ended = false;
+
+  /** DSML 参数式调用块缓冲（v0.3.2）：从无内联属性的 invoke 开标签起，缓冲到块闭合。 */
+  private dsmlBuf = '';
+  private dsmlName: TfCommandName | null = null;
 
   // body 中间态
   private bodyName: TfCommandName | null = null;
@@ -173,7 +182,24 @@ export class TfStreamParser {
     if (this.ended) return [];
     this.ended = true;
     const events: ParserEvent[] = [];
-    if (this.mode === 'header') {
+    if (this.mode === 'dsml') {
+      // v0.3.2：DSML 参数式块未闭合即流终止。非正文命令只要属性齐全就照常发（能救则救）；
+      // 正文命令（tf-write/tf-edit/tf-append/tf-code）不写半截内容——按 truncated 上报。
+      const block = this.dsmlBuf + this.buf;
+      const expected = this.dsmlName;
+      this.dsmlBuf = '';
+      this.dsmlName = null;
+      this.buf = '';
+      this.mode = 'ground';
+      const parsed = parseDsmlBlock(block, expected, { allowIncompleteBody: false });
+      for (const bad of parsed.malformed) {
+        events.push({ type: 'malformed', raw: bad.raw, reason: bad.reason });
+      }
+      for (const cmd of parsed.commands) {
+        this.emitCommand(events, cmd.name, cmd.attrs, cmd.dependsOn, cmd.body, cmd.raw);
+      }
+      events.push({ type: 'truncated', raw: block, reason: 'unclosed-dsml-invoke' });
+    } else if (this.mode === 'header') {
       if (isDsmlTag(this.buf)) {
         // DSML 尾巴（feed 期间已进 header 模式但流终止）：malformed 上报，不进 prose
         events.push({ type: 'malformed', raw: this.buf, reason: 'dsml-wrapper' });
@@ -182,11 +208,33 @@ export class TfStreamParser {
         events.push({ type: 'truncated', raw: this.buf, reason: 'unclosed-command-tag' });
       }
     } else if (this.mode === 'body') {
-      events.push({
-        type: 'truncated',
-        raw: this.bodyRawOpen + this.bodyBuf + this.buf,
-        reason: `unclosed-command-body:${this.bodyName}`,
-      });
+      if (!COMMAND_SCHEMAS[this.bodyName!].hasBody) {
+        // v0.3.2：非正文命令的配对开标签缺闭合——命令本身是完整的（属性齐），
+        // 不能因为模型少写一个 '/' 就把整条命令连同后续输出一起丢掉。
+        const name = this.bodyName!;
+        const attrs = this.bodyAttrs!;
+        const deps = this.bodyDeps!;
+        const rawOpen = this.bodyRawOpen;
+        const trailing = this.bodyBuf + this.buf;
+        this.buf = '';
+        this.bodyName = null;
+        this.bodyAttrs = null;
+        this.bodyDeps = null;
+        this.bodyRawOpen = '';
+        this.bodyBuf = '';
+        this.mode = 'ground';
+        if (trailing.trim() !== '') {
+          events.push({ type: 'malformed', raw: trailing, reason: 'unexpected-body' });
+        }
+        this.emitCommand(events, name, attrs, deps, undefined, rawOpen + trailing);
+        if (trailing.trim() !== '') events.push({ type: 'text', text: trailing });
+      } else {
+        events.push({
+          type: 'truncated',
+          raw: this.bodyRawOpen + this.bodyBuf + this.buf,
+          reason: `unclosed-command-body:${this.bodyName}`,
+        });
+      }
     } else {
       // ground：残留的 "<tf-" 片段（尚无法判定是否标签）→ truncated；
       // DSML 尾巴（协议违规，v0.3.1）→ malformed 上报后丢弃，不作为 prose 泄漏；
@@ -237,6 +285,7 @@ export class TfStreamParser {
   private step(events: ParserEvent[]): boolean {
     if (this.mode === 'ground') return this.stepGround(events);
     if (this.mode === 'header') return this.stepHeader(events);
+    if (this.mode === 'dsml') return this.stepDsml(events);
     return this.stepBody(events);
   }
 
@@ -252,7 +301,11 @@ export class TfStreamParser {
     if (probe === 'close-tag') {
       // v0.3.1：孤立闭合标签——前面没有配对打开（自闭合命令被多关一次、或模型手写了
       // 残片）。按协议违规记账后丢弃，绝不作为 prose 落进正文。
-      const gt = this.buf.indexOf('>', lt);
+      // v0.3.3：token 端界用引号感知扫描——畸形闭合可能带属性，属性值里可含 '>'
+      // （如 `</tf-write cmd="a>b">`），裸 indexOf 会把 token 截半，剩余半截再次漏进正文。
+      // probe 与消费用同一 scanHeaderClose（同 buf 同切片），端界构造性一致。
+      const close = scanHeaderClose(this.buf.slice(lt));
+      const gt = close === null ? -1 : lt + close.end;
       const raw = gt === -1 ? this.buf.slice(lt) : this.buf.slice(lt, gt + 1);
       if (lt > 0) events.push({ type: 'text', text: this.buf.slice(0, lt) });
       this.buf = gt === -1 ? '' : this.buf.slice(gt + 1);
@@ -282,12 +335,33 @@ export class TfStreamParser {
     // DSML 噪声（v0.3.1）：先于普通解析处理——`invoke name="tf-xxx" ...` 形态改写回
     // 等价 tf-* 头部（命令不丢）；其余包装行按 malformed 上报后丢弃（不进 prose）。
     if (isDsmlTag(raw)) {
-      const dsml = parseDsmlHeader(raw, close.selfClosing);
-      if (dsml === null) {
+      // v0.3.2：参数式 invoke → 进入块缓冲，按 parameter 归集属性。
+      // 0.3.1 只认内联属性形态，parameter 子标签之间的值会作为 prose 泄漏（真机残片
+      // `README.md r10` / `Get-ChildItem ... b902` 均由此产生）。
+      // v0.3.2 补充：带内联属性的 invoke 同样缓冲（parseDsmlBlock 本就合并内联属性与
+      // parameter——parameter 覆盖同名内联键）。此前内联属性走 parseDsmlHeader 进 body
+      // 模式，非正文命令的 DSML 包装残片会被吞到流末才以 malformed 露出
+      // （真机 session-8f22c7a0 step 2：三条闭合标签残片）。
+      const dsml = parseDsmlTag(raw, close.selfClosing);
+      // v0.3.3：自闭合 invoke（`.../>`）同样走缓冲——mangled name 抢救后属性齐全的
+      // 自闭合调用照常发命令（parseDsmlBlock 的 selfClosing 分支立即 flush）。
+      if (
+        dsml !== null
+        && dsml.name === 'invoke'
+        && !dsml.closing
+        && dsml.commandName !== null
+      ) {
+        this.dsmlBuf = raw;
+        this.dsmlName = dsml.commandName;
+        this.mode = 'dsml';
+        return true;
+      }
+      const inline = parseDsmlHeader(raw, close.selfClosing);
+      if (inline === null) {
         events.push({ type: 'malformed', raw, reason: 'dsml-wrapper' });
         return true;
       }
-      const parsed = parseHeader(dsml.synthetic);
+      const parsed = parseHeader(inline.synthetic);
       if ('error' in parsed || parsed.name === null) {
         events.push({ type: 'malformed', raw, reason: 'dsml-wrapper' });
         return true;
@@ -331,21 +405,47 @@ export class TfStreamParser {
 
   private stepBody(events: ParserEvent[]): boolean {
     const name = this.bodyName!;
-    // v0.4.1：闭合标签允许尾随空白与属性（`</tf-write >` / `</tf-write path="x">`）。
-    // 旧实现只认逐字 `</tf-write>`：模型写成带空白/属性的形式时永远找不到闭合，整段
-    // 正文缓冲到流末按 truncated 丢弃——用户侧就是"写到一半没了"。
+    const schema = COMMAND_SCHEMAS[name];
+    const closeTag = `</${name}>`;
     const close = findBodyClose(name, this.buf);
+    const closeIdx = close === null ? -1 : close.index;
+    // v0.3.2：非正文命令的配对开标签（少写 '/'）不得吞掉后续输出——遇到下一个
+    // `<tf-` / `</tf-` 即视为本命令结束，命令照常派发，剩余文本回到 ground 继续解析。
+    // v0.3.2 补充：DSML 标签同样是边界（包装残片立即露出，不吞到流末）。
+    if (!schema.hasBody) {
+      const boundary = findNonBodyBoundaryWithDsml(this.buf);
+      if (boundary !== -1 && (closeIdx === -1 || boundary < closeIdx)) {
+        const body = this.bodyBuf + this.buf.slice(0, boundary);
+        const raw = this.bodyRawOpen + body;
+        this.buf = this.buf.slice(boundary);
+        this.mode = 'ground';
+        const attrs = this.bodyAttrs!;
+        const deps = this.bodyDeps!;
+        this.bodyName = null;
+        this.bodyAttrs = null;
+        this.bodyDeps = null;
+        this.bodyRawOpen = '';
+        this.bodyBuf = '';
+        if (body.trim() !== '') {
+          events.push({ type: 'malformed', raw: body, reason: 'unexpected-body' });
+          // 非正文命令后面的文本是模型 prose（不是命令输入）——归还正文，避免"输出变少"。
+          events.push({ type: 'text', text: body });
+        }
+        this.emitCommand(events, name, attrs, deps, undefined, raw);
+        return true;
+      }
+    }
     if (close === null) {
-      // 闭合标签可能被拆在 chunk 边界上：扣留末尾至多（闭合标签长度-1）与 64 的较大者，
-      // 保证带属性的闭合标签不会因跨 chunk 被切半。
-      const keep = Math.min(Math.max(`</${name}>`.length - 1, 64), this.buf.length);
+      // 闭合标签可能被拆在 chunk 边界上：扣留末尾至多 closeTag.length-1 个字符。
+      // v0.3.3：闭合标签允许空白/属性（</tf-write > / </tf-write path="x">），
+      // 扣留窗口取 64 字符，避免跨 chunk 的带属性闭合被截断后整条正文按 truncated 丢弃。
+      const keep = Math.min(Math.max(closeTag.length - 1, 64), this.buf.length);
       this.bodyBuf += this.buf.slice(0, this.buf.length - keep);
       this.buf = this.buf.slice(this.buf.length - keep);
       return false;
     }
-    const closeTag = this.buf.slice(close.index, close.end);
-    const body = this.bodyBuf + this.buf.slice(0, close.index);
-    const raw = this.bodyRawOpen + body + closeTag;
+    const body = this.bodyBuf + this.buf.slice(0, closeIdx);
+    const raw = this.bodyRawOpen + body + this.buf.slice(closeIdx, close.end);
     this.buf = this.buf.slice(close.end);
     this.mode = 'ground';
     const attrs = this.bodyAttrs!;
@@ -356,11 +456,46 @@ export class TfStreamParser {
     this.bodyRawOpen = '';
     this.bodyBuf = '';
 
-    if (!COMMAND_SCHEMAS[name].hasBody && body !== '') {
+    if (!schema.hasBody && body !== '') {
+      // 非正文命令带正文：命令本身仍有效（属性齐），正文只记账不当作命令输入。
+      // v0.3.2 起不再丢弃命令——0.3.1 会整条判 malformed，模型侧表现为"命令没执行"。
       events.push({ type: 'malformed', raw, reason: 'unexpected-body' });
+      this.emitCommand(events, name, attrs, deps, undefined, raw);
       return true;
     }
-    this.emitCommand(events, name, attrs, deps, COMMAND_SCHEMAS[name].hasBody ? body : undefined, raw);
+    this.emitCommand(events, name, attrs, deps, schema.hasBody ? body : undefined, raw);
+    return true;
+  }
+
+  /**
+   * v0.3.2：DSML 参数式 invoke 块。缓冲到块闭合后一次性归集为命令：
+   * 块内 `<｜｜DSML｜｜ parameter name="k">value</...>` 的 value 归入属性 k，
+   * 不再作为 prose 泄漏；块内裸文本按命令正文处理（hasBody 命令）。
+   */
+  private stepDsml(events: ParserEvent[]): boolean {
+    if (this.buf !== '') {
+      this.dsmlBuf += this.buf;
+      this.buf = '';
+    }
+    const term = findDsmlInvokeEnd(this.dsmlBuf, this.dsmlName);
+    if (term === null) return false;
+    const block = this.dsmlBuf.slice(0, term.end);
+    const rest = this.dsmlBuf.slice(term.end);
+    const expected = this.dsmlName;
+    this.dsmlBuf = '';
+    this.dsmlName = null;
+    this.mode = 'ground';
+    // v0.3.3：块以自身配对闭合（</tf-write>）结束时，外层 DSML 包装的收尾标签
+    // （</｜｜DSML｜｜ invoke> / </calls> / parameter）还在 rest 开头。它们属于刚消费的
+    // 块，不是新协议尝试——一并吃掉，避免每步刷三条无意义的 malformed 台账。
+    this.buf = consumeDsmlClosingWrappers(rest);
+    const parsed = parseDsmlBlock(block, expected, { allowIncompleteBody: true });
+    for (const bad of parsed.malformed) {
+      events.push({ type: 'malformed', raw: bad.raw, reason: bad.reason });
+    }
+    for (const cmd of parsed.commands) {
+      this.emitCommand(events, cmd.name, cmd.attrs, cmd.dependsOn, cmd.body, cmd.raw);
+    }
     return true;
   }
 
@@ -432,8 +567,39 @@ export class TfStreamParser {
  * 引号感知地找头部结束 '>'。
  * 属性值（如 cmd="a > b"）里的 '>' 不终止头部。返回 null 表示需要更多数据。
  */
+function scanHeaderClose(buf: string): { end: number; selfClosing: boolean } | null {
+  let inQuote = false;
+  for (let i = 1; i < buf.length; i++) {
+    const ch = buf[i];
+    if (inQuote) {
+      if (ch === '"') inQuote = false;
+      continue;
+    }
+    if (ch === '"') {
+      inQuote = true;
+    } else if (ch === '>') {
+      return { end: i, selfClosing: buf[i - 1] === '/' };
+    }
+  }
+  // v0.3.3：引号不成对（mangled DSML name 值，奇数个引号——真机 session-d6cd0759
+  // seq 110：`name="tf-peek handle="obs:...`）时严格扫描永不闭合，header 模式等死，
+  // 整条命令在流末按 malformed 丢弃。退化通道：取**第一个**满足"前驱是 `\"`（属性
+  // 收尾）或 `/\"`（自闭合）"的 '>' 作为标签端界——不能取最后一个 '>'：mangled 开标签
+  // 后面跟着命令正文（Python 代码含 '>'），取最后一个会把正文整段吞进标签再丢弃
+  // （真机 seq 104：整个 selfcheck 脚本被吞）。残片形态（无端界）仍返回 null 等更多
+  // 数据；正常标签引号成对，严格扫描先行命中，退化通道不触发。
+  for (let i = 1; i < buf.length; i++) {
+    if (buf[i] !== '>') continue;
+    const prev = buf[i - 1];
+    if (prev === '"' || (prev === '/' && buf[i - 2] === '"')) {
+      return { end: i, selfClosing: prev === '/' };
+    }
+  }
+  return null;
+}
+
 /**
- * v0.4.1：正文命令的闭合标签查找（允许空白与属性）。
+ * v0.3.3：正文命令的闭合标签查找（允许空白与属性）。
  *
  * 旧实现只认逐字 `</tf-write>`：模型写成 `</tf-write >` 或 `</tf-write path="x">`
  * 时永远找不到闭合，整段正文缓冲到流末按 truncated 丢弃——用户侧就是"写到一半没了"。
@@ -458,35 +624,21 @@ function findBodyClose(name: string, buf: string): { index: number; end: number 
   }
 }
 
-function scanHeaderClose(buf: string): { end: number; selfClosing: boolean } | null {
-  let inQuote = false;
-  for (let i = 1; i < buf.length; i++) {
-    const ch = buf[i];
-    if (inQuote) {
-      if (ch === '"') inQuote = false;
-      continue;
-    }
-    if (ch === '"') {
-      inQuote = true;
-    } else if (ch === '>') {
-      return { end: i, selfClosing: buf[i - 1] === '/' };
-    }
+/**
+ * v0.3.3：吃掉 DSML 块自身的收尾包装标签。
+ *
+ * 模型常写成 `invoke … <tf-write>正文</tf-write> </｜｜DSML｜｜ invoke>`。
+ * 块以 `</tf-write>` 结束时，外层 `</invoke>` / `</calls>` / `</parameter>` 会落在
+ * ground 里被逐条判 malformed（每步刷三条台账），既不是新命令也不是正文。
+ * 只消费紧邻的已知收尾标签，遇见其它内容立即停手。
+ */
+function consumeDsmlClosingWrappers(text: string): string {
+  let rest = text;
+  for (;;) {
+    const m = /^\s*<\/\s*｜+DSML｜*\s*(?:invoke|calls|parameter)\s*>/i.exec(rest);
+    if (m === null) return rest;
+    rest = rest.slice(m[0].length);
   }
-  // v0.4.1：引号不成对（mangled DSML name 值，奇数个引号——真机 session-d6cd0759
-  // seq 110：`name="tf-peek handle="obs:...`）时严格扫描永不闭合，header 模式等死，
-  // 整条命令在流末按 malformed 丢弃。退化通道：取**第一个**满足"前驱是 `"`（属性
-  // 收尾）或 `/"`（自闭合）"的 '>' 作为标签端界——不能取最后一个 '>'：mangled 开标签
-  // 后面跟着命令正文（Python 代码含 '>'），取最后一个会把正文整段吞进标签再丢弃
-  // （真机 seq 104：整个 selfcheck 脚本被吞）。残片形态（无端界）仍返回 null 等更多
-  // 数据；正常标签引号成对，严格扫描先行命中，退化通道不触发。
-  for (let i = 1; i < buf.length; i++) {
-    if (buf[i] !== '>') continue;
-    const prev = buf[i - 1];
-    if (prev === '"' || (prev === '/' && buf[i - 2] === '"')) {
-      return { end: i, selfClosing: prev === '/' };
-    }
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -502,9 +654,9 @@ function isDsmlTag(raw: string): boolean {
   return DSML_TAG_RE.test(raw);
 }
 
-/** 从孤立闭合标签原文取命令名（`</tf-bash>` → `tf-bash`；半截标签 → `?`）。 */
+/** 从孤立闭合标签原文取命令名（`</tf-bash>` → `tf-bash`；通配 `</tf-*>` → `tf-*`；半截标签 → `?`）。 */
 function closeTagName(raw: string): string {
-  const m = /^<\/\s*(tf-[a-z0-9-]*)/.exec(raw);
+  const m = /^<\/\s*(tf-[a-z0-9*-]*)/.exec(raw);
   return m === null ? '?' : m[1]!;
 }
 
@@ -519,21 +671,405 @@ function parseDsmlHeader(raw: string, selfClosing: boolean): { synthetic: string
   let inner = raw.slice(1);
   if (selfClosing && inner.endsWith('/>')) inner = inner.slice(0, -2);
   else if (inner.endsWith('>')) inner = inner.slice(0, -1);
-  const restRaw = inner.replace(/^\/?｜+DSML｜*/, '');
-  // v0.4.1：mangled name 值抢救——模型把全部属性塞进 name 值且忘了闭引号（真机
-  // session-d6cd0759 seq 110：`name="tf-peek handle="obs:bash:b2@v1" from_line="1" .../>`，
-  // 整条命令丢失）。name 值以合法 tf-* 命令名开头且带空格时，把 `name="tf-xxx ` 改写为
-  // `name="tf-xxx" `——余段就是正常属性对（引号结构本就完好）。
-  const mangled = /^(\s*invoke\s+)name\s*=\s*"(tf-[a-z]+)\s+/.exec(restRaw);
-  const rest = mangled !== null && COMMAND_NAMES.includes(mangled[2] as TfCommandName)
-    ? restRaw.replace(mangled[0], `${mangled[1]}name="${mangled[2]}" `)
-    : restRaw;
+  const rest = inner.replace(/^\/?｜+DSML｜*/, '');
   const invoke = rest.match(/^\s*invoke\s+name="(tf-[a-z]+)"([\s\S]*)$/);
   if (invoke === null) return null;
   const [, name, attrsPart] = invoke as unknown as [string, string, string];
   if (!COMMAND_NAMES.includes(name as TfCommandName)) return null;
   // 属性段原样拼接：dsml 属性语法与 tf 协议一致（key="value"），交 parseHeader 统一校验
   return { synthetic: `<${name}${attrsPart}${selfClosing ? '/>' : '>'}` };
+}
+
+// ---------------------------------------------------------------------------
+// DSML 参数式 invoke（v0.3.2）
+// ---------------------------------------------------------------------------
+
+interface DsmlTag {
+  /** 标签名（invoke / calls / parameter …，已去掉 DSML 前缀） */
+  name: string;
+  closing: boolean;
+  selfClosing: boolean;
+  /** 标签内 key="value" 属性 */
+  attrs: Record<string, string>;
+  /** invoke 的 name 属性是合法 tf-* 命令名时给出 */
+  commandName: TfCommandName | null;
+}
+
+/** 解析单个 DSML 标签原文（不含前后空白）。非 DSML 形态返回 null。 */
+function parseDsmlTag(raw: string, selfClosing: boolean): DsmlTag | null {
+  if (!isDsmlTag(raw)) return null;
+  let inner = raw.slice(1);
+  const closing = inner.startsWith('/');
+  if (closing) inner = inner.slice(1);
+  if (inner.endsWith('/>')) inner = inner.slice(0, -2);
+  else if (inner.endsWith('>')) inner = inner.slice(0, -1);
+  const m = inner.match(/^｜+DSML｜*\s*([a-zA-Z][a-zA-Z0-9_-]*)([\s\S]*)$/);
+  if (m === null) return null;
+  const name = m[1]!;
+  // v0.3.3：mangled name 值抢救——模型把全部属性塞进了 name 值且忘了闭引号
+  // （真机 session-d6cd0759 seq 110：`name="tf-peek handle="obs:bash:b2@v1"
+  //  from_line="1" to_line="30" id="p3"/>`——整条 peek 丢失）。name 值以合法
+  //  tf-* 命令名开头且带空格时，把 "name=\"tf-xxx " 改写为 "name=\"tf-xxx\" "，
+  //  余段还原为正常属性对（引号结构本就完好）。
+  let attrSegment = m[2]!;
+  const nameAttr = /\sname\s*=\s*"(tf-[a-z]+)\s+/.exec(attrSegment);
+  if (nameAttr !== null && COMMAND_NAMES.includes(nameAttr[1] as TfCommandName)) {
+    attrSegment = attrSegment.replace(nameAttr[0], ` name="${nameAttr[1]}" `);
+  }
+  const attrs = parseAttrPairs(attrSegment);
+  const commandName = attrs['name'] !== undefined && COMMAND_NAMES.includes(attrs['name'] as TfCommandName)
+    ? (attrs['name'] as TfCommandName)
+    : null;
+  return { name, closing, selfClosing, attrs, commandName };
+}
+
+/** v0.3.2：属性值的 XML 实体解码。模型带 XML 习惯输出属性（真机 session-8f22c7a0
+ *  step 5：`command="... Write-Output &quot;EXIT=$LASTEXITCODE&quot;"`——实体原样进了
+ *  PowerShell，命令解析报错，白白烧一步）。只解码有界实体集 + 数字引用；`&` 本身
+ *  不在实体里的原样保留（不猜）。 */
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&(lt|gt|quot|apos|amp);/g, (_, name: string) => (
+      name === 'lt' ? '<' : name === 'gt' ? '>' : name === 'quot' ? '"' : name === 'apos' ? '\'' : '&'
+    ))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(parseInt(dec, 10)));
+}
+
+/** 从 `k="v" k2="v2"` 属性段提取键值（引号内允许 '>'；重复键后者覆盖，交由 schema 兜底）。 */
+function parseAttrPairs(segment: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const re = /([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(segment)) !== null) {
+    // v0.3.2：与 parseHeader 同款的内嵌引号容忍扫描（闭引号 = `"` 后跟下一属性、
+    // 标签结尾或末尾）。valueStart 是**绝对**下标（m.index + m[0].length）——
+    // 用相对偏移会把搜索起点挪回段首，re.lastIndex 不前进 = 零进度死循环。
+    const valueStart = m.index + m[0].length;
+    let value = '';
+    let next = valueStart;
+    for (let q = segment.indexOf('"', valueStart); q !== -1; q = segment.indexOf('"', q + 1)) {
+      const after = segment.slice(q + 1);
+      if (/^\s+[a-zA-Z][a-zA-Z0-9_-]*\s*=/.test(after) || /^\/?>/.test(after) || after.trim() === '') {
+        value = segment.slice(valueStart, q);
+        next = q + 1;
+        break;
+      }
+    }
+    if (next === valueStart) {
+      // 没找到合法闭引号：退化取到段尾（DSML 开标签段以标签结尾界定，段尾即值尾）。
+      value = segment.slice(valueStart);
+      next = segment.length;
+    }
+    attrs[m[1]!] = decodeXmlEntities(value);
+    re.lastIndex = Math.max(next, m.index + m[0].length + 1);
+  }
+  return attrs;
+}
+
+/**
+ * 非正文命令配对开标签的恢复边界（基础版，仅 tf 标签）：下一个 `<tf-` / `</tf-` 的
+ * 位置（-1 = 没有）。DSML 块缓冲的消费（findDsmlInvokeEnd）也用它——缓冲块内部的
+ * DSML 标签属于块本身，绝不能当边界（否则 `<｜` 即块结束 = 解析死循环）。
+ */
+function findNonBodyBoundary(buf: string): number {
+  const a = buf.indexOf('<tf-');
+  const b = buf.indexOf('</tf-');
+  if (a === -1) return b;
+  if (b === -1) return a;
+  return Math.min(a, b);
+}
+
+/**
+ * v0.3.2：body 模式的扩展边界（tf 标签 + DSML 标签）。只在 stepBody 的非正文分支
+ * 使用——真机（session-8f22c7a0 step 2）里 DSML invoke 走完内联路径后，parameter/
+ * invoke/closes 包装残片被 body 模式整体吞掉、到流末才以 malformed 露出；DSML 标签
+ * 出现即视为本命令结束（残片按既有 malformed 纪律处理，绝不作为 prose 透传）。
+ */
+function findNonBodyBoundaryWithDsml(buf: string): number {
+  const base = findNonBodyBoundary(buf);
+  const c = buf.indexOf('<｜');
+  const d = buf.indexOf('</｜');
+  let min = base;
+  for (const v of [c, d]) {
+    if (v === -1) continue;
+    if (min === -1 || v < min) min = v;
+  }
+  return min;
+}
+
+/** DSML 段结束位置（含结束标签本身）：`</invoke>` / `</tf-name>` / （非正文）下一个 tf 标签。 */
+function findDsmlInvokeEnd(buf: string, name: TfCommandName | null): { end: number } | null {
+  // v0.3.3：缓冲分支现也接收**自闭合** invoke（mangled name 抢救后的形态）——开标签
+  // 自身以 `/>` 结束时它就是块尾。end 约定 = 切片**含端点**（+1 跨过 `>` 本身，
+  // 与 invokeClose/tagClose 分支的"一次过闭合标签"约定一致）。
+  const selfEnd = scanHeaderClose(buf);
+  if (selfEnd !== null && selfEnd.selfClosing && /^\s*<\s*｜+DSML｜*\s*invoke\b/.test(buf)) {
+    return { end: selfEnd.end + 1 };
+  }
+  let end = -1;
+  const invokeClose = /<\/\s*｜+DSML｜*\s*invoke\s*>/g;
+  const m = invokeClose.exec(buf);
+  if (m !== null) end = m.index + m[0].length;
+  if (name !== null) {
+    // v0.3.3：命令自身的闭合标签允许空白/属性（与 body 模式同一 findBodyClose）。
+    const tagClose = findBodyClose(name, buf);
+    if (tagClose !== null && (end === -1 || tagClose.end < end)) {
+      end = tagClose.end;
+    }
+    if (!COMMAND_SCHEMAS[name].hasBody) {
+      const boundary = findNonBodyBoundary(buf);
+      if (boundary !== -1 && (end === -1 || boundary < end)) end = boundary;
+    }
+  }
+  return end === -1 ? null : { end };
+}
+
+interface DsmlCommand {
+  name: TfCommandName;
+  attrs: Record<string, string>;
+  dependsOn: readonly string[];
+  body?: string;
+  raw: string;
+}
+
+type DsmlToken =
+  | { kind: 'tag'; tag: DsmlTag; raw: string }
+  | { kind: 'text'; text: string };
+
+/** 把 DSML 块切成「DSML 标签 / 文本」两类 token；非 DSML 的 '<' 留在文本里。 */
+function tokenizeDsmlBlock(block: string): DsmlToken[] {
+  const out: DsmlToken[] = [];
+  let i = 0;
+  while (i < block.length) {
+    const lt = block.indexOf('<', i);
+    if (lt === -1) {
+      out.push({ kind: 'text', text: block.slice(i) });
+      break;
+    }
+    if (lt > i) out.push({ kind: 'text', text: block.slice(i, lt) });
+    const after = block.slice(lt);
+    if (!/^<\/?｜/.test(after)) {
+      out.push({ kind: 'text', text: '<' });
+      i = lt + 1;
+      continue;
+    }
+    const close = scanHeaderClose(after);
+    if (close === null) {
+      out.push({ kind: 'text', text: after });
+      break;
+    }
+    const raw = after.slice(0, close.end + 1);
+    const tag = parseDsmlTag(raw, close.selfClosing);
+    if (tag === null) out.push({ kind: 'text', text: raw });
+    else out.push({ kind: 'tag', tag, raw });
+    i = lt + close.end + 1;
+  }
+  return out;
+}
+
+/**
+ * 解析一个 DSML invoke 块（可能含 parameter 子标签）。
+ *
+ * - `parameter name="k"` 的标签间文本 → 属性 k（多行原样，去掉首尾各一个换行）；
+ * - 正文类参数（content/body/code/text）→ 命令 body（hasBody 命令）；
+ * - 块内裸文本 → hasBody 命令的 body；tf-final 无 summary 时兜底为最终答案；
+ * - 非正文命令带正文 → malformed(unexpected-body) 但命令仍发（不丢工作）；
+ * - `allowIncompleteBody=false` 时，未闭合的正文命令不回放（避免写半截文件）。
+ */
+function parseDsmlBlock(
+  block: string,
+  expected: TfCommandName | null,
+  opts: { allowIncompleteBody: boolean },
+): { commands: DsmlCommand[]; malformed: Array<{ raw: string; reason: string }> } {
+  const commands: DsmlCommand[] = [];
+  const malformed: Array<{ raw: string; reason: string }> = [];
+  let cur: {
+    name: TfCommandName | null;
+    attrs: Record<string, string>;
+    text: string;
+    params: Record<string, string>;
+    paramName: string | null;
+    paramValue: string;
+    raw: string;
+    complete: boolean;
+  } | null = null;
+
+  const flush = (complete: boolean): void => {
+    if (cur === null) return;
+    const item = cur;
+    cur = null;
+    if (item.paramName !== null) item.params[item.paramName] = trimParamValue(item.paramValue);
+    const name = item.name ?? expected;
+    if (name === null) {
+      malformed.push({ raw: item.raw, reason: 'dsml-unknown-invoke' });
+      return;
+    }
+    const schema = COMMAND_SCHEMAS[name];
+    const attrs: Record<string, string> = { ...item.attrs };
+    const bodyKeys = ['content', 'body', 'code', 'text'];
+    let bodyFromParam: string | undefined;
+    for (const key of bodyKeys) {
+      if (item.params[key] !== undefined) {
+        bodyFromParam = item.params[key];
+        delete item.params[key];
+      }
+    }
+    for (const [k, v] of Object.entries(item.params)) attrs[k] = v;
+    if (!complete && schema.hasBody && !opts.allowIncompleteBody) {
+      malformed.push({ raw: item.raw + item.text, reason: 'unclosed-dsml-body' });
+      return;
+    }
+    let body: string | undefined;
+    if (schema.hasBody) {
+      // v0.3.2：块以命令自身的配对闭合（</name>）终止时，闭合标签会被 tokenizer 当作
+      // 块内文本累积——剥掉尾部闭合，正文才干净（与 body 模式的消费语义一致）。
+      let text = item.text;
+      if (bodyFromParam === undefined) {
+        // v0.3.3：闭合标签允许空白/属性（`</tf-write >` / `</tf-write path="x">`）。
+        // 只剥末尾同一行的闭合形态，避免误删正文里提到的同名标签。
+        const idx = text.lastIndexOf(`</${name}`);
+        if (idx !== -1) {
+          const tail = text.slice(idx);
+          const closeRe = new RegExp(`^</${name}\\b[^\\n]*>\\s*$`);
+          if (closeRe.test(tail)) text = text.slice(0, idx);
+        }
+      }
+      body = bodyFromParam ?? text.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+    } else if (bodyFromParam !== undefined || item.text.trim() !== '') {
+      malformed.push({ raw: item.raw + item.text, reason: 'unexpected-body' });
+      if (name === 'tf-final' && attrs['summary'] === undefined) {
+        attrs['summary'] = (bodyFromParam ?? item.text).trim();
+      }
+    }
+    const validated = validateCommandAttrs(name, attrs);
+    if ('error' in validated) {
+      malformed.push({ raw: item.raw, reason: `dsml-invoke:${validated.error}` });
+      return;
+    }
+    commands.push({ name, attrs: validated.attrs, dependsOn: validated.dependsOn, body, raw: item.raw });
+  };
+
+  for (const token of tokenizeDsmlBlock(block)) {
+    if (token.kind === 'text') {
+      if (cur === null) {
+        if (token.text.trim() !== '') malformed.push({ raw: token.text, reason: 'dsml-text' });
+        continue;
+      }
+      if (cur.paramName !== null) cur.paramValue += token.text;
+      else cur.text += token.text;
+      continue;
+    }
+    const tag = token.tag;
+    if (tag.name === 'calls') continue;
+    if (tag.name === 'invoke') {
+      if (tag.closing) {
+        flush(true);
+        continue;
+      }
+      flush(true);
+      if (tag.commandName === null) {
+        malformed.push({ raw: token.raw, reason: 'dsml-unknown-invoke' });
+        continue;
+      }
+      const { name: _n, ...rest } = tag.attrs;
+      cur = {
+        name: tag.commandName,
+        attrs: rest,
+        text: '',
+        params: {},
+        paramName: null,
+        paramValue: '',
+        raw: token.raw,
+        complete: false,
+      };
+      if (tag.selfClosing) flush(true);
+      continue;
+    }
+    if (tag.name === 'parameter') {
+      if (tag.closing) {
+        if (cur !== null && cur.paramName !== null) {
+          cur.params[cur.paramName] = trimParamValue(cur.paramValue);
+          cur.paramName = null;
+          cur.paramValue = '';
+        }
+        continue;
+      }
+      if (cur === null) {
+        malformed.push({ raw: token.raw, reason: 'dsml-stray-parameter' });
+        continue;
+      }
+      const key = tag.attrs['name'];
+      if (key === undefined) {
+        malformed.push({ raw: token.raw, reason: 'dsml-parameter-without-name' });
+        continue;
+      }
+      cur.paramName = key;
+      cur.paramValue = '';
+      if (tag.selfClosing) {
+        cur.params[key] = '';
+        cur.paramName = null;
+      }
+      continue;
+    }
+    malformed.push({ raw: token.raw, reason: `dsml-unknown-tag:${tag.name}` });
+  }
+  flush(false);
+  return { commands, malformed };
+}
+
+/** parameter 值：去掉首尾各一个换行（模型习惯把值写在标签下一行）。 */
+function trimParamValue(value: string): string {
+  return value.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+}
+
+/** 属性 schema 校验（parseHeader 与 DSML 块共用；校验失败返回结构化 error）。
+ *  v0.3.2：未知属性**降级丢弃**而不是拒整条命令——真机（session-ec100f8a seq 91）：
+ *  模型写 `lines="1-20"`（schema 是 from_line/to_line），旧实现把整条 tf-peek 拒掉，
+ *  模型只能重试烧一步。`lines="N-M"` 识别为 from_line/to_line 的习惯写法并归一；
+ *  其余未知属性原样丢弃（不猜语义）。必需属性缺失仍然拒（缺 path 的 write 不能猜）。 */
+function validateCommandAttrs(
+  name: TfCommandName,
+  attrs: Record<string, string>,
+): { attrs: Record<string, string>; dependsOn: readonly string[] } | { error: string } {
+  const schema = COMMAND_SCHEMAS[name];
+  const allowed = new Set([...COMMON_ATTRS, ...schema.required, ...schema.optional]);
+  const kept: Record<string, string> = {};
+  for (const key of Object.keys(attrs)) {
+    if (!allowed.has(key)) continue;
+    kept[key] = attrs[key]!;
+  }
+  const lines = attrs['lines'];
+  if (lines !== undefined && (name === 'tf-peek' || name === 'tf-read')) {
+    const range = /^(\d+)\s*-\s*(\d+)$/.exec(lines);
+    if (range !== null) {
+      if (kept['from_line'] === undefined) kept['from_line'] = range[1]!;
+      if (kept['to_line'] === undefined) kept['to_line'] = range[2]!;
+    }
+  }
+  for (const req of schema.required) {
+    if (kept[req] === undefined) return { error: `missing-attribute:${req}` };
+  }
+  for (const key of ['from_line', 'to_line']) {
+    if (kept[key] !== undefined && !/^\d+$/.test(kept[key])) {
+      return { error: `bad-integer-attribute:${key}` };
+    }
+  }
+  return { attrs: kept, dependsOn: buildDependsOn(kept) };
+}
+
+/** depends_on：逗号分隔，去空、去重、保序。 */
+function buildDependsOn(attrs: Record<string, string>): string[] {
+  const dependsOn: string[] = [];
+  if (attrs['depends_on'] === undefined) return dependsOn;
+  const seen = new Set<string>();
+  for (const part of attrs['depends_on'].split(',')) {
+    const d = part.trim();
+    if (d === '' || seen.has(d)) continue;
+    seen.add(d);
+    dependsOn.push(d);
+  }
+  return dependsOn;
 }
 
 type HeaderParse =
@@ -565,44 +1101,37 @@ function parseHeader(raw: string): HeaderParse {
       continue;
     }
     if (rest === '') break;
-    const attr = rest.match(/^([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*"([^"]*)"/);
+    // v0.3.2：属性值容忍内嵌引号。简单正则 `([^"]*)` 在值含 `"` 时撑破
+    // （真机 session-ec100f8a seq 134：PowerShell cmd 内嵌引号 → 整条命令丢失，
+    // 参数值漏进正文）。闭引号判定：`"` 后面跟（下一段 `key="` 模式 | 标签结尾
+    // `>`/`/>` | inner 末尾）；否则视为值的一部分继续扫。
+    // 找不到合法闭引号 = 照旧报 bad-attribute-syntax。
+    const attr = rest.match(/^([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*"/);
     if (!attr) return { error: `bad-attribute-syntax:${rest.slice(0, 20)}` };
+    const valueStart = attr[0].length;
+    let scanned: { value: string; next: number } | null = null;
+    for (let q = rest.indexOf('"', valueStart); q !== -1; q = rest.indexOf('"', q + 1)) {
+      const after = rest.slice(q + 1);
+      if (/^\s+[a-zA-Z][a-zA-Z0-9_-]*\s*=/.test(after) || /^\/?>/.test(after) || after.trim() === '') {
+        scanned = { value: rest.slice(valueStart, q), next: q + 1 };
+        break;
+      }
+    }
+    if (scanned === null) return { error: `bad-attribute-syntax:${rest.slice(0, 20)}` };
     const key = attr[1];
     if (key in attrs) return { error: `duplicate-attribute:${key}` };
-    attrs[key] = attr[2];
-    rest = rest.slice(attr[0].length);
+    attrs[key] = decodeXmlEntities(scanned.value);
+    rest = rest.slice(scanned.next);
   }
 
   // depends_on：逗号分隔，去空、去重、保序
-  const dependsOn: string[] = [];
-  if (attrs['depends_on'] !== undefined) {
-    const seen = new Set<string>();
-    for (const part of attrs['depends_on'].split(',')) {
-      const d = part.trim();
-      if (d === '') continue;
-      if (!seen.has(d)) {
-        seen.add(d);
-        dependsOn.push(d);
-      }
-    }
-  }
+  const dependsOn = buildDependsOn(attrs);
 
   if (known === null) return { name: null, attrs, dependsOn };
 
-  const schema = COMMAND_SCHEMAS[known];
-  const allowed = new Set([...COMMON_ATTRS, ...schema.required, ...schema.optional]);
-  for (const key of Object.keys(attrs)) {
-    if (!allowed.has(key)) return { error: `unknown-attribute:${key}` };
-  }
-  for (const req of schema.required) {
-    if (attrs[req] === undefined) return { error: `missing-attribute:${req}` };
-  }
-  for (const key of ['from_line', 'to_line']) {
-    if (attrs[key] !== undefined && !/^\d+$/.test(attrs[key])) {
-      return { error: `bad-integer-attribute:${key}` };
-    }
-  }
-  return { name: known, attrs, dependsOn };
+  const validated = validateCommandAttrs(known, attrs);
+  if ('error' in validated) return { error: validated.error };
+  return { name: known, attrs: validated.attrs, dependsOn: validated.dependsOn };
 }
 
 /**
@@ -621,6 +1150,18 @@ function probeTag(s: string): TagProbe {
   if (s.startsWith('</')) {
     if ('</tf-'.startsWith(s)) return 'need-more'; // '</' / '</t' / '</tf' / '</tf-'：闭合标签开头
     if (/^<\/tf-[a-z0-9-]*\s*>/.test(s)) return 'close-tag';
+    // v0.3.3：畸形闭合变体（协议命名空间内）——通配 `</tf-*>`、带属性
+    // `</tf-write path="x">` 等。判别式：`</tf-` 紧跟非空白（与"正文里提到 </tf"区分，
+    // 如 `</tf 不在标签位` 仍是 prose），且引号感知地存在 '>'（闭合尝试成形）。
+    // 真机证据 2026-11-20（桌面端会话）：`</tf-*>` 两度作为 prose 落进 assistant 正文
+    // ——0.3.1 治理只覆盖「合法闭合形态」，畸形变体全数漏网，且模型拿不到纠错信号
+    // 同一会话内重复犯错。引号感知 '>' 的存在使 `cmd="a>b"` 这类属性值不会被误判成
+    // token 端界。>200 字符仍无 '>'：按 runaway 残片记账丢弃（与 DSML 同纪律），不无限缓冲。
+    if (/^<\/tf-\S/.test(s)) {
+      const close = scanHeaderClose(s);
+      if (close !== null) return 'close-tag';
+      return s.length > 200 ? 'close-tag' : 'need-more';
+    }
     if (/^<\/tf-?[a-z0-9-]*$/.test(s)) return 'need-more'; // 还没等到 '>'
     return 'prose'; // '</div>' 之类：确属正文
   }

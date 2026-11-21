@@ -73,7 +73,6 @@ window.__ModuleLoader__.load({
 					maxParallelToolCalls: "并行命令",
 					maxReentries: "最大重入",
 					budgetTokens: "token 预算",
-					toolSurface: "工具面档",
 				},
 				values: {
 					receipt: "只回回执",
@@ -137,7 +136,6 @@ window.__ModuleLoader__.load({
 					maxParallelToolCalls: "Parallel commands",
 					maxReentries: "Max re-entries",
 					budgetTokens: "Token budget",
-					toolSurface: "Tool surface",
 				},
 				values: {
 					receipt: "receipt only",
@@ -270,7 +268,6 @@ window.__ModuleLoader__.load({
 				["maxParallelToolCalls", effective.maxParallelToolCalls],
 				["maxReentries", effective.maxReentries],
 				["budgetTokens", effective.budgetTokens],
-				["toolSurface", effective.toolSurface],
 			];
 			return h("div", { className: "sa-params" },
 				rows.map(([key, value]) => h("div", { className: "sa-param", key },

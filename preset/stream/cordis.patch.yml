@@ -1,20 +1,13 @@
-# preset-stream 独立 bundle（S4；0.4.0 P3 扩为对等面）——随包交付，profile 组合中列在主 bundle 之后。
+# preset-stream 独立 bundle（S4）——随包交付，profile 组合中列在主 bundle 之后。
 #
-# 0.3.x 只列映射工具（7 个）；0.4.0（G1 可达对等）扩到 standard/ptc 同款全量行：
-#   映射工具（tf-* 直呼）：
-#     tf-write/tf-read/tf-edit/tf-append → dsh-tool-fs 的 write/read/edit（applyPatch 开启给 tf-append 的 EOF 追加）
-#     tf-bash                            → dsh-tool-pwsh（Windows）/ dsh-tool-bash（POSIX，二选一）
-#     tf-grep/tf-glob                    → dsh-tool-fs-search 的 grep/glob
-#   对等工具（tf-call 透传；design §6/§10 P3，矩阵见 docs/capability-parity.md）：
-#     web_search/web_fetch（dsh-tool-web）、skill（dsh-tool-skill + dsh-skill-filesystem）、
-#     job_*（dsh-tool-jobs）、schedule_*（dsh-tool-schedule）、goal 三件（dsh-tool-goal +
-#     dsh-command-goal）、ask_user_question（dsh-tool-ask-user）、todo_write（dsh-tool-todo）、
-#     present（dsh-tool-present）、office_*（dsh-tool-office）、subagent/subagent_fork
-#     （dsh-tool-subagent + dsh-tool-subagent-control，与 ptc preset 同款 interrupt:false）。
-#   与 ptc preset 对齐（design §5.2 非目标）：workflow 引擎不启用（workflow-ptc / tool-workflow
-#   停用行不在此声明——本 bundle 只 insert，不做 modify 停用）。
-#   plan-mode / compaction 组不在此声明：plan 语义由 tf-plan 承担，压缩走 F7 段边界（ADR-001）；
-#   重复声明宿主已有的行只会增加装配面（S4 约束）。
+# 只列映射工具（会话可见工具 = 映射清单；未列工具 0 调用）：
+#   tf-write/tf-read/tf-edit/tf-append → dsh-tool-fs 的 write/read/edit（applyPatch 开启给 tf-append 的 EOF 追加）
+#   tf-bash                            → dsh-tool-pwsh（Windows）/ dsh-tool-bash（POSIX，二选一）
+#   tf-grep/tf-glob                    → dsh-tool-fs-search 的 grep/glob
+#
+# 不列 persona / agent-instructions / time-context / plan-mode / compaction 等行：
+# 它们由宿主或主 bundle 处理，preset 重复声明只会增加装配面（S4 约束）。
+# 本 bundle 不碰 agent-loop、不接管 loop——那只在主 bundle 的 cordis.patch.yml。
 #
 # registry 默认值不在这里改：那是 profile patch 层的覆盖声明（见 profiles/stream/cordis.patch.yml），
 # 这样 headless 组合（无 registry）不引入本行也不会悬空。
@@ -26,7 +19,7 @@
       config:
         id: stream
         name: Stream
-        description: dsh-stream-agent 单流协议专用工具面（tf-* 映射 + tf-call 全量可达，v0.4.0 对等）
+        description: dsh-stream-agent 单流协议专用工具面（write/read/edit/append + shell + grep/glob）
         order: 99
         plugins:
           - id: tool-fs
@@ -44,55 +37,3 @@
           - id: tool-pwsh
             name: '@deepseek-ai/dsh-tool-pwsh'
             disabled: !!js process.platform !== 'win32'
-          - id: tool-jobs
-            name: '@deepseek-ai/dsh-tool-jobs'
-          - id: tool-schedule
-            name: '@deepseek-ai/dsh-tool-schedule'
-          - id: skill-filesystem
-            name: '@deepseek-ai/dsh-skill-filesystem'
-            config:
-              customSkillDirs:
-                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
-          - id: tool-skill
-            name: '@deepseek-ai/dsh-tool-skill'
-          - id: command-goal
-            name: '@deepseek-ai/dsh-command-goal'
-          - id: tool-goal
-            name: '@deepseek-ai/dsh-tool-goal'
-          - id: delegation
-            name: cordis:group
-            group: true
-            isolate:
-              workflowEngine: true
-            config:
-              - id: tool-subagent-control
-                name: '@deepseek-ai/dsh-tool-subagent-control'
-                config:
-                  interrupt: false
-              - id: tool-subagent
-                name: '@deepseek-ai/dsh-tool-subagent'
-                config:
-                  provider: spawn
-                  toolName: subagent
-                  modelSelection: true
-                  modelDiscovery: true
-              - id: tool-subagent-fork
-                name: '@deepseek-ai/dsh-tool-subagent'
-                config:
-                  provider: fork
-                  toolName: subagent_fork
-          - id: tool-ask-user
-            name: '@deepseek-ai/dsh-tool-ask-user'
-          - id: tool-todo
-            name: '@deepseek-ai/dsh-tool-todo'
-            config:
-              allowParallelInProgress: true
-          - id: tool-web
-            name: '@deepseek-ai/dsh-tool-web'
-            config:
-              fetch: true
-              searchTimeoutMs: 60000
-          - id: present
-            name: '@deepseek-ai/dsh-tool-present'
-          - id: tool-office
-            name: '@deepseek-ai/dsh-tool-office'

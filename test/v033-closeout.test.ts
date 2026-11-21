@@ -1,19 +1,20 @@
-// test/v041-closeout.test.ts —— v0.4.1 回合收束改造 + 缓存前缀契约（真机取证 2026-11-21）
+// test/v033-closeout.test.ts —— v0.3.3 回合收束改造 + 读注入预算（真机取证 2026-11-21）
 //
-// 与 0.3.3 的 `test/v033-closeout.test.ts` 同源：0.4.x 线（ToolSurface/tf-call 能力面）
-// 独立演进，0.3.2/0.3.3 的截断修复没有回流，于是同样两处结构性根因仍在：
-//   ① `#reentryCount >= maxReentries` 把**生产性重入**当打转，13 步真实任务在第 12 步被
-//      hard blocked，且收束时没有任何兜底交付 → 桌面端只剩最后一句 prose（用户侧"截断"）。
-//   ② 追加区只有 system + 任务 + 句柄目录行：模型第 2 个请求起看不到自己上一步干了什么，
-//      只能重读重猜；同时一次读多文件把几万字全塞进同一请求，前缀缓存被整块打掉。
+// 真机现象（ZCode 桌面端，DeepSeek-V4.1-Flash）：13 步的真实任务（读文件 → 改文件 → 跑检查）
+// 在第 12 步被 `#reentryCount >= maxReentries` hard blocked，**收束时没有任何兜底交付**——
+// 界面于是停在最后一句 prose 上，用户看到的就是"输出截断"（session-6bb805db / 27876fd9 /
+// 7fbfef8f / d6cd0759 四例同形态）。同时一次读五个文件把所有全文塞进同一请求（step 3 单请求
+// 5916 个未缓存 token），把前缀缓存整块打掉。
 //
 // 本文件覆盖四组：
-//   P1–P4（parser）：正文闭合容许空白/属性；DSML 畸形开标签（含 name 值塞属性）不吞正文。
-//   D1–D2（驱动器）：本步正文 + 命令事实落追加区（历史不蒸发）、易变尾转正（前缀单调）。
-//   C1–C4（收束） ：生产性重入不计停滞预算；撞墙先收束；收束用尽写"未完成交付"；零产出不伪造。
-//   R1–R3（缓存） ：单请求读注入预算（超出转预览 + 句柄）、预算 0 回退、durable 块前置。
+//   P1–P3（parser）：命令正文闭合允许空白/属性；DSML 畸形开标签不得吞掉正文
+//                    （`lastIndexOf('>')` 的回归线）。
+//   C1–C4（loop）  ：生产性重入不计停滞预算；撞墙先收束（closeout 注入）；收束用尽写
+//                    **明确标注未完成的兜底交付**；零产出回合不伪造交付。
+//   R1–R3（loop）  ：单请求 tf-read 正文预算（超出转预览 + 句柄）；预算 0 回退；
+//                    durable 块前置（缓存前缀可延续）。
 //
-// 断言对着线格式请求 / parser 事件 / assistant 交付文本，不看内部字段。
+// 断言对着线格式请求 / parser 事件 / assistant 交付文本，不看内部字段（与 v032 同纪律）。
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -39,10 +40,13 @@ function feedAll(parser: TfStreamParser, deltas: readonly string[]): ParserEvent
   return out;
 }
 
-test('P1. 闭合标签带尾随空白（</tf-write >）：正文照常取全，不判 truncated 整段丢弃', () => {
+// ---------------------------------------------------------------- P 系列：正文闭合
+
+test('P1. 闭合标签带尾随空白（</tf-write >）：正文照常取全，不再判 truncated 整段丢弃', () => {
   const events = feedAll(new TfStreamParser(), ['<tf-write path="a.py" id="w1">\nprint(1)\n</tf-write >\n']);
   const cmds = commandsOf(events);
   assert.equal(cmds.length, 1, `正文闭合带空白也必须成命令，实际事件：${JSON.stringify(events.map((e) => e.type))}`);
+  assert.equal(cmds[0]!.name, 'tf-write');
   assert.equal(cmds[0]!.body?.trim(), 'print(1)', '正文不得因闭合标签的空白而丢');
   assert.equal(events.filter((e) => e.type === 'truncated').length, 0, '不得判 truncated');
 });
@@ -55,8 +59,10 @@ test('P2. 闭合标签带属性（</tf-write path="x">）：按名字匹配取�
   assert.equal(events.filter((e) => e.type === 'truncated').length, 0);
 });
 
-test('P3. 真机回归：DSML 畸形开标签（name 里塞属性）不得吞掉命令正文', () => {
-  // session-27876fd9 step 7 的形态：attrs 全塞进 name，正文含 `>`。
+test('P3. 真机回归：DSML 畸形开标签（name 里塞属性、正文含 > ）不得吞掉命令正文', () => {
+  // 真机 session-27876fd9 step 7 的形态：模型把 attrs 全塞进 name，且正文里出现 `>`。
+  // 旧 scanHeaderClose 退化通道取 buf.lastIndexOf('>')，落在正文的 `>` 上——整个脚本
+  // 被当标签吃掉，tf-write 正文变空（模型白烧步数）。
   const events = feedAll(new TfStreamParser(), [
     '<｜｜DSML｜｜ invoke name="tf-write path="a.py" id="w1">\n',
     'if a > b: pass\n',
@@ -66,21 +72,7 @@ test('P3. 真机回归：DSML 畸形开标签（name 里塞属性）不得吞掉
   assert.equal(cmds.length, 1, `畸形 DSML 开标签也必须抢救出命令，实际：${JSON.stringify(events.map((e) => e.type))}`);
   assert.equal(cmds[0]!.name, 'tf-write');
   assert.equal(cmds[0]!.attrs['path'], 'a.py');
-  assert.equal(cmds[0]!.body, '\nif a > b: pass\n', '正文必须完整（旧实现整条丢弃、正文漏进 prose）');
-});
-
-test('P4. 真机回归：mangled name 值的自闭合 invoke 完整恢复（属性归位）', () => {
-  // session-d6cd0759 seq 110 的形态：`name="tf-peek handle="obs:..." from_line="1" .../>`
-  const events = feedAll(new TfStreamParser(), [
-    '<｜｜DSML｜｜ invoke name="tf-peek handle="obs:bash:b2@v1" from_line="1" to_line="30" id="p3"/>',
-  ]);
-  const cmds = commandsOf(events);
-  assert.equal(cmds.length, 1, `mangled 自闭合 invoke 必须恢复，实际：${JSON.stringify(events.map((e) => e.type))}`);
-  assert.equal(cmds[0]!.name, 'tf-peek');
-  assert.equal(cmds[0]!.id, 'p3');
-  assert.equal(cmds[0]!.attrs['handle'], 'obs:bash:b2@v1');
-  assert.equal(cmds[0]!.attrs['from_line'], '1');
-  assert.equal(cmds[0]!.attrs['to_line'], '30');
+  assert.equal(cmds[0]!.body, 'if a > b: pass', '正文必须完整（旧实现被 lastIndexOf 吞掉）');
 });
 
 // ---------------------------------------------------------------- 驱动器设施
@@ -101,8 +93,8 @@ function finish(kind: 'stop' | 'max-tokens'): StreamChunkLike {
 
 interface DriverHarness {
   driver: SingleStreamDriver;
-  /** 每个请求的线格式正文（一条消息一项）。 */
-  messages: string[][];
+  requests: string[][];
+  /** 落进会话的 assistant 最终消息（events.finalAnswer 通道）。 */
   finalAnswers: string[];
   sandboxDir: string;
   cleanup: () => void;
@@ -132,7 +124,8 @@ function createExecutor(sandboxDir: string) {
         results.push({ callId: call.id, result: { content: [{ type: 'text', text: `written ${filePath}` }], isError: false } });
       } else if (call.name === 'read') {
         try {
-          const abs = join(sandboxDir, filePath);
+          const text = String(args['file_path'] ?? '');
+          const abs = join(sandboxDir, text);
           results.push({ callId: call.id, result: { content: [{ type: 'text', text: readFileSync(abs, 'utf8') }], isError: false } });
         } catch (error) {
           results.push({ callId: call.id, result: { content: [{ type: 'text', text: `ENOENT: ${String(error)}` }], isError: true } });
@@ -150,8 +143,8 @@ function makeHarness(
   task: string,
   config?: Partial<StreamDriverConfig>,
 ): DriverHarness {
-  const sandboxDir = mkdtempSync(join(tmpdir(), 'tf-v041-'));
-  const messages: string[][] = [];
+  const sandboxDir = mkdtempSync(join(tmpdir(), 'tf-v033-closeout-'));
+  const requests: string[][] = [];
   const finalAnswers: string[] = [];
   let call = 0;
   const events: TurnEventWriter = {
@@ -165,7 +158,7 @@ function makeHarness(
   };
   const ports: DriverPorts = {
     stream: (options) => {
-      messages.push(options.messages.map((m) => m.content.map((b) => b.text).join('')));
+      requests.push(options.messages.map((m) => m.content.map((b) => b.text).join('')));
       const chunks = responses[Math.min(call, responses.length - 1)]!;
       call += 1;
       return { [Symbol.asyncIterator]: () => scriptedStream(chunks) } as AsyncIterable<StreamChunkLike>;
@@ -173,19 +166,13 @@ function makeHarness(
     executeTools: createExecutor(sandboxDir),
     events,
   };
-  const driver = new SingleStreamDriver(ports, {
-    provider: 'mock',
-    model: 'mock-v041',
-    // 工具面 'off'：本文件不测 tf-call（无宿主服务面时行为等价，避免噪声）
-    toolSurface: 'off',
-    ...config,
-  });
+  const driver = new SingleStreamDriver(ports, { provider: 'mock', model: 'mock-v033-closeout', ...config });
   driver.pushUserTask(task);
-  return { driver, messages, finalAnswers, sandboxDir, cleanup: () => rmSync(sandboxDir, { recursive: true, force: true }) };
+  return { driver, requests, finalAnswers, sandboxDir, cleanup: () => rmSync(sandboxDir, { recursive: true, force: true }) };
 }
 
 function promptOf(harness: DriverHarness, index: number): string {
-  return (harness.messages[index] ?? []).join('\n');
+  return (harness.requests[index] ?? []).join('\n');
 }
 
 function faultsOf(harness: DriverHarness): string[] {
@@ -193,55 +180,6 @@ function faultsOf(harness: DriverHarness): string[] {
     .filter((r) => r.kind === 'fault')
     .map((r) => String((r as { fault?: string }).fault ?? ''));
 }
-
-// ---------------------------------------------------------------- D 系列：历史与缓存前缀
-
-test('D1. 本步摘要落追加区：第 3 个请求仍能看到第 1 步的动作与读取内容（历史不蒸发）', async () => {
-  const harness = makeHarness([
-    [textDelta('先读 a.txt。\n'), textDelta('<tf-read path="a.txt" id="r1"/>'), finish('stop')],
-    [textDelta('再执行一条命令。\n'), textDelta('<tf-bash cmd="echo hi" id="b1"/>'), finish('stop')],
-    [textDelta('<tf-final id="f1" summary="两步都完成"/>'), finish('stop')],
-  ], '历史保留任务');
-  try {
-    mkdirSync(harness.sandboxDir, { recursive: true });
-    writeFileSync(join(harness.sandboxDir, 'a.txt'), 'AAAA-READ-CONTENT', 'utf8');
-    const reason = await harness.driver.runTurn();
-    assert.equal(reason.kind, 'completed');
-    assert.equal(harness.messages.length, 3, `read → bash → final 应 3 次请求，实际 ${harness.messages.length}`);
-
-    const p2 = promptOf(harness, 1);
-    assert.ok(p2.includes('AAAA-READ-CONTENT'), '第 2 请求带首读观测');
-    assert.ok(p2.includes('[tf-stream:step step=1'), '第 2 请求带第 1 步摘要');
-
-    const p3 = promptOf(harness, 2);
-    assert.ok(p3.includes('AAAA-READ-CONTENT'), '第 3 请求仍能看到第 1 步的读取内容（0.4.0 在此已蒸发）');
-    assert.ok(p3.includes('[tf-stream:step step=1'), '第 1 步摘要持久');
-    assert.ok(p3.includes('[tf-stream:step step=2'), '第 2 步摘要已追加');
-  } finally {
-    harness.cleanup();
-  }
-});
-
-test('D2. 前缀单调（缓存命中的结构前提）：后一请求逐条包含前一请求的全部消息', async () => {
-  const harness = makeHarness([
-    [textDelta('先读 a.txt。\n'), textDelta('<tf-read path="a.txt" id="r1"/>'), finish('stop')],
-    [textDelta('再执行一条命令。\n'), textDelta('<tf-bash cmd="echo hi" id="b1"/>'), finish('stop')],
-    [textDelta('<tf-final id="f1" summary="两步都完成"/>'), finish('stop')],
-  ], '前缀单调任务');
-  try {
-    mkdirSync(harness.sandboxDir, { recursive: true });
-    writeFileSync(join(harness.sandboxDir, 'a.txt'), 'AAAA-READ-CONTENT', 'utf8');
-    await harness.driver.runTurn();
-    const prev = harness.messages[1]!;
-    const next = harness.messages[2]!;
-    assert.ok(next.length > prev.length, '第 3 请求应比第 2 请求更长（只追加）');
-    for (let i = 0; i < prev.length; i++) {
-      assert.equal(next[i], prev[i], `第 ${i} 条消息必须逐字节不变（前缀单调 = 缓存可复用）`);
-    }
-  } finally {
-    harness.cleanup();
-  }
-});
 
 // ---------------------------------------------------------------- C 系列：收束
 
@@ -255,7 +193,8 @@ test('C1. 生产性重入不再被 maxReentries 硬杀：每步都有新产出 �
   try {
     const reason = await harness.driver.runTurn();
     assert.equal(reason.kind, 'completed', `生产性重入不得被砍：${JSON.stringify(reason)}`);
-    assert.equal(harness.messages.length, 4, `应干到第 4 个请求（final），实际 ${harness.messages.length}`);
+    // 旧实现（#reentryCount >= maxReentries=2）在第 3 个请求就 blocked
+    assert.equal(harness.requests.length, 4, `应干到第 4 个请求（final），实际 ${harness.requests.length}`);
     assert.ok(!faultsOf(harness).includes('turn-blocked'), '不得出现 turn-blocked');
     assert.ok(!faultsOf(harness).includes('fallback-final'), '真 final 收敛时不该走兜底交付');
   } finally {
@@ -265,6 +204,7 @@ test('C1. 生产性重入不再被 maxReentries 硬杀：每步都有新产出 �
 
 test('C2. 停滞到顶 → 先注入收束指令（closeout），模型照做即正常收敛', async () => {
   const harness = makeHarness([
+    // 有产出：写成功一个 + 写失败一个（失败即重入事由）
     [textDelta('<tf-write path="a.md" id="w1">A</tf-write>'), textDelta('<tf-write path="bad/x" id="w2">X</tf-write>'), finish('stop')],
     [textDelta('<tf-write path="bad/y" id="w3">Y</tf-write>'), finish('stop')],
     [textDelta('<tf-write path="bad/z" id="w4">Z</tf-write>'), finish('stop')],
@@ -275,7 +215,7 @@ test('C2. 停滞到顶 → 先注入收束指令（closeout），模型照做即
     const reason = await harness.driver.runTurn();
     assert.equal(reason.kind, 'completed');
     // 1 首请求 + 2 次停滞重入 + 1 收束请求 + 1 final = 5
-    assert.equal(harness.messages.length, 5, `停滞 → 收束一次 → final，共 5 个请求，实际 ${harness.messages.length}`);
+    assert.equal(harness.requests.length, 5, `停滞 → 收束一次 → final，共 5 个请求，实际 ${harness.requests.length}`);
     const closeOutPrompt = promptOf(harness, 4);
     assert.ok(closeOutPrompt.includes('[tf-stream:closeout attempt=1'), '收束请求必须带 closeout 指令');
     assert.ok(closeOutPrompt.includes('立即用 tf-final 交付'), '收束指令要求立刻交付');
@@ -298,11 +238,12 @@ test('C3. 收束预算用尽仍无 final → blocked + 兜底交付（明确标�
     const reason = await harness.driver.runTurn();
     assert.equal(reason.kind, 'blocked');
     assert.ok(reason.kind === 'blocked' && reason.detail.includes('连续 2 次重入无新增产出'), `detail 应说明停滞：${JSON.stringify(reason)}`);
+    // 用户侧"截断"的最后一道闸：必须有一条 assistant 交付说明落进会话
     assert.equal(harness.finalAnswers.length, 1, '收束必须有且只有一条兜底交付');
     const fallback = harness.finalAnswers[0]!;
     assert.ok(fallback.includes('[未完成交付]'), '兜底交付必须自报未完成（不得伪装成结论）');
     assert.ok(fallback.includes('a.md'), '兜底交付要列出已完成的台账事实');
-    assert.ok(fallback.includes('未完成'), '兜底交付要列未完成项');
+    assert.ok(fallback.includes('bad/z') || fallback.includes('未完成'), '兜底交付要列未完成项');
     assert.ok(faultsOf(harness).includes('fallback-final'), '兜底交付要落台账');
   } finally {
     harness.cleanup();
@@ -318,7 +259,7 @@ test('C4. 零产出回合（纯 prose、无任何 ok 命令）→ blocked 且不
   try {
     const reason = await harness.driver.runTurn();
     assert.equal(reason.kind, 'blocked');
-    assert.equal(harness.messages.length, 2, 'nudge 一次后仍无 final → blocked（不因收束期再多烧请求）');
+    assert.equal(harness.requests.length, 2, 'nudge 一次后仍无 final → blocked（不因收束期再多烧请求）');
     assert.equal(harness.finalAnswers.length, 0, '没有任何事实可交付时不得写兜底交付');
   } finally {
     harness.cleanup();
@@ -356,7 +297,7 @@ test('R1. 单请求读注入预算：首份给全文、超预算的第二份转"
   }
 });
 
-test('R2. readFeedbackBudgetPerRequest=0 关闭预算（回退点）：两份都全文，行为等价 0.4.0', async () => {
+test('R2. readFeedbackBudgetPerRequest=0 关闭预算（回退点）：两份都全文，行为等价 v0.3.2', async () => {
   const harness = makeHarness([
     [textDelta('<tf-read path="big1.txt" id="r1"/>'), textDelta('<tf-read path="big2.txt" id="r2"/>'), finish('stop')],
     [textDelta('<tf-final id="f1" summary="两个文件都读完了"/>'), finish('stop')],

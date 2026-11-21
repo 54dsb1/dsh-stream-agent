@@ -1,6 +1,5 @@
 /**
- * kernel/final.ts —— tf-final summary 质量闸（v0.3.1「任务半途截断」修复的内核半边；
- * v0.4.0 原样继承——0.4 是在 0.3.1 基线上长出来的能力面，截断面同一套契约）
+ * kernel/final.ts —— tf-final summary 质量闸（v0.3.1「任务半途截断」修复的内核半边）
  *
  * 背景（0.3.1 真机证据，会话 `session-84274277`）：
  *   模型在任务只走到第 4 步时输出 `<tf-final id="f1" summary="placeholder"/>`，

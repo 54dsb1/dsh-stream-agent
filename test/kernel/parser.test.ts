@@ -185,7 +185,7 @@ test('未知 tf-* 命令名 → malformed（不静默）', () => {
   assert.equal(m.raw, '<tf-frobnicate path="x"/>');
 });
 
-test('缺必填属性 → malformed；未知属性 → malformed；非法行号 → malformed', () => {
+test('缺必填属性 → malformed；未知属性降级丢弃（命令保留）；非法行号 → malformed', () => {
   const p = new TfStreamParser();
   const events = feedAll(p, [
     '<tf-read id="r1"/>',                       // 缺 path
@@ -193,10 +193,15 @@ test('缺必填属性 → malformed；未知属性 → malformed；非法行号 
     '<tf-peek handle="h" from_line="x"/>',      // 非法整数
   ]);
   const reasons = events.filter((e) => e.type === 'malformed').map((e) => (e as { reason: string }).reason);
-  assert.equal(reasons.length, 3);
+  assert.equal(reasons.length, 2);
   assert.ok(reasons[0].startsWith('missing-attribute:path'));
-  assert.ok(reasons[1].startsWith('unknown-attribute:bogus'));
-  assert.ok(reasons[2].startsWith('bad-integer-attribute:from_line'));
+  assert.ok(reasons[1].startsWith('bad-integer-attribute:from_line'));
+  // v0.3.2：未知属性降级丢弃而不是拒整条命令（真机 session-ec100f8a seq 91：
+  // lines="1-20" 被旧实现整条拒绝，模型重试烧一步）。
+  const cmds = commandsOf(events);
+  assert.equal(cmds.length, 1, '未知属性的 tf-read 应保留');
+  assert.equal(cmds[0].name, 'tf-read');
+  assert.equal(cmds[0].attrs['bogus'], undefined, '未知属性被丢弃');
 });
 
 test('属性语法错误与重复属性 → malformed；重复 id 透传（v0.2 起由驱动器裁决幂等/冲突）', () => {
@@ -348,12 +353,13 @@ test('DSML 包装行：malformed 上报并丢弃，不进 prose（真机形态�
   assert.equal(text, '\n\n\n', 'DSML 标签本身不得作为 prose 透传（标签间空白换行保留）');
   const malformed = events.filter((e) => e.type === 'malformed').map((e) => e as { reason: string });
   assert.ok(malformed.some((m) => m.reason === 'dsml-wrapper'), '包装行应按 dsml-wrapper 上报');
-  // invoke + 配对闭合 → 命令不丢
+  // invoke + 配对闭合 → 命令不丢。v0.3.2 起全部 invoke 统一走块缓冲（含内联属性形态），
+  // 正文约定与 parameter 语义一致：剥首尾各一个换行（内容本身不变）。
   const cmds = commandsOf(events);
   assert.equal(cmds.length, 1);
   assert.equal(cmds[0].name, 'tf-plan');
   assert.equal(cmds[0].id, 'p1');
-  assert.equal(cmds[0].body, '\n- [a1] 验收项\n');
+  assert.equal(cmds[0].body, '- [a1] 验收项');
 });
 
 test('DSML invoke 自闭合：改写回 tf-* 命令（属性透传）', () => {
@@ -368,14 +374,14 @@ test('DSML invoke 自闭合：改写回 tf-* 命令（属性透传）', () => {
   assert.equal(cmds[0].attrs['limit'], '4');
 });
 
-test('DSML 残缺属性（真机 mangled 形态）：v0.4.1 起抢救为完整命令，不作为 prose 泄漏', () => {
+test('DSML 残缺属性（真机 mangled 形态）：v0.3.3 起抢救为完整命令，不作为 prose 泄漏', () => {
   const p = new TfStreamParser();
   const events = feedAll(p, [
     '<｜｜DSML｜｜ invoke name="tf-read path="data/big-report.md" id="r1" offset="130" limit="15"/>',
   ]);
   const text = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text).join('');
   assert.equal(text, '', 'mangled DSML 不得进 prose');
-  // v0.4.1：name 值以合法命令名开头 → 抢救为完整命令（旧实现整条丢弃，模型重试烧一步）
+  // v0.3.3：name 值以合法命令名开头 → 抢救为完整命令（旧实现整条丢弃，模型重试烧一步）
   const cmds = commandsOf(events);
   assert.equal(cmds.length, 1, `mangled 形态应抢救出命令：${JSON.stringify(events.map((e) => e.type))}`);
   assert.equal(cmds[0].name, 'tf-read');

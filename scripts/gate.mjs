@@ -41,11 +41,11 @@ function gate(id, name, pass, evidence) {
   let ok = false;
   try {
     out = execSync('node scripts/check-consistency.mjs', { cwd: pkgRoot, encoding: 'utf8' });
-    ok = out.includes('6/6 全绿');
+    ok = out.includes('4/4 全绿');
   } catch (error) {
     out = String(error.stdout ?? error.message ?? '');
   }
-  gate('G1', '装配一致性（R2 四项 + G2/R3 两项）', ok, ok ? out.trim().split('\n').pop() : out.split('\n').slice(-4).join(' | '));
+  gate('G1', '装配一致性（R2 四项）', ok, ok ? out.trim().split('\n').pop() : out.split('\n').slice(-4).join(' | '));
 }
 
 // ---- G2 C2 单 loop 权威：E_DOUBLE_LOOP 具名失败（单测覆盖 + patch 结构）----

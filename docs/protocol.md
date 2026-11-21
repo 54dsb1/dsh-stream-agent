@@ -16,12 +16,9 @@
 | `tf-peek` | `handle`、`from`/`to` | 从句柄取回行段 | 按需注入 |
 | `tf-final` | `id`、`summary` | 声明任务完成 | 触发收束判定；同 id 携带新 summary = 覆盖最终答案（last-wins）；**有未验证验收项时判过早（F5）** |
 | `tf-code` | `description`，可选 `timeout`（毫秒）；body = async TS 函数体（可擦除语法） | 程序化工具调用（PTC 桥接）：绑定 `tools.write/read/pwsh` 走宿主管线。**0.3.0 K1：默认关闭**（协议段 0 字符），显式 `enableCode: true` 或 `power` 模式才启用 | 成功：上限内值完整注入（F3，缺省 4000 字符），超限骨架+句柄；失败：结构化 `[kind retry 结论]`（K3 八类 + quota-exceeded）；运行受 K5 配额（64 子调用/256KiB/300s）与 K2 沙箱记账（mode/denied/enforcement，`partial` 显式可见）约束 |
-| `tf-call`（0.4.0 G2） | `name`（本会话工具面内的宿主工具名）；body = JSON 参数对象 | 透传 `ctx.tools.execute`（同一 guard/sandbox 管线）；结果按宿主工具分族（web/skill/agent/ask/job → high 候选，office/goal/todo → 回执）；unknown-tool 注入带前缀匹配建议（不回灌全表）；bad-json-arguments 结构化失败；`toolSurface: off` 或无宿主面时协议段 0 字符（回退点） |
-| `tf-ask`（0.4.0 §6.4） | `q` 必填；`header`/`options`（逗号分隔标签）可选 | 映射宿主 ask_user_question；用户回答完整注入；`id` 作为问题 id 回显 |
-| `tf-skill`（0.4.0 §6.4） | `name`（技能名） | 映射宿主 skill；技能说明完整注入（会话级行为变更） |
 | `tf-plan`（0.3.0 F5） | 无；body = `- [id] 验收项描述` 行 | 声明/修订任务计划与验收项（状态放驱动器=宿主侧；请求只注**差分**） | 命令成功时在命令上加 `accepts="<id>"` 声明回执 → 验收项记已验证；缺项/未验证 → tf-final 判过早。`enablePlan: false` 关闭（回退点） |
 
-tf-call 是通用调用通道（G2：命令表净增 1，上限 14）：对等矩阵见 [docs/capability-parity.md](docs/capability-parity.md)。命令可带 `depends_on` 声明依赖，`accepts` 声明验收关联（F5），驱动器据此决定派发时机与收敛判定。
+命令可带 `depends_on` 声明依赖，`accepts` 声明验收关联（F5），驱动器据此决定派发时机与收敛判定。
 
 ## 驱动器闭环语义
 

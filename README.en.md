@@ -18,11 +18,16 @@ native loop's tokens with parity on correctness**. The historical 22.3% figure c
 earlier batch — the two are not comparable; see the honest note in
 [eval/RESULTS.md](eval/RESULTS.md) §6. The R3 rerun will re-measure both arms in one batch.
 
+A separate **single-session** measurement (2026-11-21, one run with and one without the
+plugin): total tokens **600,410 → 109,546 (−81.8%)**, uncached input **14,471 → 8,840
+(−38.9%)**. Details and an honest reading of the hit-rate change:
+[§7.1](#71-single-session-measurement-with-vs-without-the-plugin-v033).
+
 | Dimension | Status |
 | ----- | ----- |
 | Host | DeepSeek Harness `0.2.2-rc.1` (type anchor) / `rc.3` (runtime-tested) |
 | Dependencies | Zero npm dependencies; Node ≥ 22.18 (native type stripping) |
-| Tests | 333 cases green, zero API calls (mock full-chain + 20 scenarios + activation/desktop/new-capability/session-format/closeout-and-prefix regressions) |
+| Tests | 339 cases green, zero API calls (mock full-chain + 20 scenarios + activation/desktop/new-capability/session-format/host-conformance regressions) |
 | Shape | Single bundle + **dedicated profile** (`profiles/stream` template); `dsh plugin remove` unwinds the whole layer and restores the host loop atomically |
 | Control bar | `dsh-stream-agent bar`: four modes + zh/en + intent triage, onboarding banner on load |
 | Desktop page | Left-rail **Control bar**: status + four mode cards + zh/en switch, **without touching the Electron shell** |
@@ -128,17 +133,18 @@ Mode → config mapping (explicit config > mode > built-in defaults):
 | `compat` | `full` | `false` | `true` | 1 | 16 | — |
 | `power` | `receipt` | `true` | `true` | 3 | 14 | — |
 
-"Stall reentries" (v0.4.1) counts only **consecutive reentries that produced nothing new**.
+"Stall reentries" (v0.3.3) counts only **consecutive reentries that produced nothing new**.
 Reentries where the model kept reading/writing/running commands do not consume this budget —
 productive work is never killed by a counter. What still binds the turn is the hard request
 cap (2× reentries) plus a close-out window: one closing instruction (up to 2), and if no
 `tf-final` follows, a delivery note that explicitly marks the work as unfinished instead of
 dropping a half-finished session on the user.
 
+
 One-line decision guide: **stay on `balanced`; switch to `lean` when the bill matters;
 `compat` when diffing against the native loop; `power` for programmatic data work.**
 
-## 4. The tf-* protocol (14 commands, the v0.4.0 hard cap)
+## 4. The tf-* protocol (11 commands)
 
 The parser (`src/kernel/parser.ts`) is the authority; full semantics in
 [docs/protocol.md](docs/protocol.md).
@@ -155,9 +161,6 @@ The parser (`src/kernel/parser.ts`) is the authority; full semantics in
 | `tf-peek` | Fetch a line range from a handle | Injected on demand |
 | `tf-plan` | Declare/revise the plan and acceptance items (`- [id] description` lines) | State lives driver-side; requests carry **diffs only** |
 | `tf-final` | Finish (summary must contain the answer verbatim) | Flagged premature while acceptance items are unverified (F5) |
-| `tf-ask` (v0.4.0) | Blocking user question (`q` required; `header`/`options` comma-separated optional; maps to host ask_user_question) | The answer is injected in full (ask family, high); complex multi-question shapes via tf-call body |
-| `tf-skill` (v0.4.0) | Load a skill (`name`; maps to host skill) | Skill instructions injected in full (skill family, high); loading is session-level |
-| `tf-call` (v0.4.0) | Universal call channel: `name` = a host tool name in this session's frozen surface, body = JSON argument object (web/skill/job/schedule/goal/ask/todo/present/office/subagent all reachable) | Results classified by host tool family (read-type injected, write-type ledger); unknown-tool injects nearest-name suggestions; off with `toolSurface: off` or no host face (zero protocol chars) |
 | `tf-code` | Programmatic tool calls (**off by default**; `power` mode or explicit opt-in) | Values within the cap injected in full; over-limit → skeleton+handle; failures carry `kind` + retry verdict |
 
 Common attributes: `id` (auto-numbered when omitted), `depends_on` (cycles detected and
@@ -263,6 +266,31 @@ per-request usage kept verbatim); missing cache components are marked "unavailab
 zero-filled; title side-requests are excluded from both arms; the two-component figure is
 reference-only and always labelled.
 
+### 7.1 Single-session measurement: with vs. without the plugin (V0.3.3)
+
+2026-11-21, real desktop sessions, same model, same task, same starting context, one run on
+each arm (`deepseek-flash`; usage summed from per-request originals):
+
+| Metric | Without plugin | With V0.3.3 | Change |
+| --- | ---: | ---: | ---: |
+| **Total tokens** | 600,410 | **109,546** | **−81.8%** (5.48×) |
+| **Uncached input** | 14,471 | **8,840** | **−38.9%** |
+| Cache read | 548,864 | 83,200 | −84.8% |
+| Output | 37,075 | 17,506 | −52.8% |
+| Cache hit rate | 97.4% | 90.4% | −7.0 pt |
+
+Denominator: `total = uncached input + cache read + output` (**DISJOINT** — cache is listed
+separately and never double-counted into input). Both rows add up exactly to the reported
+totals: `14,471 + 548,864 + 37,075 = 600,410` and `8,840 + 83,200 + 17,506 = 109,546`.
+
+**Why the hit rate dropped by 7 points (stated plainly)**: a hit rate is a ratio. The plugin
+cuts requests and injected volume by an order of magnitude, so while uncached input also fell
+from 14,471 to 8,840 (−38.9%), cache reads fell much harder (548,864 → 83,200, −84.8%) and the
+ratio moved from 97.4% to 90.4%. What drives the bill is the **absolute volume of uncached
+input** and the **total**; shrinking the total is the goal and the hit rate is a by-product.
+When comparing hit rates across approaches, fix the task and context size and always report
+absolute volumes — percentages alone support the opposite conclusion.
+
 ## 8. Control bar & desktop page
 
 - **Load banner**: stderr onboarding panel (takeover state / current mode / first four steps
@@ -310,13 +338,13 @@ dsh-stream-agent/
 │                          #   disabled-lines-audit / v0.4.0-plan / TEST-PROPOSITIONS
 ├── scripts/               # build / check-consistency / gate / install-check / install-cycle /
 │                          #   repair-session-logs / release
-└── test/                  # 333 cases (2 kernel + 22 entry suites + 20 mock scenarios; zero API)
+└── test/                  # 339 cases (2 kernel + 22 entry suites + 20 mock scenarios; zero API)
 ```
 
 ## 10. Development
 
 ```bash
-npm test          # 333/333, zero API calls
+npm test          # 339/339, zero API calls
 npm run build     # emits dist/ (25 files) + smoke imports + desktop-page build gates
 npm run check     # R2: assembly & doc consistency (4 checks)
 npm run gate      # R4: release gate (6 items; real-machine items marked honestly)

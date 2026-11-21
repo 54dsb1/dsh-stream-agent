@@ -16,16 +16,20 @@
 历史批次的 22.3% 口径见 [eval/RESULTS.md](eval/RESULTS.md) §6 的如实说明——两批不可混用，
 R3 重跑后以同批双臂复算为准。
 
+另有一组**单会话**实测（2026-11-21，同一任务开/不开插件各一次）：总 token **600,410 →
+109,546（−81.8%）**，未缓存输入 **14,471 → 8,840（−38.9%）**。明细与命中率变化的诚实解读见
+[§7.1](#71-单会话实测开--不开插件v033)。
+
 |       |                                                                                                                                                                    |
 | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 宿主  | DeepSeek Harness `0.2.2-rc.1`（类型锚点）/ `rc.3`（运行时实测）                                                                                                     |
 | 依赖  | 零 npm 依赖；Node ≥ 22.18（原生类型擦除）                                                                                                                           |
-| 测试  | 333 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力/会话格式/收束与缓存前缀回归）                                                                              |
+| 测试  | 339 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力/会话格式/宿主一致性/截断·收束与宿主契约冲突回归）                                                                              |
 | 形态  | 单 bundle 包 + **专用 profile**（`profiles/stream` 模板）；`dsh plugin remove` 整层消失、宿主 loop 原子恢复                                                          |
 | 控制栏 | `dsh-stream-agent bar`：四模式 + 中英切换 + 意图核对，装载时自动打印上手引导                                                                                       |
 | 桌面页 | 客户端左侧栏「控制栏 / Control bar」：状态 + 四模式 + 中英切换，**不改 Electron 壳**                                                                               |
 | 计量  | 四分量脚本出数 + 回放一致性对照臂 10/10 + 发布门禁 6 项                                                                                                             |
-| 发布  | GitHub [Releases](https://github.com/54dsb1/dsh-stream-agent/releases) · npm `@hugesb/dsh-stream-agent` **尚未发布**（当前唯一安装路径见 §2）                                                      |
+| 发布  | GitHub [Releases](https://github.com/54dsb1/dsh-stream-agent/releases) · npm [`@hugesb/dsh-stream-agent`](https://www.npmjs.com/package/@hugesb/dsh-stream-agent)（`0.3.3` 起；安装形态仍限专用 profile，见 §2）                                                      |
 
 > **0.3.0 安装方式变更（重要）**：独立模式下本插件**只允许装进专用 profile**
 > （`profiles/stream` / `profiles/stream-headless`）。0.2.x 的"plugin add 进既有
@@ -111,14 +115,15 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 | `compat` | `full` | `false` | `true` | 1 | 16 | — |
 | `power` | `receipt` | `true` | `true` | 3 | 14 | — |
 
-「停滞重入」= **连续没有新增产出**的重入次数上限（v0.4.1 起）。每步都在读/写/跑命令
+「停滞重入」= **连续没有新增产出**的重入次数上限（v0.3.3 起）。每步都在读/写/跑命令
 （拿到新事实）的重入不计入这个预算——生产性工作不会被次数硬杀；真正兜底的是回合请求
 硬上限（2×重入）与收束期。撞墙时先注入一条收束指令（最多 2 次），仍无 `tf-final`
 则写一条**明确标注未完成**的交付说明，不把半截会话丢给用户。
 
+
 一句话决策：**默认 `balanced`；账单敏感换 `lean`；排障对照换 `compat`；写程序处理数据换 `power`。**
 
-## 4. tf-* 协议（14 条命令，v0.4.0 硬上限）
+## 4. tf-* 协议（11 条命令）
 
 语法权威是 `src/kernel/parser.ts`；完整闭环语义见 [docs/protocol.md](docs/protocol.md)。
 
@@ -135,9 +140,6 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 | `tf-plan` | 声明/修订计划与验收项（`- [id] 描述` 行） | 状态在驱动器侧，请求只注差分 |
 | `tf-final` | 收尾（summary 必须含答案原文） | 有未验证验收项时判过早（F5） |
 | `tf-code` | 程序化工具调用（**默认关闭**；`power` 或显式开启） | 上限内值完整注入；超限骨架+句柄；失败 `kind` + 可重试结论 |
-| `tf-ask`（v0.4.0） | 阻塞式提问（`q` 必填；`header`/`options` 逗号分隔可选；映射宿主 ask_user_question） | 用户回答完整注入（ask 族 high）；复杂多问/选项描述走 tf-call body |
-| `tf-skill`（v0.4.0） | 装载技能（`name` = 技能名；映射宿主 skill） | 技能说明完整注入（skill 族 high）；装载是会话级行为 |
-| `tf-call`（v0.4.0） | 通用调用通道：`name` = 本会话工具面内的宿主工具名，body = JSON 参数对象（web/skill/job/schedule/goal/ask/todo/present/office/subagent 等全部可达） | 按宿主工具分族处理（读类注入、写类回执）；unknown-tool 注入带相近工具名建议；`toolSurface: off` 或无宿主面时关闭（协议段 0 字符） |
 
 公共属性：`id`（缺省自动编号）、`depends_on`（依赖，环会被检测并具名失败）、
 `accepts`（验收关联，F5）。两条省 token 的纪律写在协议文本里：**不要读自己刚写过的文件**
@@ -221,6 +223,31 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 usage 原文留存可复算）；缓存分量缺失标"不可得"不按 0 计；标题旁路请求两臂同剔；
 二分量只能作参考并显式标注。
 
+### 7.1 单会话实测：开 / 不开插件（V0.3.3）
+
+2026-11-21，桌面端真实会话，同一模型、同一任务、同一份上下文起点，两侧各跑一次
+（`deepseek-flash`，usage 取每请求原文后相加）：
+
+| 指标 | 不开插件 | 开 V0.3.3 | 变化 |
+| --- | ---: | ---: | ---: |
+| **总 token 用量** | 600,410 | **109,546** | **−81.8%**（5.48×） |
+| **未缓存输入** | 14,471 | **8,840** | **−38.9%** |
+| 缓存读取 | 548,864 | 83,200 | −84.8% |
+| 输出 | 37,075 | 17,506 | −52.8% |
+| 缓存命中率 | 97.4% | 90.4% | −7.0 pt |
+
+口径：`总 token = 未缓存输入 + 缓存读取 + 输出`（**DISJOINT**，缓存读写单列，不再重复计入
+输入）。两侧各自求和都精确等于所报总数，可逐项复算：
+
+- 不开插件：`14,471 + 548,864 + 37,075 = 600,410`
+- 开 V0.3.3：`8,840 + 83,200 + 17,506 = 109,546`
+
+**为什么命中率反而降了 7 个点（如实说明）**：命中率是比值。插件把请求数与注入总量压掉一个
+数量级之后，分母里的未缓存输入虽然也从 14,471 降到 8,840（−38.9%），但缓存读取降得更狠
+（548,864 → 83,200，−84.8%），比值因此从 97.4% 落到 90.4%。真正决定账单的是**未缓存输入的
+绝对量**和**总量**；把总量压小是目标，命中率只是结果之一。跨方案比较命中率时请固定任务与
+上下文规模，并同时报绝对量——只报百分比会得出相反结论。
+
 ## 8. 控制栏与桌面页
 
 - **装载横幅**：stderr 打印引导面板（接管状态 / 当前模式 / 上手四步 / 意图提示），
@@ -262,13 +289,13 @@ dsh-stream-agent/
 │                          #   disabled-lines-audit / v0.4.0-plan / TEST-PROPOSITIONS
 ├── scripts/               # build / check-consistency / gate / install-check / install-cycle /
 │                          #   repair-session-logs / release
-└── test/                  # 333 用例（kernel 2 套 + entry 22 套 + 20 mock 场景；零 API）
+└── test/                  # 339 用例（kernel 2 套 + entry 22 套 + 20 mock 场景；零 API）
 ```
 
 ## 10. 开发
 
 ```bash
-npm test          # 333/333，零 API 调用
+npm test          # 339/339，零 API 调用
 npm run build     # 产出 dist/ 25 个文件 + 全量 smoke import + 桌面页构建闸门
 npm run check     # R2：装配与文档一致性 4 项
 npm run gate      # R4：发布门禁 6 项（真机项如实标待复测）
@@ -280,7 +307,7 @@ npm run release:dry
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/protocol.md](docs/protocol.md) | 协议语法与闭环语义（12 条命令 + F5/F6/F7 + tf-call 语义） |
+| [docs/protocol.md](docs/protocol.md) | 协议语法与闭环语义（11 条命令 + F5/F6/F7 语义） |
 | [docs/limitations.md](docs/limitations.md) | 已知限制（按"你会不会踩到"排序，每条带取证） |
 | [docs/adr-001-segment-boundary.md](docs/adr-001-segment-boundary.md) | 长会话段边界 ADR（整块丢弃 vs 宿主压缩的决策） |
 | [docs/disabled-lines-audit.md](docs/disabled-lines-audit.md) | 禁用行审计表（S5：每条停用/保留的依据） |

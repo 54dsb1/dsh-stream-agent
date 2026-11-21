@@ -1,4 +1,4 @@
-// scripts/repair-session-logs.mjs —— 存量会话日志的 v4 工具生命周期修复（0.3.0）
+// scripts/repair-session-logs.mjs —— 存量会话日志的 v4 形状修复（0.3.0 广告缺失 / 0.3.2 model source）
 //
 // 背景：0.3.0 及更早版本的插件在派发 tf-* 命令时只让宿主管线落 `tool/call` +
 // `tool/result`，从未写 v4 格式要求的 `assistant/message`（content 带 `tool-call` 块）。
@@ -6,13 +6,22 @@
 // corrupt——桌面端表现为"历史加载失败"。本脚本为存量日志补入缺失的广告事件，并重排
 // seq 与全部 seq 引用；写入前先备份，写入后用本地复核规则再验一遍。
 //
+// 0.3.2 新增第三类 corrupt（model source 缺失）：0.3.1 及更早版本写 assistant/message
+// 时 source 只有 `{kind:'model'}`，缺 `provider`/`model` 非空字符串——宿主校验器
+// （dsh-session assertMessageEventShape → hasProviderModel）读取时抛
+// `message must have model source`，整条会话同样被判 corrupt。本脚本按命令行指定的
+// provider/model（缺省 deepseek-account / deepseek-flash，即本机桌面端默认路由）补齐
+// 全部缺失的 model source；已有 provider/model 的事件一个字节不动。
+//
 // 用法：
 //   node scripts/repair-session-logs.mjs                 # dry-run：只报告哪些会话需要修
 //   node scripts/repair-session-logs.mjs --write         # 落盘（.bak-<时间戳> 备份 + 删投影缓存）
 //   node scripts/repair-session-logs.mjs --session <id>  # 只处理一个会话
 //   node scripts/repair-session-logs.mjs --root <dir>    # 指定 dsh 状态根（缺省 ~/.dsh）
+//   node scripts/repair-session-logs.mjs --model-provider <p> --model <m>
+//                                                        # 补齐 source 用的 provider/model（缺省 deepseek-account / deepseek-flash）
 //
-// 纪律：零依赖；只改被判定为"缺广告"的会话；已有广告的会话一个字节都不动。
+// 纪律：零依赖；只改被判定为"缺广告或缺 model source"的会话；形状完好的会话一个字节都不动。
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -34,6 +43,9 @@ const valueOf = (name, fallback) => {
 const WRITE = has('--write');
 const STATE_ROOT = resolve(valueOf('--root', join(homedir(), '.dsh')));
 const ONLY_SESSION = valueOf('--session', undefined);
+// model source 补齐值（0.3.2）：缺省 = 本机桌面端默认路由（与实测健康日志一致）。
+const MODEL_PROVIDER = valueOf('--model-provider', 'deepseek-account');
+const MODEL_NAME = valueOf('--model', 'deepseek-flash');
 const SESSIONS_ROOT = join(STATE_ROOT, 'sessions');
 const PROJ_CACHE = join(STATE_ROOT, 'storages', 'session_projcache', 'sessions');
 
@@ -134,10 +146,36 @@ function reorderClosedStepMessages(events) {
   return out;
 }
 
+/** assistant/message 的 model source 是否已满足宿主校验（kind=model + provider/model 非空字符串）。 */
+function hasValidModelSource(message) {
+  const source = message?.source;
+  if (source === null || typeof source !== 'object') return false;
+  if (source.kind !== 'model') return false;
+  return typeof source.provider === 'string' && source.provider !== ''
+    && typeof source.model === 'string' && source.model !== '';
+}
+
 function repairedRows(rows, sessionId) {
   const [headerRow, ...rawEvents] = rows;
   if (headerRow?.type !== 'session') throw new Error('首行不是 session header');
   const events = reorderClosedStepMessages(rawEvents);
+
+  // 0.3.2：model source 补齐（原位改写，不动 seq 与顺序）。只补缺失，已有值不覆盖——
+  // 万一存量日志里有宿主/旧版本写的真实 provider/model，保留原值。
+  let fixedSources = 0;
+  for (const event of events) {
+    if (event.type !== 'assistant/message') continue;
+    const message = event.data?.message;
+    if (message === null || typeof message !== 'object') continue;
+    if (hasValidModelSource(message)) continue;
+    const source = (message.source !== null && typeof message.source === 'object' && message.source.kind === 'model')
+      ? message.source
+      : { kind: 'model' };
+    source.provider = MODEL_PROVIDER;
+    source.model = MODEL_NAME;
+    message.source = source;
+    fixedSources += 1;
+  }
 
   /** @type {Map<number, Array<{type:'tool-call', id:string, name:string, arguments:string}>>} */
   const insertBefore = new Map();
@@ -197,9 +235,9 @@ function repairedRows(rows, sessionId) {
   };
 
   if (insertBefore.size === 0) {
-    if (!reordered) return { changed: false, rows, inserted: 0, unadvertised: 0, reordered: false };
+    if (!reordered && fixedSources === 0) return { changed: false, rows, inserted: 0, unadvertised: 0, reordered: false, fixedSources: 0 };
     const out = rebuild([...events]);
-    return { changed: true, rows: [headerRow, ...out], inserted: 0, unadvertised: 0, reordered: true };
+    return { changed: true, rows: [headerRow, ...out], inserted: 0, unadvertised: 0, reordered, fixedSources };
   }
 
   const out = [];
@@ -213,7 +251,8 @@ function repairedRows(rows, sessionId) {
         data: {
           turn: first.data?.turn,
           step: first.data?.step,
-          message: { id: `repaired-ad-${randomUUID()}`, role: 'assistant', content: blocks, source: { kind: 'model' } },
+          // 0.3.2：补出的广告同样要带非空 provider/model（宿主 hasProviderModel 校验）。
+          message: { id: `repaired-ad-${randomUUID()}`, role: 'assistant', content: blocks, source: { kind: 'model', provider: MODEL_PROVIDER, model: MODEL_NAME } },
           stream: [],
         },
         surfaceOp: 'append',
@@ -223,7 +262,7 @@ function repairedRows(rows, sessionId) {
   }
   rebuild(out);
 
-  return { changed: true, rows: [headerRow, ...out], inserted: insertBefore.size, unadvertised, reordered };
+  return { changed: true, rows: [headerRow, ...out], inserted: insertBefore.size, unadvertised, reordered, fixedSources };
 }
 
 function remapReferences(event, map) {
@@ -248,8 +287,51 @@ function remapReferences(event, map) {
 }
 
 // ---------------------------------------------------------------------------
-// 复核：与 dsh-session-format-v3-to-v4 的 tool()/closeTools 同规则
+// 复核：与 dsh-session-format-v3-to-v4 的 tool()/closeTools 同规则 + 消息形状同规则
 // ---------------------------------------------------------------------------
+
+/**
+ * 消息形状复核（0.3.2）：与 dsh-session/lib/index.js 的 assertMessageEventShape 同规则
+ * （本地镜像，插件仓库不依赖宿主包）。五类 message 事件的 role/source/content 不合法
+ * = 整条日志被判 corrupt。DSM 之外的类型（assistant/attempt、plugin:* 等）不查。
+ */
+function assertMessageShapes(rows) {
+  const expectedRole = {
+    'system/message': 'system',
+    'developer/message': 'developer',
+    'user/message': 'user',
+    'assistant/message': 'assistant',
+    'tool/result': 'tool',
+  };
+  for (const event of rows) {
+    const type = event.type;
+    if (!(type in expectedRole)) continue;
+    const data = event.data ?? {};
+    const message = type === 'user/message' ? data : data.message;
+    if (message === null || typeof message !== 'object') throw new Error(`${type}#${event.seq} 缺 message`);
+    if (typeof message.id !== 'string' || message.id === '') throw new Error(`${type}#${event.seq} 缺非空 id`);
+    if (message.role !== expectedRole[type]) throw new Error(`${type}#${event.seq} role 必须是 "${expectedRole[type]}"`);
+    const source = message.source;
+    if (source === null || typeof source !== 'object' || typeof source.kind !== 'string' || source.kind === '') {
+      throw new Error(`${type}#${event.seq} source 非法`);
+    }
+    if (!Array.isArray(message.content)) throw new Error(`${type}#${event.seq} content 必须是数组`);
+    if (type === 'system/message') {
+      if (source.kind !== 'system-prompt') throw new Error(`${type}#${event.seq} source 必须是 system-prompt`);
+    } else if (type === 'assistant/message') {
+      if (source.kind !== 'model' || typeof source.provider !== 'string' || source.provider === ''
+        || typeof source.model !== 'string' || source.model === '') {
+        throw new Error(`${type}#${event.seq} message 必须有 model source（非空 provider/model）`);
+      }
+    } else if (type === 'tool/result') {
+      if (source.kind !== 'tool' || typeof source.callId !== 'string' || source.callId === '') {
+        throw new Error(`${type}#${event.seq} message 必须有 tool source`);
+      }
+      if (message.toolCallId !== source.callId) throw new Error(`${type}#${event.seq} toolCallId 与 source.callId 不一致`);
+    }
+  }
+}
+
 
 function assertLifecycle(rows) {
   const events = rows.filter((row) => row.type !== 'session');
@@ -373,13 +455,26 @@ for (const { sessionId, file } of findSessionFiles(SESSIONS_ROOT)) {
     console.log(`[skip] ${sessionId}：${error.message}`);
     continue;
   }
-  if (!result.changed) {
-    console.log(`[ok]   ${sessionId}：无缺失广告`);
+  // 0.3.2：先对**原日志**跑消息形状复核——形状已坏的会话无论能否补广告都需要修。
+  let shapeBroken = false;
+  try {
+    assertMessageShapes(rows);
+  } catch (error) {
+    shapeBroken = true;
+  }
+  if (!result.changed && !shapeBroken) {
+    console.log(`[ok]   ${sessionId}：无缺失广告，model source 完好`);
     continue;
   }
   needRepair += 1;
-  console.log(`[fix]  ${sessionId}：补 ${result.inserted} 条广告（覆盖 ${result.unadvertised} 个 tool/call）`);
+  const fixes = [
+    result.inserted > 0 ? `补 ${result.inserted} 条广告（覆盖 ${result.unadvertised} 个 tool/call）` : '',
+    result.fixedSources > 0 ? `补齐 ${result.fixedSources} 条 model source（${MODEL_PROVIDER}/${MODEL_NAME}）` : '',
+    shapeBroken && !result.changed ? '消息形状损坏（见修复后复核）' : '',
+  ].filter(Boolean).join('；');
+  console.log(`[fix]  ${sessionId}：${fixes}`);
   try {
+    assertMessageShapes(result.rows);
     assertLifecycle(result.rows);
     hostValidate?.(result.rows);
   } catch (error) {
