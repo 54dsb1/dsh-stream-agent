@@ -80,7 +80,10 @@ W3 实体解码 / W4 DSML 内联属性混合形态 / W6 mangled name 抢救 / W7
   字符"→ 触发全量重写（`session-3d4caf01`，白烧 2-3 步 + 1 万思考 token）。
 - **mangled DSML name 值抢救**：`name="tf-peek handle="obs:...""`（全部属性塞进
   name 值、引号数为奇数）——旧实现整条丢弃。三件套：scanHeaderClose 引号不成对时
-  退化为取最后一个 '>'（残片仍等待）；name 值以合法命令名开头时改写为闭合形式；
+  退化通道 v2：取**第一个**满足"前驱是属性收尾引号或自闭合斜杠"的 '>'——不能取
+  最后一个（mangled 开标签后面的命令正文含 '>'，取最后一个会把正文整段吞进标签
+  再丢弃，真机 seq 104：整个 selfcheck 脚本被吞）；name 值以合法命令名开头时改写为
+  闭合形式；
   自闭合 invoke 进块缓冲（findDsmlInvokeEnd 自闭合分支，含端点修正）。
   `session-d6cd0759` seq 110 的整条 tf-peek 现在完整恢复（handle/from_line/to_line/id
   全部归位）。

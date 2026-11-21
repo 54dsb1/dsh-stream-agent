@@ -577,11 +577,18 @@ function scanHeaderClose(buf: string): { end: number; selfClosing: boolean } | n
   }
   // v0.3.3：引号不成对（mangled DSML name 值，奇数个引号——真机 session-d6cd0759
   // seq 110：`name="tf-peek handle="obs:...`）时严格扫描永不闭合，header 模式等死，
-  // 整条命令在流末按 malformed 丢弃。退化通道：取**最后一个** '>' 作为标签端界
-  //（残片形态没有 '>' 仍返回 null 等更多数据；正常标签引号成对，严格扫描先行命中，
-  // 退化通道不触发）。
-  const gt = buf.lastIndexOf('>');
-  if (gt > 0) return { end: gt, selfClosing: buf[gt - 1] === '/' };
+  // 整条命令在流末按 malformed 丢弃。退化通道：取**第一个**满足"前驱是 `\"`（属性
+  // 收尾）或 `/\"`（自闭合）"的 '>' 作为标签端界——不能取最后一个 '>'：mangled 开标签
+  // 后面跟着命令正文（Python 代码含 '>'），取最后一个会把正文整段吞进标签再丢弃
+  // （真机 seq 104：整个 selfcheck 脚本被吞）。残片形态（无端界）仍返回 null 等更多
+  // 数据；正常标签引号成对，严格扫描先行命中，退化通道不触发。
+  for (let i = 1; i < buf.length; i++) {
+    if (buf[i] !== '>') continue;
+    const prev = buf[i - 1];
+    if (prev === '"' || (prev === '/' && buf[i - 2] === '"')) {
+      return { end: i, selfClosing: prev === '/' };
+    }
+  }
   return null;
 }
 
