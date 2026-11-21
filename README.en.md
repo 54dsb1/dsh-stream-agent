@@ -18,6 +18,11 @@ native loop's tokens with parity on correctness**. The historical 22.3% figure c
 earlier batch — the two are not comparable; see the honest note in
 [eval/RESULTS.md](eval/RESULTS.md) §6. The R3 rerun will re-measure both arms in one batch.
 
+A separate **single-session** measurement (2026-11-21, one run with and one without the
+plugin): total tokens **600,410 → 109,546 (−81.8%)**, uncached input **14,471 → 8,840
+(−38.9%)**. Details and an honest reading of the hit-rate change:
+[§7.1](#71-single-session-measurement-with-vs-without-the-plugin-v033).
+
 | Dimension | Status |
 | ----- | ----- |
 | Host | DeepSeek Harness `0.2.2-rc.1` (type anchor) / `rc.3` (runtime-tested) |
@@ -260,6 +265,31 @@ Discipline: per-task tokens = Σ(input + cacheRead + cacheWrite + output) (four 
 per-request usage kept verbatim); missing cache components are marked "unavailable", never
 zero-filled; title side-requests are excluded from both arms; the two-component figure is
 reference-only and always labelled.
+
+### 7.1 Single-session measurement: with vs. without the plugin (V0.3.3)
+
+2026-11-21, real desktop sessions, same model, same task, same starting context, one run on
+each arm (`deepseek-flash`; usage summed from per-request originals):
+
+| Metric | Without plugin | With V0.3.3 | Change |
+| --- | ---: | ---: | ---: |
+| **Total tokens** | 600,410 | **109,546** | **−81.8%** (5.48×) |
+| **Uncached input** | 14,471 | **8,840** | **−38.9%** |
+| Cache read | 548,864 | 83,200 | −84.8% |
+| Output | 37,075 | 17,506 | −52.8% |
+| Cache hit rate | 97.4% | 90.4% | −7.0 pt |
+
+Denominator: `total = uncached input + cache read + output` (**DISJOINT** — cache is listed
+separately and never double-counted into input). Both rows add up exactly to the reported
+totals: `14,471 + 548,864 + 37,075 = 600,410` and `8,840 + 83,200 + 17,506 = 109,546`.
+
+**Why the hit rate dropped by 7 points (stated plainly)**: a hit rate is a ratio. The plugin
+cuts requests and injected volume by an order of magnitude, so while uncached input also fell
+from 14,471 to 8,840 (−38.9%), cache reads fell much harder (548,864 → 83,200, −84.8%) and the
+ratio moved from 97.4% to 90.4%. What drives the bill is the **absolute volume of uncached
+input** and the **total**; shrinking the total is the goal and the hit rate is a by-product.
+When comparing hit rates across approaches, fix the task and context size and always report
+absolute volumes — percentages alone support the opposite conclusion.
 
 ## 8. Control bar & desktop page
 
