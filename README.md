@@ -20,7 +20,7 @@ R3 重跑后以同批双臂复算为准。
 | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 宿主  | DeepSeek Harness `0.2.2-rc.1`（类型锚点）/ `rc.3`（运行时实测）                                                                                                     |
 | 依赖  | 零 npm 依赖；Node ≥ 22.18（原生类型擦除）                                                                                                                           |
-| 测试  | 318 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力/会话格式/宿主一致性/截断与宿主契约冲突回归）                                                                              |
+| 测试  | 327 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力/会话格式/宿主一致性/截断与宿主契约冲突回归）                                                                              |
 | 形态  | 单 bundle 包 + **专用 profile**（`profiles/stream` 模板）；`dsh plugin remove` 整层消失、宿主 loop 原子恢复                                                          |
 | 控制栏 | `dsh-stream-agent bar`：四模式 + 中英切换 + 意图核对，装载时自动打印上手引导                                                                                       |
 | 桌面页 | 客户端左侧栏「控制栏 / Control bar」：状态 + 四模式 + 中英切换，**不改 Electron 壳**                                                                               |
@@ -254,13 +254,13 @@ dsh-stream-agent/
 │                          #   disabled-lines-audit / v0.4.0-plan / TEST-PROPOSITIONS
 ├── scripts/               # build / check-consistency / gate / install-check / install-cycle /
 │                          #   repair-session-logs / release
-└── test/                  # 318 用例（kernel 2 套 + entry 21 套 + 20 mock 场景；零 API）
+└── test/                  # 327 用例（kernel 2 套 + entry 21 套 + 20 mock 场景；零 API）
 ```
 
 ## 10. 开发
 
 ```bash
-npm test          # 318/318，零 API 调用
+npm test          # 327/327，零 API 调用
 npm run build     # 产出 dist/ 25 个文件 + 全量 smoke import + 桌面页构建闸门
 npm run check     # R2：装配与文档一致性 4 项
 npm run gate      # R4：发布门禁 6 项（真机项如实标待复测）

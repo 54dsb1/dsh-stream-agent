@@ -46,6 +46,11 @@
  *   典型是模型把自闭合命令又"关闭"了一次）一律按 malformed(stray-close-tag) 记账后丢弃，
  *   绝不作 prose 透传——0.3.1 真机证据：这类残片会以纯文本落进 assistant/message，
  *   桌面端正文里出现裸的 `</tf-bash>`。
+ * - 畸形闭合变体（v0.3.3）：`</tf-` 紧跟非空白且引号感知存在 '>' 的 token（通配
+ *   `</tf-*>`、带属性 `</tf-write path="x">`）同样是协议闭合尝试——判 close-tag 记账丢弃
+ *   （loop 首次出现时注入定向纠错）。判别式带 `\S` 是为了保住"正文里提到 </tf"的透传语义
+ *   （`</tf 不在标签位` 无 '>' 且 tf 后是空白 → 仍按 prose）。真机证据 2026-11-20：
+ *   `</tf-*>` 两度作为 prose 落进桌面端正文，模型重复犯错且会话无产出收场。
  * - DSML 参数式调用（v0.3.2 截断修复）：模型原生调用格式还有"父标签 + parameter 子标签"
  *   形态（真机取证 session-e4b9a89c 第 6/9 步）：
  *     <｜｜DSML｜｜ invoke name="tf-read">
@@ -296,7 +301,11 @@ export class TfStreamParser {
     if (probe === 'close-tag') {
       // v0.3.1：孤立闭合标签——前面没有配对打开（自闭合命令被多关一次、或模型手写了
       // 残片）。按协议违规记账后丢弃，绝不作为 prose 落进正文。
-      const gt = this.buf.indexOf('>', lt);
+      // v0.3.3：token 端界用引号感知扫描——畸形闭合可能带属性，属性值里可含 '>'
+      // （如 `</tf-write cmd="a>b">`），裸 indexOf 会把 token 截半，剩余半截再次漏进正文。
+      // probe 与消费用同一 scanHeaderClose（同 buf 同切片），端界构造性一致。
+      const close = scanHeaderClose(this.buf.slice(lt));
+      const gt = close === null ? -1 : lt + close.end;
       const raw = gt === -1 ? this.buf.slice(lt) : this.buf.slice(lt, gt + 1);
       if (lt > 0) events.push({ type: 'text', text: this.buf.slice(0, lt) });
       this.buf = gt === -1 ? '' : this.buf.slice(gt + 1);
@@ -581,9 +590,9 @@ function isDsmlTag(raw        )          {
   return DSML_TAG_RE.test(raw);
 }
 
-/** 从孤立闭合标签原文取命令名（`</tf-bash>` → `tf-bash`；半截标签 → `?`）。 */
+/** 从孤立闭合标签原文取命令名（`</tf-bash>` → `tf-bash`；通配 `</tf-*>` → `tf-*`；半截标签 → `?`）。 */
 function closeTagName(raw        )         {
-  const m = /^<\/\s*(tf-[a-z0-9-]*)/.exec(raw);
+  const m = /^<\/\s*(tf-[a-z0-9*-]*)/.exec(raw);
   return m === null ? '?' : m[1] ;
 }
 
@@ -656,9 +665,31 @@ function decodeXmlEntities(value        )         {
 /** 从 `k="v" k2="v2"` 属性段提取键值（引号内允许 '>'；重复键后者覆盖，交由 schema 兜底）。 */
 function parseAttrPairs(segment        )                         {
   const attrs                         = {};
-  const re = /([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*"([^"]*)"/g;
+  const re = /([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*"/g;
   let m                        ;
-  while ((m = re.exec(segment)) !== null) attrs[m[1] ] = decodeXmlEntities(m[2] );
+  while ((m = re.exec(segment)) !== null) {
+    // v0.3.2：与 parseHeader 同款的内嵌引号容忍扫描（闭引号 = `"` 后跟下一属性、
+    // 标签结尾或末尾）。valueStart 是**绝对**下标（m.index + m[0].length）——
+    // 用相对偏移会把搜索起点挪回段首，re.lastIndex 不前进 = 零进度死循环。
+    const valueStart = m.index + m[0].length;
+    let value = '';
+    let next = valueStart;
+    for (let q = segment.indexOf('"', valueStart); q !== -1; q = segment.indexOf('"', q + 1)) {
+      const after = segment.slice(q + 1);
+      if (/^\s+[a-zA-Z][a-zA-Z0-9_-]*\s*=/.test(after) || /^\/?>/.test(after) || after.trim() === '') {
+        value = segment.slice(valueStart, q);
+        next = q + 1;
+        break;
+      }
+    }
+    if (next === valueStart) {
+      // 没找到合法闭引号：退化取到段尾（DSML 开标签段以标签结尾界定，段尾即值尾）。
+      value = segment.slice(valueStart);
+      next = segment.length;
+    }
+    attrs[m[1] ] = decodeXmlEntities(value);
+    re.lastIndex = Math.max(next, m.index + m[0].length + 1);
+  }
   return attrs;
 }
 
@@ -907,25 +938,39 @@ function trimParamValue(value        )         {
   return value.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
 }
 
-/** 属性 schema 校验（parseHeader 与 DSML 块共用；校验失败返回结构化 error）。 */
+/** 属性 schema 校验（parseHeader 与 DSML 块共用；校验失败返回结构化 error）。
+ *  v0.3.2：未知属性**降级丢弃**而不是拒整条命令——真机（session-ec100f8a seq 91）：
+ *  模型写 `lines="1-20"`（schema 是 from_line/to_line），旧实现把整条 tf-peek 拒掉，
+ *  模型只能重试烧一步。`lines="N-M"` 识别为 from_line/to_line 的习惯写法并归一；
+ *  其余未知属性原样丢弃（不猜语义）。必需属性缺失仍然拒（缺 path 的 write 不能猜）。 */
 function validateCommandAttrs(
   name               ,
   attrs                        ,
 )                                                                                      {
   const schema = COMMAND_SCHEMAS[name];
   const allowed = new Set([...COMMON_ATTRS, ...schema.required, ...schema.optional]);
+  const kept                         = {};
   for (const key of Object.keys(attrs)) {
-    if (!allowed.has(key)) return { error: `unknown-attribute:${key}` };
+    if (!allowed.has(key)) continue;
+    kept[key] = attrs[key] ;
+  }
+  const lines = attrs['lines'];
+  if (lines !== undefined && (name === 'tf-peek' || name === 'tf-read')) {
+    const range = /^(\d+)\s*-\s*(\d+)$/.exec(lines);
+    if (range !== null) {
+      if (kept['from_line'] === undefined) kept['from_line'] = range[1] ;
+      if (kept['to_line'] === undefined) kept['to_line'] = range[2] ;
+    }
   }
   for (const req of schema.required) {
-    if (attrs[req] === undefined) return { error: `missing-attribute:${req}` };
+    if (kept[req] === undefined) return { error: `missing-attribute:${req}` };
   }
   for (const key of ['from_line', 'to_line']) {
-    if (attrs[key] !== undefined && !/^\d+$/.test(attrs[key])) {
+    if (kept[key] !== undefined && !/^\d+$/.test(kept[key])) {
       return { error: `bad-integer-attribute:${key}` };
     }
   }
-  return { attrs, dependsOn: buildDependsOn(attrs) };
+  return { attrs: kept, dependsOn: buildDependsOn(kept) };
 }
 
 /** depends_on：逗号分隔，去空、去重、保序。 */
@@ -971,12 +1016,27 @@ function parseHeader(raw        )              {
       continue;
     }
     if (rest === '') break;
-    const attr = rest.match(/^([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*"([^"]*)"/);
+    // v0.3.2：属性值容忍内嵌引号。简单正则 `([^"]*)` 在值含 `"` 时撑破
+    // （真机 session-ec100f8a seq 134：PowerShell cmd 内嵌引号 → 整条命令丢失，
+    // 参数值漏进正文）。闭引号判定：`"` 后面跟（下一段 `key="` 模式 | 标签结尾
+    // `>`/`/>` | inner 末尾）；否则视为值的一部分继续扫。
+    // 找不到合法闭引号 = 照旧报 bad-attribute-syntax。
+    const attr = rest.match(/^([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*"/);
     if (!attr) return { error: `bad-attribute-syntax:${rest.slice(0, 20)}` };
+    const valueStart = attr[0].length;
+    let scanned                                         = null;
+    for (let q = rest.indexOf('"', valueStart); q !== -1; q = rest.indexOf('"', q + 1)) {
+      const after = rest.slice(q + 1);
+      if (/^\s+[a-zA-Z][a-zA-Z0-9_-]*\s*=/.test(after) || /^\/?>/.test(after) || after.trim() === '') {
+        scanned = { value: rest.slice(valueStart, q), next: q + 1 };
+        break;
+      }
+    }
+    if (scanned === null) return { error: `bad-attribute-syntax:${rest.slice(0, 20)}` };
     const key = attr[1];
     if (key in attrs) return { error: `duplicate-attribute:${key}` };
-    attrs[key] = decodeXmlEntities(attr[2]);
-    rest = rest.slice(attr[0].length);
+    attrs[key] = decodeXmlEntities(scanned.value);
+    rest = rest.slice(scanned.next);
   }
 
   // depends_on：逗号分隔，去空、去重、保序
@@ -1005,6 +1065,18 @@ function probeTag(s        )           {
   if (s.startsWith('</')) {
     if ('</tf-'.startsWith(s)) return 'need-more'; // '</' / '</t' / '</tf' / '</tf-'：闭合标签开头
     if (/^<\/tf-[a-z0-9-]*\s*>/.test(s)) return 'close-tag';
+    // v0.3.3：畸形闭合变体（协议命名空间内）——通配 `</tf-*>`、带属性
+    // `</tf-write path="x">` 等。判别式：`</tf-` 紧跟非空白（与"正文里提到 </tf"区分，
+    // 如 `</tf 不在标签位` 仍是 prose），且引号感知地存在 '>'（闭合尝试成形）。
+    // 真机证据 2026-11-20（桌面端会话）：`</tf-*>` 两度作为 prose 落进 assistant 正文
+    // ——0.3.1 治理只覆盖「合法闭合形态」，畸形变体全数漏网，且模型拿不到纠错信号
+    // 同一会话内重复犯错。引号感知 '>' 的存在使 `cmd="a>b"` 这类属性值不会被误判成
+    // token 端界。>200 字符仍无 '>'：按 runaway 残片记账丢弃（与 DSML 同纪律），不无限缓冲。
+    if (/^<\/tf-\S/.test(s)) {
+      const close = scanHeaderClose(s);
+      if (close !== null) return 'close-tag';
+      return s.length > 200 ? 'close-tag' : 'need-more';
+    }
     if (/^<\/tf-?[a-z0-9-]*$/.test(s)) return 'need-more'; // 还没等到 '>'
     return 'prose'; // '</div>' 之类：确属正文
   }

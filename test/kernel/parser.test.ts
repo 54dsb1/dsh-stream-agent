@@ -185,7 +185,7 @@ test('未知 tf-* 命令名 → malformed（不静默）', () => {
   assert.equal(m.raw, '<tf-frobnicate path="x"/>');
 });
 
-test('缺必填属性 → malformed；未知属性 → malformed；非法行号 → malformed', () => {
+test('缺必填属性 → malformed；未知属性降级丢弃（命令保留）；非法行号 → malformed', () => {
   const p = new TfStreamParser();
   const events = feedAll(p, [
     '<tf-read id="r1"/>',                       // 缺 path
@@ -193,10 +193,15 @@ test('缺必填属性 → malformed；未知属性 → malformed；非法行号 
     '<tf-peek handle="h" from_line="x"/>',      // 非法整数
   ]);
   const reasons = events.filter((e) => e.type === 'malformed').map((e) => (e as { reason: string }).reason);
-  assert.equal(reasons.length, 3);
+  assert.equal(reasons.length, 2);
   assert.ok(reasons[0].startsWith('missing-attribute:path'));
-  assert.ok(reasons[1].startsWith('unknown-attribute:bogus'));
-  assert.ok(reasons[2].startsWith('bad-integer-attribute:from_line'));
+  assert.ok(reasons[1].startsWith('bad-integer-attribute:from_line'));
+  // v0.3.2：未知属性降级丢弃而不是拒整条命令（真机 session-ec100f8a seq 91：
+  // lines="1-20" 被旧实现整条拒绝，模型重试烧一步）。
+  const cmds = commandsOf(events);
+  assert.equal(cmds.length, 1, '未知属性的 tf-read 应保留');
+  assert.equal(cmds[0].name, 'tf-read');
+  assert.equal(cmds[0].attrs['bogus'], undefined, '未知属性被丢弃');
 });
 
 test('属性语法错误与重复属性 → malformed；重复 id 透传（v0.2 起由驱动器裁决幂等/冲突）', () => {

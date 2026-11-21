@@ -573,6 +573,26 @@ function truncationNudge(truncation                                 )         {
   ].filter((line) => line !== '').join('\n');
 }
 
+/**
+ * v0.3.3：畸形/孤立闭合标签的定向纠错注入。真机取证（2026-11-20 桌面端会话，
+ * DeepSeek-V4.1）：模型把协议通配当成闭合标签输出（`</tf-*>`），同一会话内重复两次——
+ * 因为畸形闭合此前只记台账无注入（fail-soft），模型拿不到任何纠错信号，会话无产出收场。
+ * 文本点名残片原文、给出两种合法命令形态与收束方式。该残片已被 parser 丢弃（不进正文、
+ * 不显示、不执行），本注入只负责"教会一次"。
+ */
+export function malformedCloserNudge(raw        )         {
+  const shown = raw.length <= 40 ? raw : `${raw.slice(0, 40)}…`;
+  return [
+    `[tf-stream:error cmd=protocol] 检测到无效的协议闭合标签 \`${shown}\`——已丢弃：不执行、不进入对话正文。`,
+    'tf-* 协议没有通配或独立的闭合标签形态（`</tf-*>`、`</tf-命令名 属性…>` 都不是合法语法）：',
+    '- 有正文的命令（tf-write/tf-edit/tf-append/tf-code/tf-plan）用配对闭合，闭合标签必须与命令名逐字一致：',
+    '  `<tf-write path="a.txt" id="w1">正文</tf-write>`；',
+    '- 其余命令一律自闭合：`<tf-read path="a.txt" id="r1"/>`；',
+    '- 任务收束用 `<tf-final id="f1" summary="最终答案原文"/>`——不存在 `</tf-*>` 这样的流级闭合。',
+    '请继续用正确的 tf-* 命令完成剩余工作，最后以 tf-final 收尾。',
+  ].join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // ② SingleStreamDriver
 // ---------------------------------------------------------------------------
@@ -759,6 +779,9 @@ export class SingleStreamDriver {
   #deliveredTail                                                                 = null;
   /** 本步被截断的事实（parser truncated 事件 / finish=max-tokens）；非空即强制续写一次。 */
   #truncation                                         = null;
+  /** v0.3.3：畸形闭合标签（stray-close-tag）的定向纠错注入（一次性；见 malformedCloserNudge）。 */
+  #strayCloseNudge                = null;
+  #strayCloseGuided = false;
   #truncationRetries = 0;
   /** 本步命令 id 与原生调用（摘要用；流开始时重置） */
   #stepCommandIds           = [];
@@ -1170,9 +1193,9 @@ export class SingleStreamDriver {
     let reason                = { kind: 'blocked', detail: 'turn loop exited without convergence' };
 
     while (true) {
-      // v0.3.2：上一步的正文 + 命令摘要先落追加区（assistant/message 语义），再发下一请求。
-      // 顺序刻意为"摘要 → 易变尾"：模型看到的时间线与真实发生顺序一致。
-      this.#commitStepDigest();
+      // v0.3.2：digest 的落史时机在流结束时（见 consumeStream 之后的 #commitStepDigest），
+      // 易变尾的转正在 render 之后（转正块落位 = 上一请求尾部的同一位置）——两件事各就
+      // 各位，下一请求的公共前缀即可覆盖上一请求的全部 prompt（缓存读零损失）。
       // ---- steer 注入（修复限制 2）：运行中到达的 steer 在下一请求（内建的"下一步"）生效
       // ——进追加区（只追加，前缀单调不破）；流内不打断：当前流早已跑完才会走到这里。
       if (this.#pendingSteers.length > 0) {
@@ -1194,8 +1217,9 @@ export class SingleStreamDriver {
 
       // ---- REQUEST：装配 + O6 preflight（render() 内置断言，违反即抛 → fail-closed）----
       const messages = this.#renderer.render();
-      // v0.3.2：刚刚发出去的易变尾（上一步的观测/错误/原生结果）转正为追加区历史——
-      // 下一次请求仍可见（缓存读），不再"注入一次就消失"。只追加，前缀单调性不变。
+      // v0.3.2：**刚随本请求发出的**易变尾在此转正——落位 = 它在本请求 prompt 里的同一
+      // 位置（尾部），下一请求的公共前缀因此覆盖本请求的全部 prompt（缓存读零损失）。
+      // 本步的 digest 在流结束时就地落史（见 consumeStream 之后），时序：转正 → digest。
       this.#commitDeliveredTail();
       const stableHash = this.#renderer.stableHash();
       this.#stableHashes.push(stableHash);
@@ -1233,6 +1257,14 @@ export class SingleStreamDriver {
       // v4 格式要求它落在打开的 turn+step 内；此前在 step/end 之后写会被判
       // "assistant/message does not match an open turn and step" → 整条会话 corrupt。
 
+      // v0.3.2：本步的正文 + 命令摘要**就地落史**（流结束即落，不等下一轮循环顶部）。
+      // 时序红线：易变尾的转正发生在 render 之后（转正块落位 = 上一请求尾部的同一位置），
+      // digest 必须在转正之后追加——下一请求的公共前缀才能覆盖上一请求的全部 prompt
+      //（缓存读零损失；digest 在转正前落史会把转正块整体挤到错位，每条注入被双倍支付）。
+      // 模型视角时间线同样正确：上一步输出（digest）→ 上一步结果（上一请求尾部的注入，
+      // 已在 prompt 里读过）→ 本步结果（本步注入）。
+      this.#commitStepDigest();
+
       // ---- 收束判定（仅三种重入事由：失败/拒绝、high 观测、peek 需求）----
       const issues = this.#collectIssues();
       const injections = this.#buildInjections(issues, level);
@@ -1245,6 +1277,13 @@ export class SingleStreamDriver {
         injections.blocks.push({ role: 'user', content: truncationNudge(this.#truncation) });
         this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'output-truncated', detail: `${this.#truncation.reason}（第 ${this.#truncationRetries} 次续写）` });
         this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'output-truncated', reason: this.#truncation.reason, retry: this.#truncationRetries, turn });
+      }
+      // v0.3.3：畸形/孤立闭合标签的定向纠错注入（一次性；final-only 档不注入——预算已枯竭）。
+      // 挂块即成为重入事由（needsReentry：injections.blocks.length > 0）——真机场景里
+      // "纯 prose 残片 + 无命令无 final"的流也会因此重入一次，模型拿到纠错信号后继续干活。
+      if (this.#strayCloseNudge !== null && level !== 'final-only') {
+        injections.blocks.push({ role: 'user', content: this.#strayCloseNudge });
+        this.#strayCloseNudge = null;
       }
       // 饥饿防线（07 号结果 §3.6 上报的断链，08 号评测前按其建议修复）：
       // 升格骨架接入注入通路（按 high 观测同款格式；final-only 档不注入——预算已枯竭）。
@@ -1700,6 +1739,15 @@ export class SingleStreamDriver {
         // fail-soft：记 ledger，流继续（分派 06 硬性要求 + 05 号故障剧本口径）
         this.#record({ seq: ++DRIVER_SEQ, kind: 'malformed', raw: event.raw, reason: event.reason });
         this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'malformed-command', reason: event.reason, raw: event.raw.slice(0, 200) });
+        // v0.3.3：畸形/孤立闭合标签第一次出现时挂一条定向纠错注入（malformedCloserNudge；
+        // 本回合首个非 final-only 请求携带）。此前 fail-soft 只记台账、无纠错信号——真机
+        // 2026-11-20：`</tf-*>` 同一会话两度落进正文，模型全程不知道这是错形态。
+        if (event.reason.startsWith('stray-close-tag') && !this.#strayCloseGuided) {
+          this.#strayCloseGuided = true;
+          this.#strayCloseNudge = malformedCloserNudge(event.raw);
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'malformed-closer-guidance', detail: `第一次畸形闭合（${event.reason}）→ 挂定向纠错注入` });
+          this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'malformed-closer-guidance', reason: event.reason });
+        }
         break;
       case 'truncated':
         this.#record({ seq: ++DRIVER_SEQ, kind: 'truncated', raw: event.raw, reason: event.reason });

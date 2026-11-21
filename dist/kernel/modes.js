@@ -108,7 +108,7 @@ export const MODES                      = [
       enableCode: false,
       persistFallback: true,
       maxParallelToolCalls: 3,
-      maxReentries: 8,
+      maxReentries: 12,
     },
   },
   {
@@ -138,7 +138,7 @@ export const MODES                      = [
       enableCode: false,
       persistFallback: true,
       maxParallelToolCalls: 2,
-      maxReentries: 6,
+      maxReentries: 8,
       budgetTokens: 60_000,
     },
   },
@@ -169,7 +169,7 @@ export const MODES                      = [
       enableCode: false,
       persistFallback: true,
       maxParallelToolCalls: 1,
-      maxReentries: 12,
+      maxReentries: 16,
     },
   },
   {
@@ -199,7 +199,7 @@ export const MODES                      = [
       enableCode: true,
       persistFallback: true,
       maxParallelToolCalls: 3,
-      maxReentries: 10,
+      maxReentries: 14,
     },
   },
 ];
