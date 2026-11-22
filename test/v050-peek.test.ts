@@ -139,6 +139,40 @@ describe('0.5.0 取回：span 账本（kernel/obs.ts，D5 修复）', () => {
     const content = obs.peek(obs.resolveHandleRef('request:1')[0]!, 1, 2);
     assert.equal(content, 'seg-1\nseg-2');
   });
+
+  it('S7. 符号定位（Appendix B："peek 增符号定位"）：tf-peek symbol= → 顶层符号 ±40 行窗口', async () => {
+    const lines = Array.from({ length: 300 }, (_, i) => `filler ${i + 1}`);
+    lines[149] = 'export function buildIndex() {';
+    lines[150] = '  return 42;';
+    lines[151] = '}';
+    const h = makeHarness({
+      task: '符号定位演练：读大文件后按符号取回。',
+      streams: [
+        [blockStart, { type: 'text-delta', index: 0, text: '读。\n<tf-read path="s.txt" id="r1"/>\n' }, stop],
+        [blockStart, { type: 'text-delta', index: 0, text: '<tf-peek handle="obs:read:r1@v1" symbol="buildIndex" id="p1"/>\n' }, stop],
+        [blockStart, { type: 'text-delta', index: 0, text: '<tf-final id="f1" summary="完成：符号定位演练通过，buildIndex 返回 42。"/>\n' }, stop],
+      ],
+      files: { 's.txt': lines.join('\n') },
+      config: { maxInputTokens: 0, surfaceCompaction: false, observeBudgetTokens: 0 },
+    });
+    try {
+      const reason = await h.driver.runTurn();
+      assert.equal(reason.kind, 'completed', JSON.stringify(reason));
+      const peekRecords = h.driver.snapshot().records.filter((r) => r.kind === 'command' && r.id === 'p1') as Array<{ status: string; detail?: string }>;
+      const peek = peekRecords[peekRecords.length - 1];
+      assert.ok(peek !== undefined && peek.status === 'ok' && (peek.detail ?? '').includes('buildIndex'), JSON.stringify(peekRecords));
+      assert.ok(
+        h.wireRequests[2]!.contentTexts.some((t) => t.includes('buildIndex') && t.includes('L110-L191') === false && t.includes('return 42')),
+        '符号窗口取回正文（模型不必按行号猜测，§7.2 问题 1）',
+      );
+      // 内核面：找不到符号 → null（unknown-symbol 结构化失败，不静默）
+      const bare = new ObservationLedger();
+      const r = bare.observe({ tool: 'tf-read', ok: true, key: 'x', content: 'no symbols here', callId: 'c1' });
+      assert.equal(bare.peekBySymbol(r.handle!, 'nope', 1), null);
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -453,6 +453,41 @@ export class ObservationLedger {
     this.handlesByRequest.set(requestSeq, list);
   }
 
+  /**
+   * 0.5.0（Appendix B："peek 增符号定位与 span 去重"）：按符号定位取回——
+   * 在句柄内容中查找**顶层符号**定义行（TOP_LEVEL_SYMBOL_RE），返回 ±window 行窗口。
+   * 模型不再需要按行号猜测（§7.2 问题 1 的直接修复）；找不到返回 null（调用方按
+   * unknown-symbol 结构化上报，不静默）。计数口径与 peekWithLedger 一致
+   * （countRequest 由调用方决定——模型主动 tf-peek symbol 计入度量）。
+   */
+  peekBySymbol(handle: string, symbol: string, requestSeq: number, options?: { window?: number; countRequest?: boolean }): { from: number; to: number; text: string; line: number } | null {
+    const content = this.contentByHandle.get(handle);
+    if (content === undefined) return null;
+    this.peekedTotal++;
+    if (options?.countRequest !== false) {
+      this.peekRequestTotal++;
+      this.peekCountByHandle.set(handle, (this.peekCountByHandle.get(handle) ?? 0) + 1);
+    }
+    const lines = content.split('\n');
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+    const re = new RegExp(`\\b${escapeRegExp(symbol)}\\b`);
+    let found = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (TOP_LEVEL_SYMBOL_RE.test(lines[i]!) && re.test(lines[i]!)) {
+        found = i;
+        break;
+      }
+    }
+    if (found < 0) return null;
+    const window = Math.max(1, options?.window ?? 40);
+    const from = Math.max(1, found + 1 - window);
+    const to = Math.min(lines.length, found + 1 + window);
+    const text = lines.slice(from - 1, to).join('\n');
+    this.derefBytes += Buffer.byteLength(text, 'utf8');
+    this.injectedTotal++;
+    return { from, to, text, line: found + 1 };
+  }
+
   /** 解析 handle 引用：'request:N' → 段句柄数组；普通句柄 → 原样单元素。 */
   resolveHandleRef(ref: string): string[] {
     const m = /^request:(\d+)$/.exec(ref.trim());
@@ -831,4 +866,14 @@ export function readFeedbackPlan(
     return { kind: 'index', text: renderReadIndex(content, { delivered }) };
   }
   return { kind: 'inline', text: content };
+}
+
+/**
+ * 0.5.0（Appendix B："peek 增符号定位与 span 去重"）：按符号定位取回——
+ * 在句柄内容中查找顶层符号定义行（TOP_LEVEL_SYMBOL_RE），返回 ±window 行窗口。
+ * 模型不再需要按行号猜测（§7.2 问题 1 的直接修复）；找不到返回 null（调用方按
+ * unknown-symbol 结构化上报，不静默）。
+ */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

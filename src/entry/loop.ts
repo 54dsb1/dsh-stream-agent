@@ -370,6 +370,11 @@ export interface StreamDriverConfig {
   /** 0.5.0：观测预算阈值（token；默认 60,000）。任务级花费（严格口径，不含 cacheRead）
    *  超阈值写 warn 与报表，**不改变执行行为**（D7 修复落点）。 */
   observeBudgetTokens?: number;
+  /** 0.5.0（附录 A）：taskBudget = 任务级便捷写法的会话级初始预算。 */
+  taskBudget?: { maxSteps?: number; maxInputTokens?: number } | null;
+  /** 0.5.0（§6.2）：loop 接管优先级（默认 100；诊断展示用——setFactory 是单槽，优先级
+   *  不参与仲裁，只在控制状态/横幅里如实展示）。 */
+  takeoverPriority?: number;
   /** 饥饿防线阈值（透传 obs.ts） */
   starvationThreshold?: number;
   /** 原生工具 schema 文本（双通道：声明给模型的可用原生工具；缺省 = 协议独占） */
@@ -1407,6 +1412,11 @@ export class SingleStreamDriver {
     });
     this.#warn = ports.onWarning ?? (() => {});
     this.#gate = ports.gate;
+    // 0.5.0（附录 A）：taskBudget 配置 = 会话级预算初始值（任务指令可收窄，不可突破装配上限）
+    if (config.taskBudget !== undefined && config.taskBudget !== null) {
+      if (typeof config.taskBudget.maxSteps === 'number') this.#sessionBudget.maxSteps = config.taskBudget.maxSteps;
+      if (typeof config.taskBudget.maxInputTokens === 'number') this.#sessionBudget.maxInputTokens = config.taskBudget.maxInputTokens;
+    }
   }
 
   /** 注入 ledger 通道（探针 C 定案的 plugin:tf-agent/* 落盘口；缺省只进内存 records）。 */
@@ -1555,7 +1565,7 @@ export class SingleStreamDriver {
     return { ok: true };
   }
 
-  /** 会话级预算（setBudget 落点；与档位值合成生效值）。 */
+  /** 会话级预算（setBudget 落点；与档位值合成生效值）。构造时从 config.taskBudget 初始化。 */
   #sessionBudget: { maxSteps?: number; maxInputTokens?: number } = {};
 
   /** 旧模式别名（0.5.x 保留，0.6.0 移除）：legacy mode → (channel, tier) 两路排队。 */
@@ -3635,10 +3645,50 @@ export class SingleStreamDriver {
     // ---- tf-peek：内核 obs 直接取回（need_result 通道；0.5.0 走 span 账本 + 回合预算）----
     if (cmd.name === 'tf-peek') {
       const handle = cmd.attrs['handle'] ?? '';
+      const symbol = cmd.attrs['symbol'];
       const from = Number(cmd.attrs['from_line'] ?? '1');
       const to = cmd.attrs['to_line'] === undefined ? Number.MAX_SAFE_INTEGER : Number(cmd.attrs['to_line']);
       // 0.5.0（§5.2）：handle 支持 request:N 别名（长上下文压缩段的取回地址）
       const handleCandidates = this.#obs.resolveHandleRef(handle);
+      // 0.5.0（Appendix B）：symbol 属性 → 符号定位取回（±40 行窗口；§7.2 问题 1 修复）。
+      // 符号命中按窗口区间走 span 账本（recordDelivered 由 peek 结果注入时统一登记）。
+      if (symbol !== undefined && symbol !== '') {
+        const symbolHit = handleCandidates
+          .map((h) => this.#obs.peekBySymbol(h, symbol, this.#requestCount))
+          .find((r) => r !== null) ?? null;
+        if (symbolHit === null) {
+          const workInFlight = [...this.#commands.values()].some(
+            (r) => r.cmd.name !== 'tf-peek' && (r.status === 'pending' || r.status === 'dispatched'),
+          );
+          if (workInFlight) {
+            rec.status = 'dispatched';
+            rec.detail = 'deferred: handle/symbol 未就绪，流末重试';
+            this.#deferredPeeks.push({ rec, turn, step });
+            this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'dispatched', detail: rec.detail });
+            return;
+          }
+          rec.status = 'failed';
+          rec.detail = `unknown-symbol:${symbol}（handle=${handle}）——用 tf-grep 先定位符号所在文件，或核对 handle`;
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+          this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+          return;
+        }
+        if (this.#cfg.peekBudgetChars > 0 && symbolHit.text.length > this.#cfg.peekBudgetChars - this.#peekBudgetUsed) {
+          const budgetLine = `[budget] 本回合取回已达上限（${this.#cfg.peekBudgetChars} 字符，已用 ${this.#peekBudgetUsed}）。请先用 tf-grep 缩小范围，或在下回合继续。`;
+          rec.status = 'ok';
+          rec.output = budgetLine;
+          rec.detail = 'peek-budget-exhausted';
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+          return;
+        }
+        rec.status = 'ok';
+        rec.output = `L${symbolHit.from}-${symbolHit.to}（符号 ${symbol} 定义于 L${symbolHit.line}，±40 行窗口）\n${symbolHit.text}`;
+        rec.detail = `${symbolHit.text.length} chars（symbol=${symbol} → L${symbolHit.line}）`;
+        this.#peekBudgetUsed += symbolHit.text.length;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', handle: handleCandidates[0] ?? handle, detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', handle, symbol: symbol, line: symbolHit.line, chars: symbolHit.text.length });
+        return;
+      }
       const spanResult = handleCandidates.length > 0 ? this.#obs.peekWithLedger(handleCandidates[0]!, from, to, this.#requestCount) : null;
       const content = spanResult === null
         ? (handleCandidates.length > 1 ? handleCandidates.map((h) => this.#obs.peek(h, from, to)).find((c) => c !== null) ?? null : null)
@@ -5783,6 +5833,19 @@ export interface LoopEntryConfig {
   takeoverOnConflict?: 'degrade' | 'refuse';
   /** 代码通道来源（§5.2）：'auto'（默认，按探测）/ 'preset' / 'bridge'（显式绕过探测） */
   codeChannelSource?: 'auto' | 'preset' | 'bridge';
+  /** 0.5.0（§6.4 C4）：配置键命名空间——具名写法 `streamAgent: { channel, tier, lang, ... }`。
+   *  根级别键（channel/tier/lang/mode）保留一个 minor 作别名（0.6.0 移除根级歧义键）；
+   *  命名空间键与根级键同时出现时，根级显式值优先（与"显式压过别名"一致）。 */
+  streamAgent?: {
+    channel?: string;
+    tier?: string;
+    lang?: string;
+    /** 旧模式值别名（同根级 mode） */
+    mode?: string;
+  };
+  /** 0.5.0（附录 A）：任务级便捷写法的会话级默认（{ maxSteps?, maxInputTokens? }）。
+   *  null/缺省 = 用档位值；任务指令与 setBudget 可收窄（不可突破装配上限）。 */
+  taskBudget?: { maxSteps?: number; maxInputTokens?: number } | null;
   /** 任务级 token 预算（显式设置时阶梯生效——基数已修复为任务起点；缺省仅观测告警） */
   budgetTokens?: number;
   /** 观测预算阈值（token；默认 60k；仅告警与报表——D7） */
@@ -5981,8 +6044,15 @@ export default function apply(ctx: {
   const stateRoot = resolveStateDir(config.stateDir);
   // 控制状态（0.5.0 两轴）：显式 config（channel/tier，旧 mode 走别名 + warn）
   // > STREAM_AGENT_CHANNEL/STREAM_AGENT_TIER（旧 STREAM_AGENT_MODE 走别名）> control.json > 默认。
+  // §6.4 命名空间：streamAgent.{channel,tier,lang,mode} 为具名写法；根级别名保留一个 minor。
+  const ns = config.streamAgent ?? {};
   const control = resolveControlState(
-    { channel: config.channel, tier: config.tier, lang: config.lang, mode: config.mode },
+    {
+      channel: config.channel ?? ns.channel,
+      tier: config.tier ?? ns.tier,
+      lang: config.lang ?? ns.lang,
+      mode: config.mode ?? ns.mode,
+    },
     config.stateDir,
     warning,
   );
@@ -6107,6 +6177,8 @@ export default function apply(ctx: {
         ...(codeSourceProbe !== null ? { codeSource: codeSourceProbe } : {}),
         // 观测预算（D7：只告警不改行为）
         observeBudgetTokens: config.observeBudgetTokens,
+        // 0.5.0（附录 A）：taskBudget = 任务级便捷写法的会话级默认
+        ...(config.taskBudget === undefined || config.taskBudget === null ? {} : { taskBudget: config.taskBudget }),
         maxParallelToolCalls: live.maxParallelToolCalls,
         maxReentries: live.maxReentries,
         streamIdleTimeoutMs: config.streamIdleTimeoutMs,
@@ -6281,6 +6353,7 @@ export default function apply(ctx: {
       langSource: control.langSource,
       langLocked: control.langSource === 'config' || control.langSource === 'env',
       codeSource: codeSourceProbe,
+      takeoverPriority: config.takeoverPriority ?? 100,
       effective: {
         selfReadFeedback: live.selfReadFeedback,
         enableCode: live.enableCode === undefined ? false : live.enableCode,
@@ -6400,7 +6473,7 @@ export default function apply(ctx: {
     const codeState = degradedSidecar
       ? 'loop=sidecar(degraded)'
       : `channel=${control.channel} source=${codeSourceProbe ?? '-'} tier=${control.tier}`;
-    console.error(`[stream-loop] ${degradedSidecar ? 'TAKEOVER-DEGRADED: sidecar mode（另一 loop 插件已接管）' : 'TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch)'} · ${codeState} · executor=${codeExecutor === undefined ? 'native' : 'bridge-available'} · profile=${profileName}`);
+    console.error(`[stream-loop] ${degradedSidecar ? 'TAKEOVER-DEGRADED: sidecar mode（另一 loop 插件已接管）' : 'TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch)'} · ${codeState} · executor=${codeExecutor === undefined ? 'native' : 'bridge-available'} · priority=${config.takeoverPriority ?? 100} · profile=${profileName}`);
   }
 
   // 会话投影注册（桌面端硬依赖，内建 agent-loop 在 Service.init 注册——dsh-agent-loop rc.3:50110）：

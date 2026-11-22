@@ -99,7 +99,7 @@ const COMMAND_SCHEMAS                                                 = {
   'tf-grep': { required: ['pattern'], optional: ['path', 'include'], hasBody: false },
   'tf-glob': { required: ['pattern'], optional: ['path'], hasBody: false },
   'tf-bash': { required: ['cmd'], optional: [], hasBody: false },
-  'tf-peek': { required: ['handle'], optional: ['from_line', 'to_line'], hasBody: false },
+  'tf-peek': { required: ['handle'], optional: ['from_line', 'to_line', 'symbol'], hasBody: false },
   'tf-final': { required: [], optional: ['summary'], hasBody: false },
   // F5：计划与验收——body 按行声明验收项（`- [id] 描述`）；计划状态在驱动器（宿主侧）持有，
   // 请求只注差分；tf-final 在存在未验证验收项时判定为过早。

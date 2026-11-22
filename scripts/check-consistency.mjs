@@ -138,6 +138,20 @@ const presetRows = insertRows(join(pkgRoot, 'preset.yml'));
   notes.push(`检查4 README 命令表/工具面装配断言：通过（dist ${distCount} 个文件，README 数字由 npm test 实测回填）`);
 }
 
+// ---- 检查 7（0.5.0 R10 对策）：NOTICE 与依赖清单一致 ----
+{
+  const noticePath = join(pkgRoot, 'NOTICE');
+  if (!existsSync(noticePath)) {
+    failures.push('检查7 缺 NOTICE 文件（R10：归属漏项 = 高影响，必须有两栏制登记处）');
+  } else {
+    const notice = readFileSync(noticePath, 'utf8');
+    for (const required of ['xuxiang/thinkflow', 'MIT', 'dsh-ptc-runtime', 'dsh-tool-executor-ptc', '依赖与派生分栏']) {
+      if (!notice.includes(required)) failures.push(`检查7 NOTICE 缺条目: ${required}（R10 两栏制核对）`);
+    }
+  }
+  notes.push('检查7 NOTICE 一致性：thinkflow 派生 / PTC 依赖分栏 / 两栏制条目齐备');
+}
+
 // ---- 检查 5（v0.4.0 G2）：协议命令表 ≤ 14（11 tf-* 基础 + tf-call + tf-ask + tf-skill 上限）----
 {
   const parserSrc = readFileSync(join(pkgRoot, 'src', 'kernel', 'parser.ts'), 'utf8');
@@ -190,4 +204,4 @@ if (failures.length > 0) {
   for (const f of failures) console.error(`  - ${f}`);
   process.exit(1);
 }
-console.log('[check] 6/6 全绿：entry 集 / inject / 装载顺序 / README 数字与命令表 / 命令表上限 / 矩阵一致。');
+console.log('[check] 7/7 全绿：entry 集 / inject / 装载顺序 / README 数字与命令表 / 命令表上限 / 矩阵一致 / NOTICE 一致。');
