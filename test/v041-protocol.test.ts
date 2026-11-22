@@ -35,8 +35,8 @@ import type { ToolsServiceLike } from '../src/entry/tool-surface.ts';
 
 const GOLDEN = readFileSync(join(fileURLToPath(new URL('.', import.meta.url)), 'golden', 'v040-protocol.txt'), 'utf8');
 
-test('C1. 金样逐字节：composeProtocolText() === v0.4.0-beta.1 DEFAULT_PROTOCOL_TEXT', () => {
-  assert.equal(composeProtocolText(), GOLDEN, '缺省组装必须与 v040 原文逐字节一致（缓存零回归）');
+test('C1. 金样逐字节：composeProtocolText() === PROTOCOL-v1 金样（0.5.0 有意变更：新增 peek 段）', () => {
+  assert.equal(composeProtocolText(), GOLDEN, '缺省组装必须与金样逐字节一致（缓存零回归；改协议先更新金样并记录变更）');
 });
 
 test('C2. 入口重导出层：DEFAULT_PROTOCOL_TEXT === 金样', () => {
@@ -78,13 +78,14 @@ test('C7. fail-fast：未知段 id / 未知档位抛错，不静默', () => {
 });
 
 test('C8. 字符数回归护栏：full/lean/minimal 实测值钉死（改文本必须显式更新金样与本断言）', () => {
-  assert.equal(composeProtocolText().length, 2836);
-  assert.equal(composeProtocolText({ level: 'lean' }).length, 2324);
-  assert.equal(composeProtocolText({ level: 'minimal' }).length, 1446);
+  // 0.5.0：新增 peek 段（§7.3(4) 协议引导，302 字符）——金样随 PROTOCOL-v1 更新（有意变更）
+  assert.equal(composeProtocolText().length, 3138);
+  assert.equal(composeProtocolText({ level: 'lean' }).length, 2626);
+  assert.equal(composeProtocolText({ level: 'minimal' }).length, 1748);
   // 关键语义锚点在三个档位里都必须存活
   for (const level of ['full', 'lean', 'minimal'] as const) {
     const text = composeProtocolText({ level });
-    for (const anchor of ['<tf-write', '<tf-read', '<tf-edit', '<tf-peek', '<tf-final', '[tf-stream:error]']) {
+    for (const anchor of ['<tf-write', '<tf-read', '<tf-edit', '<tf-peek', '<tf-final', '[tf-stream:error]', '## 取回纪律']) {
       assert.ok(text.includes(anchor), `${level} 缺关键锚点: ${anchor}`);
     }
   }
@@ -99,8 +100,8 @@ test('C9. asProtocolLevel：未知值归一 full（fail-open）；lean/minimal �
 
 test('C10. protocolPreview：逐段统计与来源如实标注（同文段标 full）', () => {
   const preview = protocolPreview({ level: 'minimal' });
-  assert.equal(preview.chars, 1446);
-  assert.equal(preview.fullChars, 2836);
+  assert.equal(preview.chars, 1748);
+  assert.equal(preview.fullChars, 3138);
   assert.equal(preview.savedChars, 1390);
   assert.equal(preview.sections.length, PROTOCOL_SECTION_IDS.length);
   const plan = preview.sections.find((s) => s.id === 'plan');
@@ -110,9 +111,11 @@ test('C10. protocolPreview：逐段统计与来源如实标注（同文段标 fu
   const selfread = preview.sections.find((s) => s.id === 'selfread');
   assert.equal(selfread!.included, false);
   assert.equal(selfread!.chars, null);
-  // LEVEL_SECTIONS 口径：full/lean 全 7 段，minimal 5 段
-  assert.equal(LEVEL_SECTIONS.full.length, 7);
-  assert.equal(LEVEL_SECTIONS.minimal.length, 5);
+  const peek = preview.sections.find((s) => s.id === 'peek');
+  assert.equal(peek!.included, true, '0.5.0：peek 段三档都在（取回纪律）');
+  // LEVEL_SECTIONS 口径：full/lean 全 8 段，minimal 6 段
+  assert.equal(LEVEL_SECTIONS.full.length, 8);
+  assert.equal(LEVEL_SECTIONS.minimal.length, 6);
 });
 
 // ---------------------------------------------------------------- D 组：驱动器 E2E
@@ -263,13 +266,13 @@ test('D4. E2E：sections={timing:false} 落进首请求；其余缺省行为逐�
   }
 });
 
-test('D5. E2E：缺省构造的首请求前缀与 0.4.0-beta.1 一致（plan/selfread/timing/invariants 全在）', async () => {
+test('D5. E2E：缺省构造的首请求前缀与 PROTOCOL-v1 金样一致（plan/selfread/timing/peek/invariants 全在）', async () => {
   const cap = await runFirstRequest({ provider: 'mock', model: 'mock-v041' });
   try {
-    for (const anchor of ['## 计划与验收', '## 回验纪律', '## 时序与重发规则', '## tf-call 通用调用', '不变量：历史消息只增不改']) {
+    for (const anchor of ['## 计划与验收', '## 回验纪律', '## 时序与重发规则', '## tf-call 通用调用', '## 取回纪律', '不变量：历史消息只增不改']) {
       assert.ok(cap.firstSystem.includes(anchor), `缺省回归锚点缺失: ${anchor}`);
     }
-    assert.ok(cap.firstSystem.includes(GOLDEN.slice(0, 80)), '协议开头逐字节来自 v040 原文');
+    assert.ok(cap.firstSystem.includes(GOLDEN.slice(0, 80)), '协议开头逐字节来自金样原文');
   } finally {
     cap.cleanup();
   }
@@ -294,18 +297,19 @@ test('E1. parseSectionFlags：布尔/开关词解析 + 非法值具名报错', (
 test('E2. protocolCommand：stats 与 --json；--stats-only 不含组装全文', () => {
   const zh = protocolCommand(['--level', 'minimal', '--stats-only'], 'zh');
   assert.equal(zh.code, 0);
-  assert.ok(zh.lines.some((l) => l.includes('合计 1981 字符')), 'minimal 基座 1446 + call 段 535（含连接符）');
-  assert.ok(zh.lines.some((l) => l.includes('省 1390 / 41.2%')), '对 full 缺省装配基准（3371）的节省实测');
+  // 0.5.0：minimal 基座 1748（含 peek 段）+ call 段 535（含连接符）
+  assert.ok(zh.lines.some((l) => l.includes('合计 2283 字符')), 'minimal 基座 1748 + call 段 535（含连接符）');
+  assert.ok(zh.lines.some((l) => l.includes('省 1390 / 37.8%')), '对 full 缺省装配基准（3673）的节省实测');
   assert.ok(!zh.lines.some((l) => l.includes('—— 组装全文 ——')), 'stats-only 不出全文');
 
   const noPlan = protocolCommand(['--level', 'minimal', '--no-plan', '--stats-only'], 'zh');
-  assert.ok(noPlan.lines.some((l) => l.includes('合计 1696 字符')), '再联动 enablePlan=false（去 plan 段）实测');
+  assert.ok(noPlan.lines.some((l) => l.includes('合计 1998 字符')), '再联动 enablePlan=false（去 plan 段）实测');
 
   const json = protocolCommand(['--level', 'lean', '--stats-only', '--json'], 'zh');
   const payload = JSON.parse(json.lines[0]!) as { level: string; sections: unknown[]; totalChars: number; savedChars: number };
   assert.equal(payload.level, 'lean');
-  assert.equal(payload.sections.length, 7);
-  assert.equal(payload.totalChars, 2324 + 535, 'lean 基座 + call 段（含连接符）');
+  assert.equal(payload.sections.length, 8);
+  assert.equal(payload.totalChars, 2626 + 535, 'lean 基座 + call 段（含连接符）');
 });
 
 test('E3. protocolCommand：错误档位/错误段开关 → code=2', () => {

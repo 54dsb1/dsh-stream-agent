@@ -24,10 +24,11 @@ R3 重跑后以同批双臂复算为准。
 | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 宿主  | DeepSeek Harness `0.2.2-rc.1`（类型锚点）/ `rc.3`（运行时实测）                                                                                                     |
 | 依赖  | 零 npm 依赖；Node ≥ 22.18（原生类型擦除）                                                                                                                           |
-| 测试  | 388 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力/会话格式/协议组件化/宿主一致性/缓存与计划持久性/前缀退路（含混合尾反例）与尺子回归）                                                              |
+| 测试  | 462 用例全绿（0.5.0：+五组 v050 回归——预算/通道/压缩/前缀/取回）|
+| 0.5.0 | **单插件双通道**：执行通道（标准/代码）× 上下文档位（轻/标准/深）两轴取代四档模式（旧值走别名，0.6.0 移除）；双旋钮预算（maxSteps/maxInputTokens）+ span 账本去重 + 行锚索引取回 + 确定性压缩与效果折叠 + 计划性换基。规范见 [PROTOCOL-v1.md](./PROTOCOL-v1.md)，通道矩阵见 [docs/channel-matrix.md](./docs/channel-matrix.md) | |
 | 形态  | 单 bundle 包 + **专用 profile**（`profiles/stream` 模板）；`dsh plugin remove` 整层消失、宿主 loop 原子恢复                                                          |
-| 控制栏 | `dsh-stream-agent bar`：四模式 + 中英切换 + 意图核对，装载时自动打印上手引导                                                                                       |
-| 桌面页 | 客户端左侧栏「控制栏 / Control bar」：状态 + 四模式 + 中英切换，**不改 Electron 壳**                                                                               |
+| 控制栏 | `dsh-stream-agent bar`：两区块（执行通道 × 上下文档位）+ 中英切换 + 意图核对，装载时自动打印上手引导                                                                                       |
+| 桌面页 | 客户端左侧栏「控制栏 / Control bar」：状态 + 两区块 + 运行状态行（N/换基/重复取回/摘要）+ 中英切换，**不改 Electron 壳**                                                                               |
 | 计量  | 七列计量（P0-10，§7.3 可外部复算）+ 四列同表 + 回放一致性对照臂 10/10 + 发布门禁 6 项                                                                                                             |
 | 发布  | GitHub [Releases](https://github.com/54dsb1/dsh-stream-agent/releases) · npm `@hugesb/dsh-stream-agent` **尚未发布**（当前唯一安装路径见 §2）                                                      |
 
@@ -91,7 +92,7 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 开发/验证用的临时叠加（不进 profile）仍可用：
 `dsh --profile headless --patch ./patches/takeover.yml headless "任务"`。
 
-## 3. 运行模式（控制栏四模式）
+## 3. 运行模式（0.5.0：两区块两轴）
 
 `dsh-stream-agent bar` 交互面板 / `dsh-stream-agent mode lean` / 桌面控制页三处同源
 （同一份 `kernel/modes.ts`）。模式只提供默认值；**装配里显式写的配置永远压过模式**。

@@ -1,0 +1,34 @@
+# NOTICE
+
+This product includes software derived from:
+
+1. xuxiang/thinkflow (MIT)
+   Copyright (c) 2026 沐雪清泽
+   移植范围：协议语义、解析器、压缩与回取策略（详见 docs/porting-matrix.md）
+   移植方式：Python → TypeScript 重写，非源码复制
+   上游地址：https://github.com/xuxiang/thinkflow
+
+2. @deepseek-ai/dsh-ptc-runtime, dsh-ptc-runtime-node, dsh-tool-executor-ptc (MIT)
+   Copyright (c) DeepSeek
+   使用方式：npm dependency（宿主装载），未修改（仅代码通道 bridge 使用 `ctx.ptcRuntime` 服务缝；
+   preset 通道由宿主 preset 装载 tool-executor-ptc，本插件不 import、不复制）
+
+---
+
+## 依赖与派生分栏
+
+| 类别 | 项目 | 许可 | 义务履行 |
+|---|---|---|---|
+| 派生（语义重写） | xuxiang/thinkflow 0.10.3（PROTOCOL 1.14）——parser / context / compaction / text_filter / output_store / delivery / task_plan / file_observations / feedback / recall / prompts / context_budget 等必搬模块的行为契约与测试向量 | MIT | 本 NOTICE 保留版权声明；逐模块移植清单见 docs/porting-matrix.md；规范面见 PROTOCOL-v1.md（thinkflow 列为参考实现） |
+| 依赖（运行时） | @deepseek-ai/dsh-ptc-runtime（TS，343 行） | MIT | 本 NOTICE；npm dependency，未修改 |
+| 依赖（运行时） | @deepseek-ai/dsh-ptc-runtime-node（TS，3,274 行） | MIT | 本 NOTICE；npm dependency（宿主侧），未修改 |
+| 依赖（宿主装载） | @deepseek-ai/dsh-tool-executor-ptc（TS，2,338 行） | MIT | 本 NOTICE；由宿主 PTC preset 装载，本插件 0 行复制 |
+| 宿主 | @deepseek-ai/dsh（0.2.2-rc.3）系列服务 | 各自许可 | duck-type 接缝（零静态 import）；接缝清单见 README |
+
+## 复制核对（CI 口径）
+
+- 上游 thinkflow：0 行源码复制（Python → TS 语义重写；测试向量在 test/ 内重述）。
+- PTC 三包：0 行复制（运行时依赖或宿主装载）。
+- 本插件自有代码行数核对：`git ls-files src/ | xargs wc -l`（Apache-2.0，见 LICENSE）。
+
+R10 风险对策：NOTICE 与依赖清单的一致性由 `scripts/check-consistency.mjs`（npm run check）核对；本文件的"依赖与派生分栏"为唯一归属登记处，新增依赖须同时更新本文件与 package.json。

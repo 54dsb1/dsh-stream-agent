@@ -782,7 +782,12 @@ describe('G. tf-peek need_result 通道', () => {
       // v0.2：小文件 read 直接反馈完整原文（上游"成功结果完整反馈一次"语义）
       assert.ok(req2.contentTexts.some((t) => t.includes('第一行 alpha') && t.includes('第四行 delta')), '请求 2 应包含 read 完整原文反馈');
       const req3 = harness.wireRequests[2]!;
-      assert.ok(req3.contentTexts.some((t) => t.includes('[tf-stream:peek') && t.includes('第一行 alpha')), '请求 3 应注入 peek 结果');
+      // 0.5.0（§7.3(2) span 账本 / D5 修复）：全文已在请求 2 投递且内容未变化——
+      // 对同一区间的显式 peek 命中账本，只回一行 [unchanged]，不重复投递正文。
+      assert.ok(req3.contentTexts.some((t) => t.includes('[tf-stream:peek')), '请求 3 应注入 peek 结果块');
+      assert.ok(req3.contentTexts.some((t) => t.includes('[unchanged]') && t.includes('obs:read:r1@v1')), '命中已投递区间 → [unchanged] 一行（不重发正文）');
+      // 历史里的观测块（0.4.2 durable 转正）合法携带原文；D5 断言的是"peek 不再重发正文"，
+      // 由上一行的 [unchanged] 断言覆盖。
 
       const counters = snap.counters();
       assert.equal(counters.peeked, 2, 'v0.2：完整反馈自动 peek 1 次 + 模型 peek 1 次');
@@ -1029,7 +1034,8 @@ describe('H. AgentFactory 生命周期（fake host）', () => {
     assert.ok(entry.factory !== undefined);
     entry.dispose();
 
-    // 重复注册 fail-fast（探针 A：重复注册抛 "an agent factory is already registered"）
+    // 重复注册（0.5.0 §6.2）：默认 takeoverOnConflict='degrade' → 不抛错，转 sidecar
+    // （markDegrade 登记，告警不静默）；显式 'refuse' → 保留 0.4.x 的 fail-fast 语义。
     const conflictingCtx = {
       ...hostCtx,
       agents: {
@@ -1038,7 +1044,10 @@ describe('H. AgentFactory 生命周期（fake host）', () => {
         },
       },
     };
-    assert.throws(() => applyLoopEntry(conflictingCtx, {}), /already registered/);
+    const degradedEntry = applyLoopEntry(conflictingCtx, {});
+    assert.equal(registered.length, 1, 'degrade 模式不重复注册（让位 sidecar）');
+    degradedEntry.dispose();
+    assert.throws(() => applyLoopEntry(conflictingCtx, { takeoverOnConflict: 'refuse' }), /already registered/, 'refuse 模式保留 fail-fast');
 
     // llm 缺失 → fail-fast
     assert.throws(() => applyLoopEntry({ agents: hostCtx.agents, get: () => undefined }, {}), /ctx\.llm\.stream 不可用/);

@@ -130,11 +130,12 @@ const presetRows = insertRows(join(pkgRoot, 'preset.yml'));
     for (const cmd of ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan', 'tf-call', 'tf-ask', 'tf-skill']) {
       if (!text.includes(cmd)) failures.push(`检查4 ${readmePath.split(/[\\/]/).pop()} 缺命令 ${cmd}`);
     }
-    // K1 装配断言：enableCode: false 必须在 patch/preset，README 不得宣称默认开启
+    // 0.5.0 装配断言（取代 0.4.x 的 enableCode: false K1 断言——通道语义由 channel +
+    // 三来源判定接管；工具面策略默认 reserved-only（D2 修复）必须在装配里如实声明）：
     const patchText = readFileSync(join(pkgRoot, 'cordis.patch.yml'), 'utf8');
-    if (!patchText.includes('enableCode: false')) failures.push('检查4 cordis.patch.yml 缺 enableCode: false（K1 装配断言）');
+    if (!patchText.includes('surfacePolicy: reserved-only')) failures.push('检查4 cordis.patch.yml 缺 surfacePolicy: reserved-only（0.5.0 工具面装配断言）');
   }
-  notes.push(`检查4 README 命令表/enableCode 断言：通过（dist ${distCount} 个文件，README 数字由 npm test 实测回填）`);
+  notes.push(`检查4 README 命令表/工具面装配断言：通过（dist ${distCount} 个文件，README 数字由 npm test 实测回填）`);
 }
 
 // ---- 检查 5（v0.4.0 G2）：协议命令表 ≤ 14（11 tf-* 基础 + tf-call + tf-ask + tf-skill 上限）----

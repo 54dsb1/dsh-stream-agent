@@ -15,7 +15,7 @@
 // 保证 CLI 与插件装载横幅的中英文案、宽度、语义完全一致）。
 
 import { readdirSync } from 'node:fs';
-import { MODES, getMode, isModeId } from '../kernel/modes.ts';
+import { CHANNEL_SPECS, TIER_SPECS, getChannel, getTier, isChannelId, isLegacyModeId, isTierId, resolveLegacyMode } from '../kernel/modes.ts';
 import { PROTOCOL_LEVELS, PROTOCOL_SECTION_IDS, protocolPreview, SECTION_TEXTS } from '../kernel/protocol.ts';
 import type { ComposeProtocolOptions, ProtocolLevel, ProtocolSectionId } from '../kernel/protocol.ts';
 import { DEFAULT_CODE_PROTOCOL_SECTION, DEFAULT_CALL_PROTOCOL_SECTION } from './loop.ts';
@@ -60,21 +60,20 @@ function usage(lang: Lang): string[] {
   return [
     zh ? '用法' : 'Usage',
     '  dsh-stream-agent [bar] [--once] [--json]    ' + (zh ? '控制栏（交互 / 一次性）' : 'control bar (interactive / once)'),
-    '  dsh-stream-agent status [--json]            ' + (zh ? '当前模式与语言' : 'current mode and language'),
+    '  dsh-stream-agent status [--json]            ' + (zh ? '当前通道/档位与语言' : 'current channel/tier and language'),
+    '  dsh-stream-agent channel <standard|code>    ' + (zh ? '① 执行通道' : 'block A: execution channel'),
+    '  dsh-stream-agent tier <light|standard|deep> ' + (zh ? '② 上下文档位（只改数值）' : 'block B: context tier (numbers only)'),
     '  dsh-stream-agent mode <balanced|lean|compat|power>',
+    '        ' + (zh ? '旧模式值（0.5.x 别名 → channel/tier，0.6.0 移除）' : 'legacy mode value (0.5.x alias → channel/tier, removed in 0.6.0)'),
     '  dsh-stream-agent lang <zh|en>',
     '  dsh-stream-agent intents [--ack <sessionId>] ' + (zh ? 'F6 意图核对：列出"有意图无回执"（--ack 人工确认后闭合）' : 'F6 intent triage: list intents without receipts (--ack to close)'),
     '  dsh-stream-agent protocol [--level <full|lean|minimal>] [--sections plan=off,...]',
-    '        ' + (zh ? 'v0.4.1 协议组装预览：逐段字符数 + 总量对比 full + 组装全文（--stats-only 只看数字）'
-      : 'v0.4.1 protocol composition preview: per-section chars, total vs full, composed text (--stats-only)'),
-    '  dsh-stream-agent help                       ' + (zh ? '全模式指南' : 'full mode guide'),
+    '        ' + (zh ? '协议组装预览：逐段字符数 + 总量对比 full + 组装全文（--stats-only 只看数字）'
+      : 'protocol composition preview: per-section chars, total vs full, composed text (--stats-only)'),
+    '  dsh-stream-agent help                       ' + (zh ? '两区块指南' : 'two-block guide'),
     '',
     zh ? '状态文件' : 'State file',
     `  ${controlFileOf()}`,
-    '',
-    zh
-      ? '发布提示：v0.2.1 的 npm 源最多 3 天内可用；在此之前请用仓库路径安装'
-      : 'Release note: the v0.2.1 npm source lands within 3 days; install from the repo path until then',
   ];
 }
 
@@ -296,22 +295,68 @@ function main(argv: readonly string[]): number {
       return 0;
     }
 
-    case 'mode': {
+    case 'channel': {
+      // 0.5.0 区块 A：执行通道（standard / code）
       const target = rest[1];
       if (target === undefined) {
-        print([`${t('mode', state.lang)}: ${MODES.map((m) => `${m.order}=${m.id}`).join('  ')}`]);
+        print([`${t('blockA', state.lang)}: ${CHANNEL_SPECS.map((c) => `${c.order}=${c.id}`).join('  ')}`]);
         return 1;
       }
-      if (!isModeId(target)) {
-        print([t('unknownMode', state.lang)]);
+      if (!isChannelId(target)) {
+        print([t('unknownChannel', state.lang)]);
         return 2;
       }
-      const next: ControlState = { ...state, mode: target };
+      const next: ControlState = { ...state, channel: target };
       const file = save(next);
       if (json) {
         process.stdout.write(`${renderJson(next, { version: VERSION })}\n`);
       } else {
-        print([`${t('mode', state.lang)} → ${getMode(target).order} ${getMode(target).label[state.lang]}（${target}）`,
+        print([`${t('blockA', state.lang)} → ${getChannel(target).label[state.lang]}（${target}）`,
+          `${t('saved', state.lang)}: ${file}`]);
+      }
+      return 0;
+    }
+
+    case 'tier': {
+      // 0.5.0 区块 B：上下文档位（light / standard / deep——只改数值）
+      const target = rest[1];
+      if (target === undefined) {
+        print([`${t('blockB', state.lang)}: ${TIER_SPECS.map((x) => `${x.order + 2}=${x.id}`).join('  ')}`]);
+        return 1;
+      }
+      if (!isTierId(target)) {
+        print([t('unknownTier', state.lang)]);
+        return 2;
+      }
+      const next: ControlState = { ...state, tier: target };
+      const file = save(next);
+      if (json) {
+        process.stdout.write(`${renderJson(next, { version: VERSION })}\n`);
+      } else {
+        print([`${t('blockB', state.lang)} → ${getTier(target).label[state.lang]}（${target}）`,
+          `${t('saved', state.lang)}: ${file}`]);
+      }
+      return 0;
+    }
+
+    case 'mode': {
+      // 0.5.x 别名（0.6.0 移除）：旧模式值 → (channel, tier)，输出一行 warn
+      const target = rest[1];
+      if (target === undefined) {
+        print([`${t('mode', state.lang)}: balanced / lean / compat / power（${state.lang === 'zh' ? '旧值，走别名' : 'legacy values, aliased'}）`]);
+        return 1;
+      }
+      if (!isLegacyModeId(target)) {
+        print([`${t('unknownChannel', state.lang)} / ${t('unknownTier', state.lang)}（${state.lang === 'zh' ? '旧模式值可选: balanced|lean|compat|power' : 'legacy values: balanced|lean|compat|power'}）`]);
+        return 2;
+      }
+      const mapped = resolveLegacyMode(target);
+      const next: ControlState = { ...state, channel: mapped.channel, tier: mapped.tier };
+      const file = save(next);
+      if (json) {
+        process.stdout.write(`${renderJson(next, { version: VERSION })}\n`);
+      } else {
+        print([`${state.lang === 'zh' ? '旧模式' : 'legacy mode'} ${target} → channel=${mapped.channel} tier=${mapped.tier}（${state.lang === 'zh' ? '别名映射；0.5.x 保留，0.6.0 移除' : 'aliased; kept in 0.5.x, removed in 0.6.0'}）`,
           `${t('saved', state.lang)}: ${file}`]);
       }
       return 0;
@@ -400,7 +445,7 @@ function main(argv: readonly string[]): number {
     }
 
     default:
-      print([`${t('usage', state.lang)}: dsh-stream-agent [bar|status|mode|lang|intents|protocol|help]`, t('unknownMode', state.lang)]);
+      print([`${t('usage', state.lang)}: dsh-stream-agent [bar|status|channel|tier|mode|lang|intents|protocol|help]`]);
       return 2;
   }
 }

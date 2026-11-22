@@ -5,15 +5,19 @@
  *   [ 稳定前缀 ]  system 提示 + tf-* 协议说明 + 工具 schema + 任务不变量
  *                 —— 构造期冻结，逐请求字节不变（结构性保证：只读，无任何写入路径）
  *   [ 追加区   ]  历史 assistant 消息 + 句柄目录增量（O3 差分注入）+ 回合冻结动态段（O4）
- *                 —— 只追加，永不改写（唯一的例外是显式记录的整块尾部丢弃）
+ *                 —— 只追加，永不改写（唯一的例外是显式记录的整块尾部丢弃 / 计划性换基）
  *   [ 易变尾   ]  高增益观测注入 + tf-peek 结果 + 动态上下文 + 失败结构化错误
  *                 —— 每请求整块重建，允许整块丢弃
  *
  * 前缀校验器（README 优化点 O6，fail-closed）：
  * - assertPrefixStable(prev, next)：逐消息逐字节比较，违反抛 PrefixBrokenError，不做静默修复；
  * - 只允许整块丢弃尾部（显式调用 truncateAppendTail，内部逐字节验证"只有尾部被丢弃"）；
- * - "压缩历史"请求 → 拒绝 + 降级为尾部截断 + 记录（红线 4：禁止智能压缩/摘要）；
- * - render() 内置 preflight：发送前对上一请求的稳定段做逐字节断言，违反直接抛错拒绝发送。
+ * - "压缩历史"请求 → 拒绝 + 降级为尾部截断 + 记录（红线 4：禁止智能压缩/摘要——
+ *   0.5.0 P3 起压缩走 kernel/compaction.ts 的确定性摘要 + dropAppendHead 合法通道）；
+ * - render() 内置 preflight：发送前对上一请求的稳定段做逐字节断言，违反直接抛错拒绝发送；
+ * - 0.5.0（§8.3 K8）：前缀非单调按三类分别处置，新增**计划性换基**（planned-rebase）
+ *   合法通道——surface replace / 段边界 / 通道切换产生的前缀断裂走 rebase()，重置基线
+ *   + 记账 + 模型侧可见（[tf-stream:context-rebased]），不采用"报错/重发"二分。
  *
  * 内核层纪律：零框架依赖、无 IO（时钟注入）。
  */
@@ -58,10 +62,12 @@ import { createHash } from 'node:crypto';
                                                                
 
 /** 策略事件记录（红线：不许静默）。compress-history-request = 违规拒绝（accepted:false）；
- *  segment-drop = F7 显式段边界（accepted:true——整块丢弃、前缀基线重置并记录）。 */
+ *  segment-drop = F7 显式段边界（accepted:true——整块丢弃、前缀基线重置并记录）；
+ *  planned-rebase = 0.5.0 计划性换基（§8.3：surface replace / dropAppendHead / 通道切换
+ *  产生的合法换基——重置基线、记账、模型侧可见，accepted:true）。 */
                                         
              
-                                                    
+                                                                       
                   
                     
                                          
@@ -77,11 +83,19 @@ import { createHash } from 'node:crypto';
 // 错误类型
 // ---------------------------------------------------------------------------
 
-/** v0.4.3（P0-6③）：前缀破坏的三类成因。判定式：error.index < error.stablePrefixLen
- *  → 'stable-drift'（稳定段漂移——装配被改写，最严重）；否则 'append-drift'
- *  （追加区/转正块漂移——转正纪律被破坏）；长度收缩不匹配时为 'shrink'
- *  （历史被销毁且未走段边界通道）。 */
-                                                                           
+/** v0.4.3（P0-6③）：前缀破坏的三类成因 + 0.5.0 计划性换基（§8.3 判定表）。
+ *  判定式：error.index < error.stablePrefixLen → 'stable-drift'（稳定段漂移——装配被改写，
+ *  最严重）；否则 'append-drift'（追加区/转正块漂移——转正纪律被破坏）；长度收缩不匹配
+ *  时为 'shrink'（历史被销毁且未走段边界通道）。
+ *  'planned-rebase' 永不作为断言失败抛出——计划性换基（surface replace / 段边界 /
+ *  通道切换）走 ContextRenderer.rebase() 显式通道：重置基线 + 记账 + 模型侧可见
+ *  （§8.3 K8：不采用"报错/重发"二分，宿主 surfaceOp:replace 是合法换基通道）。 */
+                                                                                              
+
+/** 0.5.0（§8.6 实现要求 1）：换基后的模型可见一行。 */
+export function contextRebasedLine(reason        )         {
+  return `[tf-stream:context-rebased] 本请求上下文已重建（原因：${reason}），缓存已重置，行为不变。`;
+}
 
 export class PrefixBrokenError extends Error {
            index        ;
@@ -298,7 +312,10 @@ function renderHandleDelta(delta                      )                {
 
 export class ContextRenderer {
   // 稳定前缀：构造期冻结。语言层面只读（readonly + Object.freeze），不存在任何写入路径。
-           #prefix                          ;
+  // 0.5.0：唯一的改写入口是 rebase()（计划性换基，§8.3——记账 + 显式，绝非静默）。
+  #prefix                          ;
+  /** 前缀四段（rebase 的缺省来源：未提供的段沿用当前值；rebase 是唯一改写口）。 */
+  #prefixParts                                                                               ;
   #appendBlocks                = [];
   #tailBlocks              = [];
   /** O4：逐请求变化的动态字段（时间戳等），归易变尾，每请求重建。 */
@@ -310,6 +327,12 @@ export class ContextRenderer {
 
   constructor(opts                        ) {
     // 稳定前缀内容：四段确定性拼接，构造后字节冻结
+    this.#prefixParts = {
+      system: opts.system,
+      protocol: opts.protocol,
+      toolSchemas: opts.toolSchemas,
+      invariants: opts.invariants,
+    };
     const content = [
       opts.system,
       opts.protocol,
@@ -517,8 +540,11 @@ export class ContextRenderer {
   }
 
   /**
-   * 模型请求"压缩历史"：一律拒绝（红线 4 禁止智能压缩/摘要/改写中间内容），
+   * 模型请求"压缩历史"：0.4.x 一律拒绝（红线 4 禁止智能压缩/摘要/改写中间内容），
    * 降级为整块尾部截断并记录。绝不静默。
+   * 0.5.0 P3：合法压缩走 dropAppendHead + kernel/compaction.ts 的确定性摘要——
+   * 摘要替换被丢弃块（compression 后追加，原文句柄化），本方法保留为"模型侧主动
+   * 请求压缩"的拒绝面（模型不能自己触发换基）。
    */
   requestHistoryCompression(req   
                     
@@ -541,6 +567,62 @@ export class ContextRenderer {
         (dropped > 0
           ? `；降级为整块尾部截断 ${dropped} 块`
           : '；未做任何丢弃'),
+    };
+    this.#policyLog.push(record);
+    if (this.#policySink) this.#policySink(record);
+    return record;
+  }
+
+  // ------------------------------------------------------------- 0.5.0 计划性换基
+
+  /**
+   * 0.5.0（§8.3 K8）：计划性换基——前缀非单调的第三类处置（合法路径，不是报错也不是
+   * 重发）。适用：surface replace 压缩 / 段边界 / **通道切换**（工具面与协议段同时变化，
+   * 必然破前缀；切换在任务边界执行，换基一次）。
+   *
+   * 行为：
+   *  1. 提供了新前缀组件（system/protocol/toolSchemas/invariants 任一）→ 重建稳定前缀
+   *     （通道切换 = 协议段变化，新前缀从此请求起生效）；
+   *  2. 重置 preflight 基线（#lastStable = null）——下一请求是新时代第一条；
+   *  3. policyLog 记 planned-rebase（accepted:true，绝不静默）。
+   *
+   * 调用方负责：重置 wire 承诺基线（loop #lastRequest = null）、注入
+   * [tf-stream:context-rebased]（contextRebasedLine）、cache-reset 台账事件
+   * （cause / contextTokens / estimatedColdCost，§8.6 实现要求 2）。
+   */
+  rebase(req   
+                   
+                    
+                      
+                         
+                        
+                              
+                           
+   )                        {
+    const parts = {
+      system: req.system ?? this.#prefixParts.system,
+      protocol: req.protocol ?? this.#prefixParts.protocol,
+      toolSchemas: req.toolSchemas ?? this.#prefixParts.toolSchemas,
+      invariants: req.invariants ?? this.#prefixParts.invariants,
+    };
+    const changed = parts.system !== this.#prefixParts.system
+      || parts.protocol !== this.#prefixParts.protocol
+      || parts.toolSchemas !== this.#prefixParts.toolSchemas
+      || parts.invariants !== this.#prefixParts.invariants;
+    if (changed) {
+      this.#prefixParts = parts;
+      const content = [parts.system, parts.protocol, parts.toolSchemas, parts.invariants].join('\n\n');
+      this.#prefix = Object.freeze([Object.freeze({ role: 'system'         , content })]);
+    }
+    this.#lastStable = null;
+    const record                        = {
+      at: this.#clock.now(),
+      kind: 'planned-rebase',
+      request: req.reason,
+      accepted: true,
+      degradedTo: 'none',
+      droppedBlocks: 0,
+      detail: `计划性换基（${req.reason}）：稳定前缀基线重置${changed ? '（前缀组件已更新）' : ''}${req.contextTokens !== undefined ? `，contextTokens≈${req.contextTokens}` : ''}——记账 + 模型侧可见（[tf-stream:context-rebased]），非静默`,
     };
     this.#policyLog.push(record);
     if (this.#policySink) this.#policySink(record);

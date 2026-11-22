@@ -176,9 +176,10 @@ test('V2. usage 缓存字段随流进台账：cacheRead/Write 累计 + 回合台
 
 // ---------------------------------------------------------------- V3 预算口径
 
-test('V3. 预算阶梯计入缓存读：cacheRead 大幅消耗时按计费输入升档（旧口径只看未命中输入会漏判）', async () => {
-  // budget=1000；第 1 请求：未命中 100 + 缓存读 750 + 输出 20 = 870（<900 normal）
-  // 第 2 请求：再 +未命中 100 + 缓存读 750 + 输出 30 → 累计 1750 ≥ 1350（70% 档=high-only）
+test('V3. 预算口径（0.5.0 D1/D7）：阶梯用任务级差值 + 严格口径——cacheRead 不再加速降级', async () => {
+  // D7（旧缺陷的反向修复）：budget=1000；两个请求各带 cacheRead 750——0.4.x 把缓存读按
+  // 1:1 计入控制，缓存命中越好越早降级（方向与成本相反）。0.5.0 阶梯只看严格口径
+  // （input+output）：100+20 + 100+30 = 250 < 700 → 全程 normal，绝不因缓存读升档。
   const responses: ReadonlyArray<readonly StreamChunkLike[]> = [
     [
       textDelta('读文件。\n'),
@@ -187,27 +188,48 @@ test('V3. 预算阶梯计入缓存读：cacheRead 大幅消耗时按计费输入
       finishStop(),
     ],
     [
-      textDelta('再读一个。\n'),
-      textDelta('<tf-read path="b.txt" id="r2"/>\n'),
+      textDelta('收尾：文件读到了，答案原文如下——A 文件为示例文件，约定已核对。\n'),
+      textDelta('<tf-final id="f1" summary="A 文件已核对。"/>\n'),
       usageChunk({ inputTokens: 100, outputTokens: 30, cacheReadTokens: 750 }),
       finishStop(),
     ],
-    [
-      textDelta('收尾：两个文件都读到了，答案原文如下——A/B 均为示例文件，约定已核对。\n'),
-      textDelta('<tf-final id="f1" summary="A/B 文件已核对。"/>\n'),
-      usageChunk({ inputTokens: 50, outputTokens: 10 }),
-      finishStop(),
-    ],
   ];
-  const harness = makeHarness(responses, '读两个文件后收尾。', { budgetTokens: 1000 });
+  const harness = makeHarness(responses, '读一个文件后收尾。', { budgetTokens: 1000 });
   try {
     const reason = await harness.driver.runTurn();
     assert.equal(reason.kind, 'completed', JSON.stringify(reason));
     const records = harness.driver.snapshot().records;
     const requests = records.filter((r) => r.kind === 'request') as Array<{ kind: string; level: string }>;
-    assert.ok(requests.length >= 3, `至少 3 个请求，实际 ${requests.length}`);
-    // 第 3 请求必须升档（旧口径：只累计 250 未命中输入 → 永远 normal——漏判）
-    assert.equal(requests[requests.length - 1]!.level, 'final-only', '累计计费输入 ≥90% 预算后必须进入 final-only 档');
+    assert.ok(requests.length >= 2, `至少 2 个请求，实际 ${requests.length}`);
+    for (const r of requests) {
+      assert.equal(r.level, 'normal', 'cacheRead 不计入控制（严格口径）：阶梯保持 normal');
+    }
+    // 显式未命中输入超阈值时阶梯仍然生效（预算没有失效，只是不再被缓存读污染）：
+    // 0.4.x 的 high-only 语义对"真实计费输入"保留。
+    const ladder = makeHarness([
+      [
+        textDelta('读文件。\n'),
+        textDelta('<tf-read path="a.txt" id="r1"/>\n'),
+        usageChunk({ inputTokens: 800, outputTokens: 20, cacheReadTokens: 5 }),
+        finishStop(),
+      ],
+      [
+        textDelta('收尾：A 文件为示例文件，约定已核对。\n'),
+        textDelta('<tf-final id="f1" summary="A 文件已核对。"/>\n'),
+        usageChunk({ inputTokens: 200, outputTokens: 10 }),
+        finishStop(),
+      ],
+    ], '读一个文件后收尾（阶梯）。', { budgetTokens: 1000 });
+    try {
+      await ladder.driver.runTurn();
+      const ladderRequests = ladder.driver.snapshot().records
+        .filter((r) => r.kind === 'request') as Array<{ kind: string; level: string }>;
+      // 阶梯按"发送该请求时的任务级花费"取档：请求 2 发送前 = 820（请求 1 的 800+20）
+      // ≥ 70% 预算 → high-only；缓存读不参与（D7）。
+      assert.equal(ladderRequests[ladderRequests.length - 1]!.level, 'high-only', '严格口径花费 820 ≥ 70% 预算 → high-only');
+    } finally {
+      ladder.cleanup();
+    }
   } finally {
     harness.cleanup();
   }

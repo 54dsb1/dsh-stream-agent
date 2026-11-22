@@ -23,9 +23,12 @@ import type {
   ToolBatchInputLike,
   ToolBatchResultLike,
 } from '../src/entry/loop.ts';
-import { ToolSurfaceHolder, CORE_TOOLS, degradedLine } from '../src/entry/tool-surface.ts';
+import { ToolSurfaceHolder, degradedLine } from '../src/entry/tool-surface.ts';
 import type { HostToolSchemaLike, ToolsServiceLike } from '../src/entry/tool-surface.ts';
 import { TfStreamParser } from '../src/kernel/parser.ts';
+
+/** profile 档（回退演练）白名单——0.5.0 起非默认路径；与 tool-surface.ts 内部表一致。 */
+const CORE_PROFILE_TOOLS: readonly string[] = ['read', 'write', 'edit', 'grep', 'glob', 'bash', 'pwsh'];
 
 // ---------------------------------------------------------------- 设施
 
@@ -53,13 +56,16 @@ function fakeToolsService(opts: { fail?: boolean } = {}): ToolsServiceLike & { c
 }
 
 test('S1. ToolSurfaceHolder：首解析冻结；additions-only；names 覆盖全量', async () => {
-  const holder = new ToolSurfaceHolder(fakeToolsService(), { profile: 'core', nativeTools: true, callCommand: true });
+  // 0.5.0（§6.3）：默认 reserved-only = 全量透传（对第三方工具零影响）；
+  // profile 档（已弃用，仅回退演练 §12.4）才走 core 白名单过滤。
+  const holder = new ToolSurfaceHolder(fakeToolsService(), { policy: 'reserved-only', profile: 'full', nativeTools: true, callCommand: true });
   const first = await holder.resolve({ agent: {} });
   assert.ok(first !== undefined);
   assert.equal(first.frozenAt, 1);
-  // core 白名单：read/write/pwsh（HOST_TOOLS 里的 3 个 core 命中）
-  assert.deepEqual(first.schemas.map((s) => s.name), HOST_TOOLS.map((t) => t.name).filter((n) => CORE_TOOLS.includes(n)));
-  // names = 冻结面全量（含非 core：web_search/todo_write）——tf-call 校验面
+  assert.equal(first.policy, 'reserved-only');
+  // reserved-only：schema 全量透传（read/write/pwsh/web_search/todo_write 一个不少）
+  assert.deepEqual(first.schemas.map((s) => s.name), HOST_TOOLS.map((t) => t.name));
+  // names = 冻结面全量（tf-call 校验面）
   assert.ok(first.names.includes('web_search') && first.names.includes('todo_write'));
   // 第二次解析：additions-only（schemas 引用不变 = 前缀字节不变）
   const second = await holder.resolve({ agent: {} });
@@ -67,6 +73,11 @@ test('S1. ToolSurfaceHolder：首解析冻结；additions-only；names 覆盖全
   assert.equal(second!.schemas, first!.schemas);
   // 工具面出现新工具 → names 扩张（只增不减）
   assert.ok(second!.names.length >= first!.names.length);
+  // profile 策略（回退演练）：core 白名单只声明 read/write/pwsh
+  const profileHolder = new ToolSurfaceHolder(fakeToolsService(), { policy: 'profile', profile: 'core', nativeTools: true, callCommand: true });
+  const profiled = await profileHolder.resolve({ agent: {} });
+  assert.deepEqual(profiled!.schemas.map((s) => s.name), HOST_TOOLS.map((t) => t.name).filter((n) => CORE_PROFILE_TOOLS.includes(n)));
+  // D2 修复语义：'off' 档已删除——profile 类型不再接受 'off'（编译期即约束）
 });
 
 test('S2. 解析失败沿用旧面（degraded=stale）；无服务面返回 undefined（稳态 L2）', async () => {
@@ -85,16 +96,18 @@ test('S2. 解析失败沿用旧面（degraded=stale）；无服务面返回 unde
   assert.ok(first !== undefined);
 });
 
-test('S3. validateCallName：unknown-tool 带前缀建议；off 档与未启用引导', async () => {
-  const holder = new ToolSurfaceHolder(fakeToolsService(), { profile: 'standard', nativeTools: false, callCommand: true });
+test('S3. validateCallName：unknown-tool 带前缀建议；让位/未启用引导（0.5.0：off 档已删除）', async () => {
+  const holder = new ToolSurfaceHolder(fakeToolsService(), { policy: 'reserved-only', profile: 'standard', nativeTools: false, callCommand: true });
   await holder.resolve({ agent: {} });
   assert.equal(holder.validateCallName('web_search'), null, '面内工具通过');
   const miss = holder.validateCallName('websearch');
   assert.ok(miss !== null && miss.startsWith('unknown-tool'), '面外工具拒绝');
   assert.ok(miss.includes('web_search'), '前缀建议给出相近工具名');
-  const off = new ToolSurfaceHolder(fakeToolsService(), { profile: 'off', nativeTools: false, callCommand: true });
-  assert.ok(off.validateCallName('read') !== null, 'off 档引导改道 tf-*');
-  const disabled = new ToolSurfaceHolder(fakeToolsService(), { profile: 'standard', nativeTools: false, callCommand: false });
+  // 0.5.0：代码通道让位（callReserved）与 callCommand=false 都引导"直接调用会话内工具"；
+  // 'off' 档删除（D2）——通道语义由 callReserved 表达。
+  const reserved = new ToolSurfaceHolder(fakeToolsService(), { policy: 'reserved-only', profile: 'standard', nativeTools: false, callCommand: true, callReserved: true });
+  assert.ok(reserved.validateCallName('read') !== null, '代码通道让位：tf-call 整体未启用');
+  const disabled = new ToolSurfaceHolder(fakeToolsService(), { policy: 'reserved-only', profile: 'standard', nativeTools: false, callCommand: false });
   assert.ok(disabled.validateCallName('read') !== null, 'callCommand=false 引导');
 });
 
@@ -289,7 +302,7 @@ test('S10. 无服务面（headless 稳态）：不注降级行，不记账，行
   }
 });
 
-test('S11. nativeTools 开启：请求携带冻结面 schema（core 档白名单）', async () => {
+test('S11. nativeTools 开启：reserved-only 全量透传；profile 档（回退演练）走白名单', async () => {
   const chunks: StreamChunkLike[] = [
     { type: 'block-start', index: 0, blockType: 'text' } as never,
     { type: 'text-delta', index: 0, text: '<tf-final id="f1" summary="done"/>' } as never,
@@ -302,6 +315,7 @@ test('S11. nativeTools 开启：请求携带冻结面 schema（core 档白名单
       id: 's-nt', header: { id: 's-nt' },
       append(type: string, data: unknown) { return { seq: 1 }; },
     };
+    // 0.5.0 默认（reserved-only）：全量透传，web_search 不被隐藏（G4 探针面）
     const driver = new SingleStreamDriver({
       stream: (options: { tools?: unknown }) => {
         wireRequests.push(options);
@@ -309,7 +323,7 @@ test('S11. nativeTools 开启：请求携带冻结面 schema（core 档白名单
       },
       executeTools: async (input: ToolBatchInputLike) => ({ results: [], additionalContexts: [], concluded: false }),
       toolsService: fakeToolsService(),
-    }, { provider: 'mock', model: 'm', nativeTools: true, toolSurface: 'core' });
+    }, { provider: 'mock', model: 'm', nativeTools: true });
     driver.setIdentity('s-nt', 't');
     driver.setAgent({ session, id: 'a' });
     driver.pushUserTask('测试');
@@ -317,8 +331,24 @@ test('S11. nativeTools 开启：请求携带冻结面 schema（core 档白名单
     assert.equal(wireRequests.length, 1);
     const tools = (wireRequests[0] as { tools?: Array<{ name: string }> }).tools;
     assert.ok(Array.isArray(tools) && tools.length > 0, '请求携带 tools');
-    assert.ok(tools!.every((t) => CORE_TOOLS.includes(t.name)), 'core 档只声明白名单');
-    assert.ok(!tools!.some((t) => t.name === 'web_search'), '非 core 工具不进声明面（可达性走 tf-call）');
+    assert.deepEqual(tools!.map((x) => x.name), HOST_TOOLS.map((x) => x.name), 'reserved-only：第三方工具透传（D3 修复）');
+    // profile 档（回退演练 §12.4）：core 白名单
+    const wireProfile: Array<unknown> = [];
+    const driverProfile = new SingleStreamDriver({
+      stream: (options: { tools?: unknown }) => {
+        wireProfile.push(options);
+        return (async function* () { for (const c of chunks) yield c; })();
+      },
+      executeTools: async (input: ToolBatchInputLike) => ({ results: [], additionalContexts: [], concluded: false }),
+      toolsService: fakeToolsService(),
+    }, { provider: 'mock', model: 'm', nativeTools: true, surfacePolicy: 'profile', toolSurface: 'core' });
+    driverProfile.setIdentity('s-nt', 't');
+    driverProfile.setAgent({ session, id: 'a' });
+    driverProfile.pushUserTask('测试');
+    await driverProfile.runTurn();
+    const profileTools = (wireProfile[0] as { tools?: Array<{ name: string }> }).tools;
+    assert.ok(profileTools!.every((x) => CORE_PROFILE_TOOLS.includes(x.name)), 'profile 档只声明白名单');
+    assert.ok(!profileTools!.some((x) => x.name === 'web_search'), '非 core 工具不进声明面（可达性走 tf-call）');
   } finally {
     rmSync(sandboxDir, { recursive: true, force: true });
   }

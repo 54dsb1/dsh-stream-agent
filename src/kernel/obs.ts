@@ -281,6 +281,11 @@ export interface ObsKernelOptions {
   starvationThreshold?: number;
   /** blob 出口注入；缺省内存实现 */
   sink?: BlobSink;
+  /**
+   * 0.5.0（§7.3）：已投递 span 账本（默认开）。false = 关闭去重（回退点：
+   * `spanLedger: false` 行为等价 0.4.0——重复取回同一区间重复付费）。
+   */
+  spanLedger?: boolean;
 }
 
 interface DirEntryInternal {
@@ -303,11 +308,14 @@ const DEFAULT_STARVATION_THRESHOLD = 5;
 
 /**
  * 观测账本：登记 + 分类 + 骨架 + 目录差分 + 计数器 + 饥饿防线。
+ * 0.5.0 增：已投递 span 账本（§7.3(2)，D5 修复——重复取回同一区间不再重复付费）、
+ * request:N 句柄别名（§7.6）、取回度量（§7.4）。
  * 每个任务一个实例（reset() 或直接 new）。
  */
 export class ObservationLedger {
   private readonly threshold: number;
   private readonly sink: BlobSink;
+  private readonly spanLedgerEnabled: boolean;
 
   private seqCounter = 0;
   private readonly contentByHandle = new Map<string, string>();
@@ -317,6 +325,24 @@ export class ObservationLedger {
   private readonly dirByKey = new Map<string, DirEntryInternal>();
   private readonly lowRecords: LowRecord[] = [];
   private readonly ledger: ObservationRecord[] = [];
+
+  // ---- 0.5.0：span 账本与取回度量（§7.3/§7.4）----
+  /** 已投递区间账本：handle → [{from,to,req,contentHash}]。spanLedger=false 时不写入（回退点）。 */
+  private readonly deliveredSpans = new Map<string, DeliveredSpan[]>();
+  /** handle → 最近一次投递时的全文哈希（变化检测：正文变了就不能说 [unchanged]）。 */
+  private readonly hashByHandle = new Map<string, string>();
+  /** request:N → 该请求句柄化的段句柄（长上下文压缩段的取回别名）。 */
+  private readonly handlesByRequest = new Map<number, string[]>();
+  /** 取回请求计数（tf-peek 语义的调用数；§7.4 peek_requests_per_task 分子）。 */
+  private peekRequestTotal = 0;
+  /** 命中已投递且未变化的取回数（redundant_peek_ratio 分子；命中即省一次正文投递）。 */
+  private redundantHits = 0;
+  /** 取回原文累计字节（deref_bytes）。 */
+  private derefBytes = 0;
+  /** 产出原文累计字节（produced_bytes：observe() 收到的内容字节合计）。 */
+  private producedBytes = 0;
+  /** 每 handle 取回次数（k_mean 用）。 */
+  private readonly peekCountByHandle = new Map<string, number>();
 
   private injectedTotal = 0;
   private producedTotal = 0;
@@ -330,11 +356,130 @@ export class ObservationLedger {
     }
     this.threshold = t;
     this.sink = options.sink ?? new InMemoryBlobSink();
+    this.spanLedgerEnabled = options.spanLedger !== false;
+  }
+
+  // ------------------------------------------------------------------
+  // 0.5.0 span 账本（§7.3(2)）：已投递区间去重（D5 修复）
+  // ------------------------------------------------------------------
+
+  /**
+   * 登记一次"已投递"（read/peek 的正文进入模型上下文时调用）。
+   * spanLedger=false（回退点）时只计数不记账（行为等价 0.4.0）。
+   */
+  recordDelivered(handle: string, fromLine: number, toLine: number, requestSeq: number): void {
+    if (!this.spanLedgerEnabled) return;
+    const content = this.contentByHandle.get(handle);
+    if (content === undefined) return;
+    const lines = content.split('\n');
+    const from = Math.max(1, Math.floor(fromLine));
+    const to = Math.min(lines.length, Math.floor(toLine));
+    if (from > to) return;
+    const contentHash = this.hashByHandle.get(handle) ?? hashContent(content);
+    const spans = this.deliveredSpans.get(handle) ?? [];
+    spans.push({ from, to, req: requestSeq, contentHash });
+    this.deliveredSpans.set(handle, spans);
+  }
+
+  /** 查询某句柄的已投递区间（账本只读视图；测试/审计用）。 */
+  deliveredSpanList(handle: string): readonly DeliveredSpan[] {
+    return this.deliveredSpans.get(handle) ?? [];
+  }
+
+  /**
+   * span 感知取回（§7.3(2)）：tf-peek 与回灌通道共用。
+   *  - 命中已投递且内容哈希未变 → { kind:'unchanged', line }（一行 ~20 token，不返回正文）；
+   *  - 部分重叠（同内容哈希的已投递段与请求区间相交但不覆盖）→ 只返回**新增**区间正文 + 一行说明；
+   *  - 无重叠（或账本关闭）→ 正常返回正文；
+   *  - 未知句柄 → null（调用方上报，内核不静默吞）。
+   */
+  peekWithLedger(handle: string, fromLine: number, toLine: number, requestSeq: number, options?: { countRequest?: boolean }): PeekSpanResult | null {
+    const content = this.contentByHandle.get(handle);
+    if (content === undefined) return null;
+    this.peekedTotal++;
+    // countRequest=false：自动完整反馈（非模型主动取回）不进取回度量——§7.4 的
+    // peek_requests_per_task / k_mean 度量的是"由取回引起的"请求（模型 tf-peek）。
+    if (options?.countRequest !== false) {
+      this.peekRequestTotal++;
+      this.peekCountByHandle.set(handle, (this.peekCountByHandle.get(handle) ?? 0) + 1);
+    }
+    const lines = content.split('\n');
+    const from = Math.max(1, Math.floor(fromLine));
+    const to = Math.min(lines.length, Math.floor(toLine));
+    if (from > to) return { kind: 'content', handle, from, to, text: '', note: '空区间' };
+    const currentHash = this.hashByHandle.get(handle) ?? hashContent(content);
+    // 有效账本 = 同内容哈希的投递记录（正文已变化的历史投递不算数）
+    const spans = this.spanLedgerEnabled
+      ? (this.deliveredSpans.get(handle) ?? []).filter((s) => s.contentHash === currentHash)
+      : [];
+    const fullyCovered = spans.some((s) => s.from <= from && s.to >= to);
+    if (fullyCovered) {
+      this.redundantHits++;
+      const lastReq = spans
+        .filter((s) => s.from <= from && s.to >= to)
+        .reduce((m, s) => Math.max(m, s.req), 0);
+      return {
+        kind: 'unchanged',
+        handle,
+        from,
+        to,
+        line: `[unchanged] ${handle} L${from}-${to}（与 req#${lastReq} 投递内容一致，未变化）`,
+      };
+    }
+    const missing = subtractSpans(from, to, spans);
+    const overlapChars = spans.reduce((n, s) => n + (Math.min(s.to, to) - Math.max(s.from, from) + 1 > 0 ? Math.min(s.to, to) - Math.max(s.from, from) + 1 : 0), 0);
+    if (missing.length > 0 && overlapChars > 0) {
+      // 部分重叠：仅返回新增区间并附一行说明（§7.3(2)）
+      const text = missing.map(([a, b]) => lines.slice(a - 1, b).join('\n')).join('\n');
+      const missingDesc = missing.map(([a, b]) => (a === b ? `L${a}` : `L${a}-${b}`)).join(', ');
+      this.derefBytes += Buffer.byteLength(text, 'utf8');
+      this.injectedTotal++;
+      return { kind: 'partial', handle, from, to, text, note: `已投递区间不重发（${overlapChars} 字符省略）；新增区间 ${missingDesc}` };
+    }
+    // 无重叠：正常返回正文
+    const text = lines.slice(from - 1, to).join('\n');
+    this.derefBytes += Buffer.byteLength(text, 'utf8');
+    this.injectedTotal++; // peek 产出进入上下文，按口径计入 injected
+    return { kind: 'content', handle, from, to, text };
+  }
+
+  /**
+   * request:N 句柄别名（§7.6 长上下文取回）：压缩段句柄化后按请求序号登记，
+   * `resolveHandleRef('request:12')` → 该请求句柄化的段句柄列表。
+   */
+  registerRequestHandle(requestSeq: number, handle: string): void {
+    const list = this.handlesByRequest.get(requestSeq) ?? [];
+    if (!list.includes(handle)) list.push(handle);
+    this.handlesByRequest.set(requestSeq, list);
+  }
+
+  /** 解析 handle 引用：'request:N' → 段句柄数组；普通句柄 → 原样单元素。 */
+  resolveHandleRef(ref: string): string[] {
+    const m = /^request:(\d+)$/.exec(ref.trim());
+    if (m !== null) return [...(this.handlesByRequest.get(Number(m[1])) ?? [])];
+    return [ref];
+  }
+
+  /** 取回度量（§7.4）：peek_requests_per_task / redundant_peek_ratio / deref/produced / k_mean。 */
+  peekMetrics(): PeekMetrics {
+    let kSum = 0;
+    for (const n of this.peekCountByHandle.values()) kSum += n;
+    const kHandles = this.peekCountByHandle.size;
+    return {
+      peekRequests: this.peekRequestTotal,
+      redundantHits: this.redundantHits,
+      redundantPeekRatio: this.peekRequestTotal > 0 ? this.redundantHits / this.peekRequestTotal : 0,
+      derefBytes: this.derefBytes,
+      producedBytes: this.producedBytes,
+      derefRatio: this.producedBytes > 0 ? this.derefBytes / this.producedBytes : 0,
+      kMean: kHandles > 0 ? kSum / kHandles : 0,
+    };
   }
 
   /** 登记一条工具产出观测，返回三档结果（O1）。 */
   observe(input: ObservationInput): ObservationResult {
     this.producedTotal++;
+    this.producedBytes += Buffer.byteLength(input.content, 'utf8');
     const family = classifyTool(input.tool);
     const cls = classify(input, { lastHash: this.lastHashByKey.get(input.key) });
     const seq = ++this.seqCounter;
@@ -368,6 +513,7 @@ export class ObservationLedger {
 
     this.contentByHandle.set(handle, input.content);
     this.sink.put(handle, input.content);
+    this.hashByHandle.set(handle, hash);
     this.versionByKey.set(input.key, version);
     this.lastHashByKey.set(input.key, hash);
     this.handleByKey.set(input.key, handle);
@@ -509,6 +655,15 @@ export class ObservationLedger {
     this.producedTotal = 0;
     this.peekedTotal = 0;
     this.drySteps = 0;
+    // 0.5.0：span 账本与取回度量同口径清零（每任务）
+    this.deliveredSpans.clear();
+    this.hashByHandle.clear();
+    this.handlesByRequest.clear();
+    this.peekRequestTotal = 0;
+    this.redundantHits = 0;
+    this.derefBytes = 0;
+    this.producedBytes = 0;
+    this.peekCountByHandle.clear();
   }
 }
 
@@ -529,4 +684,151 @@ function hashContent(s: string): string {
     h = (h * prime) & mask;
   }
   return h.toString(16).padStart(16, '0');
+}
+
+// ---------------------------------------------------------------------------
+// 0.5.0 span 账本类型与区间运算（§7.3(2)，D5 修复）
+// ---------------------------------------------------------------------------
+
+/** 已投递区间（1-based 闭区间；contentHash = 投递时的全文哈希，变化检测用）。 */
+export interface DeliveredSpan {
+  from: number;
+  to: number;
+  /** 投递发生时的请求序号（request:N 取回别名与 [unchanged] 行引用它） */
+  req: number;
+  contentHash: string;
+}
+
+/** span 感知取回结果（peekWithLedger 的返回；kind 决定调用方注入形态）。 */
+export type PeekSpanResult =
+  | { kind: 'unchanged'; handle: string; from: number; to: number; line: string }
+  | { kind: 'partial'; handle: string; from: number; to: number; text: string; note: string }
+  | { kind: 'content'; handle: string; from: number; to: number; text: string; note?: string };
+
+/** 取回度量（§7.4 指标表）。 */
+export interface PeekMetrics {
+  /** 由取回引起的请求数的分母侧：取回调用总数 */
+  peekRequests: number;
+  /** 命中已投递且未变化的取回数 */
+  redundantHits: number;
+  /** redundant_peek_ratio（目标 ≥ 0.8） */
+  redundantPeekRatio: number;
+  /** 取回原文累计字节 */
+  derefBytes: number;
+  /** 产出原文累计字节 */
+  producedBytes: number;
+  /** deref_bytes / produced_bytes（目标 ≤ 0.5） */
+  derefRatio: number;
+  /** 每个 handle 的平均取回次数（目标 ≤ 1.2） */
+  kMean: number;
+}
+
+/** 从 [from,to] 中减去已覆盖区间（区间并集裁剪；结果为未覆盖子区间，升序）。 */
+function subtractSpans(from: number, to: number, covered: readonly DeliveredSpan[]): Array<[number, number]> {
+  const sorted = [...covered].filter((s) => s.to >= from && s.from <= to).sort((a, b) => a.from - b.from);
+  const out: Array<[number, number]> = [];
+  let cursor = from;
+  for (const s of sorted) {
+    if (s.from > cursor) out.push([cursor, Math.min(s.from - 1, to)]);
+    cursor = Math.max(cursor, s.to + 1);
+    if (cursor > to) break;
+  }
+  if (cursor <= to) out.push([cursor, to]);
+  return out.filter(([a, b]) => a <= b);
+}
+
+// ---------------------------------------------------------------------------
+// 0.5.0 read 索引（§7.3(1)）：截断改为"索引 + 请求窗 + 覆盖图"（D4 修复）
+// ---------------------------------------------------------------------------
+
+/** 行锚（每 anchorEvery 行一个；含顶层符号）。 */
+export interface ReadAnchor {
+  line: number;
+  text: string;
+}
+
+/** 顶层符号判定（索引锚点的"含顶层符号"要求；规则式，不调模型）。 */
+const TOP_LEVEL_SYMBOL_RE = /^\s*(?:export\s+)?(?:abstract\s+)?(?:class|function|def|const|let|var|interface|type|enum|async\s+function|public|private|protected)\b|^#{1,6}\s+/;
+
+export interface ReadIndexOptions {
+  /** 锚点间隔（行）；默认 200（§7.3(1)） */
+  anchorEvery?: number;
+  /** 索引总字符上限（R9：超出仅给符号名；默认 2000） */
+  maxIndexChars?: number;
+  /** 已投递区间（覆盖图；缺省 = 无） */
+  delivered?: ReadonlyArray<{ from: number; to: number }>;
+}
+
+/**
+ * 生成 read 索引（头信息 + 行锚 + 未投递区间）。索引成本约为文件体积的 1–3%；
+ * 未投递区间显式列出，模型无需推断已读范围。
+ */
+export function renderReadIndex(content: string, opts: ReadIndexOptions = {}): string {
+  const lines = content.split('\n');
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  const anchorEvery = Math.max(1, opts.anchorEvery ?? 200);
+  const maxIndexChars = Math.max(200, opts.maxIndexChars ?? 2000);
+  const bytes = Buffer.byteLength(content, 'utf8');
+  const kb = bytes >= 1024 ? `${Math.round(bytes / 1024)}KB` : `${bytes}B`;
+  const head = `[tf-stream:read] ${lines.length.toLocaleString('en-US')} 行 / ${kb}`;
+
+  // 已投递覆盖图
+  const delivered = opts.delivered ?? [];
+  const deliveredDesc = delivered
+    .map((s) => `L${s.from}-${s.to}`)
+    .join(' + ');
+
+  // 行锚：每 anchorEvery 行一个，且优先含顶层符号的行（若该窗口内有）
+  const anchors: ReadAnchor[] = [];
+  for (let start = 0; start < lines.length; start += anchorEvery) {
+    const window = lines.slice(start, Math.min(start + anchorEvery, lines.length));
+    let picked = -1;
+    for (let i = 0; i < window.length; i++) {
+      if (TOP_LEVEL_SYMBOL_RE.test(window[i]!)) {
+        picked = start + i;
+        break;
+      }
+    }
+    if (picked === -1 && window.length > 0) picked = start;
+    if (picked >= 0) anchors.push({ line: picked + 1, text: lines[picked]!.trim().slice(0, 120) });
+  }
+
+  // 未投递区间 = [1, total] − 已投递
+  const undelivered = subtractSpans(1, lines.length, delivered.map((s) => ({ from: s.from, to: s.to, req: 0, contentHash: '' })));
+  const undeliveredDesc = undelivered.map(([a, b]) => (a === b ? `L${a}` : `L${a}-${b}`)).join(', ');
+
+  // R9：索引本身超预算 → 只给符号名（丢锚文本，保留行号）
+  let body = anchors.map((a) => `  L${a.line} ${a.text}`).join('\n');
+  if (head.length + 1 + body.length > maxIndexChars) {
+    body = anchors.map((a) => `  L${a.line} ${symbolNameOf(a.text)}`).join('\n');
+  }
+
+  const parts = [head];
+  if (deliveredDesc !== '') parts.push(`已投递 ${deliveredDesc}`);
+  if (body !== '') parts.push(`索引（每 ${anchorEvery} 行一个锚，含顶层符号）：\n${body}`);
+  if (undeliveredDesc !== '') {
+    parts.push(`未投递区间：${undeliveredDesc} → 用 tf-peek handle=... from_line=.. to_line=.. 取回`);
+  }
+  return parts.join('\n');
+}
+
+/** 从锚文本提取符号名（R9 降级形态：只给符号名不给行内容）。 */
+function symbolNameOf(text: string): string {
+  const m = /(?:class|function|def|const|let|var|interface|type|enum)\s+([A-Za-z_$][\w$]*)/.exec(text);
+  return m !== null ? m[1]! : text.split(/\s+/)[0]?.slice(0, 40) ?? '(空)';
+}
+
+/**
+ * §7.5 双旋钮的读取侧投影：maxReadChars 之内投正文（带覆盖图），超出只投索引。
+ * maxReadChars ≤ 0 = 关闭索引化（回退点：0.4.x 头部截断行为）。
+ */
+export function readFeedbackPlan(
+  content: string,
+  maxReadChars: number,
+  delivered: ReadonlyArray<{ from: number; to: number }> = [],
+): { kind: 'inline'; text: string } | { kind: 'index'; text: string } {
+  if (maxReadChars > 0 && content.length > maxReadChars) {
+    return { kind: 'index', text: renderReadIndex(content, { delivered }) };
+  }
+  return { kind: 'inline', text: content };
 }

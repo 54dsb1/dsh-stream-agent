@@ -1,27 +1,31 @@
-// entry/control-bar.ts —— 控制栏 entry（v0.2.1）
+// entry/control-bar.ts —— 控制栏 entry（0.5.0：两区块）
 //
 // 三件事，全部 fail-open：
-//   ① 装载时把控制栏打到 stderr：接管状态 + 当前模式 + 上手四步 + 打开方式。
+//   ① 装载时把控制栏打到 stderr：接管状态 + 当前通道/档位 + 上手四步 + 打开方式。
 //      bundle 激活对 CLI 是静默的（v0.2.0 的教训：用户只看到一条 warning），
 //      控制栏是插件"自证已装载 + 教怎么用"的唯一直观出口。
-//   ② 提供 ctx.streamAgentControl 服务：其它 entry / 诊断脚本可读当前模式与语言。
-//   ③ 状态与 loop 共用同一份 control.json（control-state.ts），改模式不需要重启。
+//   ② 提供 ctx.streamAgentControl 服务：其它 entry / 诊断脚本可读当前通道/档位与语言。
+//   ③ 状态与 loop 共用同一份 control.json（control-state.ts），改通道/档位不需要重启。
 //
 // 红线：本 entry 不得因为"配置坏了"而装载失败。resolveControlState 全程 fail-open，
 // 告警走 logger/stderr，绝不上抛（v0.2.1 事故链见 cordis-compat.ts）。
 
 import { createControlState, renderBanner, renderStatusBar } from '../kernel/control-bar.js';
-                                                             
-import { getMode } from '../kernel/modes.js';
-                                                           
+                                                                   
+import { getChannel, getTier, isChannelId, isLegacyModeId, isTierId, resolveLegacyMode } from '../kernel/modes.js';
+                                                            
 import { VERSION } from '../version.js';
 import { asPluginEffect } from './cordis-compat.js';
                                                     
 import { resolveControlState, writePersistedControl } from './control-state.js';
-import { isTakeoverActive, onTakeover } from './takeover-registry.js';
+import { isTakeoverActive, takeover, onTakeover } from './takeover-registry.js';
 
                                    
-                                                   
+                                                     
+                   
+                        
+                
+                                                                           
                 
                            
                 
@@ -35,9 +39,13 @@ import { isTakeoverActive, onTakeover } from './takeover-registry.js';
 
                                     
                         
-                   
+                                           
+                                     
+                                                                  
                                                          
-                                                                       
+                                                       
+                                                         
+                                                       
                                        
                     
                
@@ -55,8 +63,17 @@ export default function apply(ctx             , config                   = {})  
     else console.error(text);
   };
 
-  const resolved = resolveControlState({ mode: config.mode, lang: config.lang }, config.stateDir, warn);
-  let state               = createControlState({ mode: resolved.mode, lang: resolved.lang });
+  const resolved = resolveControlState(
+    { channel: config.channel, tier: config.tier, lang: config.lang, mode: config.mode },
+    config.stateDir,
+    warn,
+  );
+  if (resolved.aliased) {
+    // §4.4：旧配置读到旧 mode 字段时输出一行 warn（resolveControlState 已对 control.json
+    // 来源告警；这里补装配显式 config.mode 的告警面）。
+    warn(`control-bar 收到旧模式值 mode="${config.mode}"，已按别名映射为 channel=${resolved.channel}/tier=${resolved.tier}（0.5.x 保留别名，0.6.0 移除）`);
+  }
+  let state               = createControlState({ channel: resolved.channel, tier: resolved.tier, lang: resolved.lang });
   const file = resolved.file;
 
   const persist = ()       => {
@@ -69,9 +86,26 @@ export default function apply(ctx             , config                   = {})  
 
   const service                    = {
     state: () => ({ ...state }),
-    mode: () => getMode(state.mode),
+    channel: () => getChannel(state.channel),
+    tier: () => getTier(state.tier),
+    setChannel: (channel, shouldPersist = true) => {
+      state = { ...state, channel: getChannel(channel).id };
+      if (shouldPersist) persist();
+      return { ...state };
+    },
+    setTier: (tier, shouldPersist = true) => {
+      state = { ...state, tier: getTier(tier).id };
+      if (shouldPersist) persist();
+      return { ...state };
+    },
     setMode: (mode, shouldPersist = true) => {
-      state = { ...state, mode: getMode(mode).id };
+      if (!isLegacyModeId(mode)) {
+        warn(`setMode("${String(mode)}") 不是旧模式值（可用: balanced|lean|compat|power）`);
+        return { ...state };
+      }
+      const mapped = resolveLegacyMode(mode);
+      warn(`setMode("${mode}") 是旧模式值，已按别名映射为 channel=${mapped.channel}/tier=${mapped.tier}（0.5.x 保留别名，0.6.0 移除）`);
+      state = { ...state, channel: mapped.channel, tier: mapped.tier };
       if (shouldPersist) persist();
       return { ...state };
     },
@@ -96,8 +130,13 @@ export default function apply(ctx             , config                   = {})  
   const printBanner = ()       => {
     if (printed) return;
     printed = true;
+    const fact = takeover();
     const active = isTakeoverActive();
     for (const line of renderBanner(state, { version, active, columns: process.stderr.columns })) console.error(line);
+    // 0.5.0（§6.2）：降级（sidecar）必须可见——占位者具名显示，绝不静默覆盖。
+    if (fact.state === 'degraded') {
+      console.error(`[control-bar] 未接管：已被 ${fact.owner || '另一个 loop 插件'} 接管——本插件转 sidecar（仅控制栏状态与诊断，上下文治理关闭）`);
+    }
   };
   const announce = config.announce !== false && process.env.STREAM_AGENT_NO_BANNER !== '1';
   const offTakeover = announce ? onTakeover(printBanner) : () => {};
@@ -121,3 +160,7 @@ export default function apply(ctx             , config                   = {})  
     },
   });
 }
+
+// isChannelId / isTierId 保留在导入面（ControlBarConfig 的运行时校验由 resolveControlState
+// 完成；这里显式引用避免未用告警，同时给 CLI 复用）。
+export { isChannelId, isTierId };

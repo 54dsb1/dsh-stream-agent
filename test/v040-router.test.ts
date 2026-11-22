@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 
 import { createPresetRouter, isPresetLockedError } from '../src/entry/preset-router.ts';
 import type { AgentPresetsServiceLike } from '../src/entry/preset-router.ts';
-import { getMode, modeConfig, publicModeCatalog } from '../src/kernel/modes.ts';
+import { LEGACY_MODE_ALIAS, publicLegacyModeCatalog, publicChannelCatalog, publicTierCatalog } from '../src/kernel/modes.ts';
 
 function fakeRegistry(opts: { lastTurn?: number; openTurn?: boolean } = {}): AgentPresetsServiceLike {
   return {
@@ -77,14 +77,22 @@ test('R4. current()：presetForSession 优先；服务缺方法/缺席 = null（
   assert.equal(createPresetRouter({}), undefined, '无 get 方法 → 无路由器');
 });
 
-test('R5. 能力档维度：模式提供 toolSurface 默认值（不是第五个模式）', () => {
-  const catalog = publicModeCatalog();
-  assert.equal(catalog.length, 4, '模式数不变（能力档不是模式）');
-  // lean = core（首请求 schema 最省）；compat = off（0.3.x 回退）；balanced/power = standard
-  assert.equal(modeConfig('lean').toolSurface, 'core');
-  assert.equal(modeConfig('compat').toolSurface, 'off');
-  assert.equal(modeConfig('balanced').toolSurface, 'standard');
-  assert.equal(modeConfig('power').toolSurface, 'standard');
-  // getMode fail-open：未知 id → 默认模式，config 带 tier
-  assert.equal(getMode('nope').config.toolSurface, 'standard');
+test('R5. 0.5.0 两轴目录：旧模式目录变成别名投影（deprecated + 移除版本），工具面不再随预设变化', () => {
+  // 0.5.0（§4.2/§4.4）：四档变两轴——旧四模式只保留别名映射（0.6.0 移除），
+  // 别名不携带任何 toolSurface/enableCode 副作用（D2/D3 的成因正是预设顺手改工具面）。
+  const legacy = publicLegacyModeCatalog();
+  assert.equal(legacy.length, 4, '旧模式目录保留 4 条（别名期）');
+  assert.deepEqual(legacy.map((m) => m.aliasTarget), [
+    { channel: 'standard', tier: 'standard' },
+    { channel: 'standard', tier: 'light' },
+    { channel: 'standard', tier: 'deep' },
+    { channel: 'code', tier: 'standard' },
+  ]);
+  for (const m of legacy) assert.equal(m.deprecated, true);
+  // 新轴目录：通道 2（模型看到什么）× 档位 3（只改数值）
+  assert.equal(publicChannelCatalog().length, 2);
+  assert.equal(publicTierCatalog().length, 3);
+  // power → code 通道；compat/lean 的工具面副作用已删除（D2/D3 修复）
+  assert.equal(LEGACY_MODE_ALIAS.power.channel, 'code');
+  assert.ok(!('toolSurface' in LEGACY_MODE_ALIAS.lean));
 });

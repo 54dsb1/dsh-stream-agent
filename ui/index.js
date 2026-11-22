@@ -1,4 +1,4 @@
-// ui/index.js —— 桌面控制页的宿主半边（v0.2.1）
+// ui/index.js —— 桌面控制页的宿主半边（0.5.0：两区块）
 //
 // 为什么是独立子包：dsh-client-modules 以 **包** 为单位扫描 dsh.client，
 // 同一个包被多个 Loader 行引用时会抛 "resolves from multiple active Loader sources"。
@@ -6,14 +6,17 @@
 // 所以浏览器半边必须住在自己的包（ui/package.json）里，主包不能声明 dsh.client。
 //
 // 本文件只做三件事：
-//   1. 注册同源路由 /stream-agent/control（GET 读状态，POST 改模式/语言）
+//   1. 注册同源路由 /stream-agent/control（GET 读状态，POST 改通道/档位/语言）
 //   2. 复用宿主的 connection.admit 做鉴权（桌面端是 cookie，Web 端是同一套会话）
 //   3. 优先调用 loop 提供的 streamAgentRuntime 服务；服务缺席时降级为只读诊断
+//
+// 0.5.0 两区块（§3.3）：POST 面 = {channel?, tier?, lang?, mode?, budget?}——
+// mode 是 0.5.x 别名（0.6.0 移除）；区块 A 不出现"PTC 模式"字样（来源是探测结果）。
 //
 // 刻意不引入任何 npm 依赖：只 import 本包 dist/ 里已有的内核模块。
 
 import { readPersistedControl, writePersistedControl } from '../dist/entry/control-state.js';
-import { isModeId, modeConfig, publicModeCatalog } from '../dist/kernel/modes.js';
+import { isChannelId, isTierId, publicChannelCatalog, publicTierCatalog, publicLegacyModeCatalog, getTier } from '../dist/kernel/modes.js';
 import { isLang } from '../dist/kernel/control-bar.js';
 // v0.4.0（P4）：预设路由（空白会话三向切换的唯一入口；locked 具名识别）
 import { createPresetRouter, isPresetLockedError } from '../dist/entry/preset-router.js';
@@ -35,34 +38,36 @@ function sendJson(res, status, body) {
   res.end(payload);
 }
 
-function publicModes() {
-  return publicModeCatalog();
-}
-
 /** 可读的降级状态：loop 没接管时仍让用户看到文件里的值与 CLI 指引。 */
 function fallbackStatus() {
   const persisted = readPersistedControl();
-  const preset = modeConfig(persisted.state.mode);
+  const tierValues = getTier(persisted.state.tier).values;
   return {
     version: VERSION,
     takeover: false,
     degraded: true,
-    mode: persisted.state.mode,
-    modeSource: persisted.found ? 'file' : 'default',
-    modeLocked: isModeId(process.env.STREAM_AGENT_MODE),
+    channel: persisted.state.channel,
+    channelSource: persisted.found ? 'file' : 'default',
+    channelLocked: isChannelId(process.env.STREAM_AGENT_CHANNEL) || isChannelId(process.env.STREAM_AGENT_MODE),
+    tier: persisted.state.tier,
+    tierSource: persisted.found ? 'file' : 'default',
+    tierLocked: isTierId(process.env.STREAM_AGENT_TIER) || isTierId(process.env.STREAM_AGENT_MODE),
+    aliased: persisted.aliased === true,
     lang: persisted.state.lang,
     langSource: persisted.found ? 'file' : 'default',
     langLocked: isLang(process.env.STREAM_AGENT_LANG),
     effective: {
-      selfReadFeedback: preset.selfReadFeedback,
-      enableCode: preset.enableCode === 'auto' ? 'auto' : preset.enableCode,
-      persistFallback: preset.persistFallback,
-      maxParallelToolCalls: preset.maxParallelToolCalls,
-      maxReentries: preset.maxReentries,
-      budgetTokens: preset.budgetTokens ?? null,
-      toolSurface: preset.toolSurface ?? 'standard',
+      maxSteps: tierValues.maxSteps,
+      maxInputTokens: tierValues.maxInputTokens,
+      compactAggressiveness: tierValues.compactAggressiveness,
+      peekBudgetChars: tierValues.peekBudgetChars,
+      keepRecent: tierValues.keepRecent,
+      maxSummaryChars: tierValues.maxSummaryChars,
+      surfacePolicy: 'reserved-only',
     },
-    modes: publicModes(),
+    channels: publicChannelCatalog(),
+    tiers: publicTierCatalog(),
+    legacyModes: publicLegacyModeCatalog(),
     updatedAt: persisted.updatedAt ?? null,
     stateFile: persisted.file,
   };
@@ -213,14 +218,30 @@ export async function handleControlRequest(ctx, req, res) {
     return;
   }
 
-  const wantsMode = body.mode !== undefined;
+  // 0.5.0 两区块 POST 面：channel（区块 A）/ tier（区块 B）/ lang / budget / mode（0.5.x 别名）
+  const wantsChannel = body.channel !== undefined;
+  const wantsTier = body.tier !== undefined;
+  const wantsBudget = body.budget !== undefined && body.budget !== null;
   const wantsLang = body.lang !== undefined;
-  if (!wantsMode && !wantsLang) {
-    sendJson(res, 400, { ok: false, error: { code: 'empty', message: 'mode or lang required' }, status: live });
+  const wantsMode = body.mode !== undefined;
+  if (!wantsChannel && !wantsTier && !wantsLang && !wantsMode && !wantsBudget) {
+    sendJson(res, 400, { ok: false, error: { code: 'empty', message: 'channel, tier, budget or lang required' }, status: live });
     return;
   }
-  if (wantsMode && !isModeId(body.mode)) {
-    sendJson(res, 400, { ok: false, error: { code: 'invalid-mode', message: `unknown mode: ${String(body.mode)}` }, status: live });
+  if (wantsChannel && !isChannelId(body.channel)) {
+    sendJson(res, 400, { ok: false, error: { code: 'invalid-channel', message: `unknown channel: ${String(body.channel)}（valid: standard | code）` }, status: live });
+    return;
+  }
+  if (wantsTier && !isTierId(body.tier)) {
+    sendJson(res, 400, { ok: false, error: { code: 'invalid-tier', message: `unknown tier: ${String(body.tier)}（valid: light | standard | deep）` }, status: live });
+    return;
+  }
+  if (wantsBudget && (typeof body.budget !== 'object' || Array.isArray(body.budget))) {
+    sendJson(res, 400, { ok: false, error: { code: 'invalid-budget', message: 'budget must be an object: { maxSteps?, maxInputTokens? }' }, status: live });
+    return;
+  }
+  if (wantsMode && typeof body.mode !== 'string') {
+    sendJson(res, 400, { ok: false, error: { code: 'invalid-mode', message: `legacy mode must be a string (balanced|lean|compat|power)` }, status: live });
     return;
   }
   if (wantsLang && !isLang(body.lang)) {
@@ -229,7 +250,9 @@ export async function handleControlRequest(ctx, req, res) {
   }
 
   // 锁定判断放在路由层：运行时服务即使实现有出入，也不会绕过装配配置/环境变量。
-  if ((wantsMode && live.modeLocked === true) || (wantsLang && live.langLocked === true)) {
+  if ((wantsChannel && live.channelLocked === true) || (wantsTier && live.tierLocked === true)
+    || (wantsMode && (live.channelLocked === true || live.tierLocked === true))
+    || (wantsLang && live.langLocked === true)) {
     sendJson(res, 409, {
       ok: false,
       error: { code: 'locked', message: '当前值由装配配置或环境变量锁定' },
@@ -238,16 +261,19 @@ export async function handleControlRequest(ctx, req, res) {
     return;
   }
 
-  // 运行时在位：走服务，模式立即对新会话生效并落盘。
-  if (runtime !== undefined && (typeof runtime.setMode === 'function' || typeof runtime.setLang === 'function')) {
+  // 运行时在位：走服务，通道/档位立即对新会话生效并落盘（会话内切换排队到任务边界）。
+  if (runtime !== undefined && (typeof runtime.setChannel === 'function' || typeof runtime.setTier === 'function' || typeof runtime.setLang === 'function')) {
     let result = { ok: true, persisted: true };
-    if (wantsMode) result = runtime.setMode(body.mode);
+    if (wantsMode && typeof runtime.setMode === 'function') result = runtime.setMode(body.mode);
+    if (result.ok !== false && wantsChannel) result = runtime.setChannel(body.channel);
+    if (result.ok !== false && wantsTier) result = runtime.setTier(body.tier);
+    if (result.ok !== false && wantsBudget && typeof runtime.setBudget === 'function') result = runtime.setBudget(body.budget);
     if (result.ok !== false && wantsLang) result = runtime.setLang(body.lang);
     if (result.ok === false) {
-      const statusCode = result.code === 'locked' ? 409 : 400;
+      const statusCode = result.code === 'locked' ? 409 : result.code === 'rebase-limit' ? 409 : 400;
       sendJson(res, statusCode, {
         ok: false,
-        error: { code: result.code ?? 'refused', message: result.code === 'locked' ? '当前值由装配配置或环境变量锁定' : 'invalid value' },
+        error: { code: result.code ?? 'refused', message: result.detail ?? (result.code === 'locked' ? '当前值由装配配置或环境变量锁定' : 'invalid value') },
         status: currentStatus(ctx),
       });
       return;
@@ -258,7 +284,14 @@ export async function handleControlRequest(ctx, req, res) {
 
   // 降级：loop 没接管（装载失败/headless），只改状态文件，并明确告知需要重启。
   const next = {
-    mode: wantsMode ? body.mode : live.mode,
+    channel: wantsMode
+      ? ({ balanced: 'standard', lean: 'light', compat: 'deep', power: 'code' }[body.mode] !== undefined
+        ? (body.mode === 'power' ? 'code' : 'standard')
+        : live.channel)
+      : (wantsChannel ? body.channel : live.channel),
+    tier: wantsMode
+      ? ({ balanced: 'standard', lean: 'light', compat: 'deep', power: 'standard' }[body.mode] ?? live.tier)
+      : (wantsTier ? body.tier : live.tier),
     lang: wantsLang ? body.lang : live.lang,
   };
   try {

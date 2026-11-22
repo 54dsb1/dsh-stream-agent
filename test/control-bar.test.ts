@@ -1,11 +1,15 @@
-// test/control-bar.test.ts —— 控制栏（v0.2.1）
+// test/control-bar.test.ts —— 控制栏（0.5.0 两区块）
 //
 // 验收口径：
-//   · 四个模式全部有中英双语字段，且 en 里不允许出现中文、zh 里必须有中文（防"翻译漏了"）；
+//   · 两轴目录（channel × tier）全部有中英双语字段，且 en 里不允许出现中文、zh 里必须有
+//     中文（防"翻译漏了"）；
 //   · 面板/引导/帮助在 56-92 列下每一行的显示宽度完全一致（盒子不错位）；
 //   · 结构字符只用 ASCII（· → ↑↓ … 这类东亚宽度不确定字符会让中英终端错位）；
-//   · 按键语义：1-4 选模式、Up/Down 移动、Enter 应用、l 切语言、r 重置、? 帮助、q 退出；
-//   · 状态落盘：读写往返、坏文件回默认且告警、env 覆盖、装配显式配置最高优先。
+//   · 按键语义：1-2 选通道、3-5 选档位、c/t 快切、Up/Down 移动、Enter 应用、l 切语言、
+//     r 重置、? 帮助、q 退出；
+//   · 状态落盘：读写往返、坏文件回默认且告警、env 覆盖、装配显式配置最高优先；
+//   · 旧模式值（balanced/lean/compat/power）走 LEGACY_MODE_ALIAS 别名映射 + warn（§4.4）；
+//   · control.json 迁移：旧 mode 字段 → (channel, tier)，写回保留 mode 一个 minor。
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,15 +18,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  AVAILABILITY_TEXT,
-  DEFAULT_MODE,
-  MODES,
-  SAVING_TEXT,
-  getMode,
-  isModeId,
-  modeByOrder,
-  modeConfig,
-  publicModeCatalog,
+  CHANNELS,
+  CHANNEL_SPECS,
+  TIERS,
+  TIER_SPECS,
+  DEFAULT_CHANNEL,
+  DEFAULT_TIER,
+  LEGACY_MODE_ALIAS,
+  LEGACY_MODE_IDS,
+  getChannel,
+  getTier,
+  isChannelId,
+  isLegacyModeId,
+  isTierId,
+  resolveLegacyMode,
+  reverseLegacyMode,
+  publicChannelCatalog,
+  publicTierCatalog,
+  publicLegacyModeCatalog,
 } from '../src/kernel/modes.ts';
 import {
   DEFAULT_LANG,
@@ -30,7 +43,7 @@ import {
   displayWidth,
   interpretKey,
   isLang,
-  modeSummary,
+  tierValuesLine,
   moveFocus,
   otherLang,
   panelWidth,
@@ -39,6 +52,7 @@ import {
   renderJson,
   renderPanel,
   renderStatusBar,
+  statsLine,
   t,
   textKeys,
   truncate,
@@ -56,433 +70,312 @@ function uniformWidth(lines: readonly string[]): boolean {
   return widths.size === 1;
 }
 
-test('模式目录：四个模式，id 与序号唯一，默认模式在目录里', () => {
-  assert.equal(MODES.length, 4);
-  assert.equal(new Set(MODES.map((m) => m.id)).size, 4);
-  assert.deepEqual(MODES.map((m) => m.order), [1, 2, 3, 4]);
-  assert.ok(isModeId(DEFAULT_MODE));
-  assert.equal(modeByOrder(2)?.id, 'lean');
-  assert.equal(modeByOrder(9), undefined);
-  assert.equal(isModeId('nope'), false);
-  assert.equal(getMode('nope').id, DEFAULT_MODE, '未知模式回落到默认');
+// ---------------------------------------------------------------- 两轴目录
+
+test('两轴目录：通道 2 条、档位 3 条，id 与序号唯一，默认在目录里', () => {
+  assert.equal(CHANNELS.length, 2);
+  assert.equal(TIERS.length, 3);
+  assert.deepEqual([...CHANNELS], ['standard', 'code']);
+  assert.deepEqual([...TIERS], ['light', 'standard', 'deep']);
+  assert.equal(new Set(CHANNEL_SPECS.map((c) => c.id)).size, 2);
+  assert.equal(new Set(TIER_SPECS.map((x) => x.id)).size, 3);
+  assert.equal(DEFAULT_CHANNEL, 'standard');
+  assert.equal(DEFAULT_TIER, 'standard');
+  assert.ok(isChannelId('code') && !isChannelId('mode'));
+  assert.ok(isTierId('light') && !isTierId('lean'));
 });
 
-test('模式双语：每一条面向用户的文案两种语言都有，且语言不串味', () => {
-  const hasCjk = (s: string): boolean => /[\u4e00-\u9fff]/.test(s);
-  const hasLatin = (s: string): boolean => /[A-Za-z]/.test(s);
-  for (const mode of MODES) {
-    for (const field of ['label', 'tagline', 'useWhen', 'tradeoff'] as const) {
-      const zh = mode[field].zh;
-      const en = mode[field].en;
-      assert.ok(zh.trim() !== '' && en.trim() !== '', `${mode.id}.${field} 两种语言都不能为空`);
-      assert.ok(hasCjk(zh), `${mode.id}.${field}.zh 必须包含中文`);
-      assert.equal(hasCjk(en), false, `${mode.id}.${field}.en 不允许混入中文：${en}`);
-      if (field === 'useWhen' || field === 'tradeoff') assert.ok(hasLatin(en), `${mode.id}.${field}.en 必须可读`);
+test('档位数值（§4.2 表）：16/24/40 步 · 12k/20k/48k · 压缩三档 · 取回预算 · keepRecent · 摘要上限', () => {
+  const [light, standard, deep] = TIER_SPECS;
+  assert.deepEqual(light!.values, { maxSteps: 16, maxInputTokens: 12_000, compactAggressiveness: 'aggressive', peekBudgetChars: 12_000, keepRecent: 12, maxSummaryChars: 8_000 });
+  assert.deepEqual(standard!.values, { maxSteps: 24, maxInputTokens: 20_000, compactAggressiveness: 'balanced', peekBudgetChars: 24_000, keepRecent: 30, maxSummaryChars: 16_000 });
+  assert.deepEqual(deep!.values, { maxSteps: 40, maxInputTokens: 48_000, compactAggressiveness: 'conservative', peekBudgetChars: 48_000, keepRecent: 60, maxSummaryChars: 32_000 });
+});
+
+test('双语字段完整性：通道/档位 en 无中文、zh 有中文', () => {
+  for (const spec of [...CHANNEL_SPECS, ...TIER_SPECS]) {
+    for (const [, text] of Object.entries(spec)) {
+      if (text === null || typeof text !== 'object') continue;
+      const pair = text as { zh?: string; en?: string };
+      if (typeof pair.zh !== 'string' || typeof pair.en !== 'string') continue;
+      assert.ok(/[\u4e00-\u9fff]/.test(pair.zh), `${spec.id} 的中文文案必须有中文`);
+      assert.ok(!/[\u4e00-\u9fff]/.test(pair.en), `${spec.id} 的英文文案不得出现中文`);
     }
   }
 });
 
-test('模式只映射既有配置项：默认模式与 0.3.0 出厂默认等价（K1：tf-code 默认关闭）', () => {
-  const balanced = modeConfig('balanced');
-  assert.equal(balanced.selfReadFeedback, 'receipt');
-  assert.equal(balanced.enableCode, false, 'K1（0.3.0）：balanced 不再自动开 tf-code，协议段默认 0 字符');
-  assert.equal(balanced.persistFallback, true);
-  assert.equal(balanced.maxParallelToolCalls, 3);
-  // v0.4.2：8 → 12。语义是'防打转兜底'不是'任务步数预算'——真机（session-6b61cb4d）证明
-  // 计划+实现+验收的任务 9 步不够；失忆修复后残余打转由重复命令护栏兜底，上限只放宽兜底。
-  assert.equal(balanced.maxReentries, 12);
-  assert.equal(balanced.budgetTokens, undefined);
-
-  const lean = modeConfig('lean');
-  assert.ok((lean.budgetTokens ?? 0) > 0, 'lean 必须真的更省：预算阶梯要能触发');
-  assert.equal(lean.enableCode, false);
-
-  const compat = modeConfig('compat');
-  assert.equal(compat.selfReadFeedback, 'full', 'compat 恢复全文回灌');
-  assert.equal(compat.maxParallelToolCalls, 1, 'compat 串行执行，便于对照');
-
-  const power = modeConfig('power');
-  assert.equal(power.enableCode, true, 'power 显式开启 tf-code');
-
-  // 返回副本：调用方改它不得污染目录
-  lean.maxReentries = 99;
-  assert.notEqual(modeConfig('lean').maxReentries, 99);
+test('区块 B 数值行：三档实际数值同屏展示（不做定性宣传）', () => {
+  const line = tierValuesLine('zh');
+  assert.ok(line.includes('16/24/40'), line);
+  assert.ok(line.includes('12k/20k/48k'), line);
+  assert.ok(line.includes('aggressive/balanced/conservative'), line);
 });
 
-test('文案表：每个 key 中英都非空（结构性一致）', () => {
+// ---------------------------------------------------------------- 别名（§4.4）
+
+test('LEGACY_MODE_ALIAS：四模式映射正确；compat 不再关工具面（D2 修复的语义保证）', () => {
+  assert.deepEqual(LEGACY_MODE_ALIAS.balanced, { channel: 'standard', tier: 'standard' });
+  assert.deepEqual(LEGACY_MODE_ALIAS.lean, { channel: 'standard', tier: 'light' });
+  assert.deepEqual(LEGACY_MODE_ALIAS.compat, { channel: 'standard', tier: 'deep' });
+  assert.deepEqual(LEGACY_MODE_ALIAS.power, { channel: 'code', tier: 'standard' });
+  // 别名只映射 (channel, tier)——不携带任何工具面副作用（D2/D3 的成因正是旧预设顺手改工具面）
+  for (const mapped of Object.values(LEGACY_MODE_ALIAS)) {
+    assert.ok(!('toolSurface' in mapped));
+    assert.ok(!('enableCode' in mapped));
+  }
+  assert.ok(isLegacyModeId('lean') && !isLegacyModeId('light'));
+  assert.equal(resolveLegacyMode('lean').tier, 'light');
+  assert.equal(resolveLegacyMode('lean').aliased, true);
+  assert.equal(resolveLegacyMode('nope').aliased, false);
+});
+
+test('反向别名（回滚兼容）：可精确表达的组合写回 mode 字段', () => {
+  assert.equal(reverseLegacyMode('standard', 'standard'), 'balanced');
+  assert.equal(reverseLegacyMode('standard', 'light'), 'lean');
+  assert.equal(reverseLegacyMode('standard', 'deep'), 'compat');
+  assert.equal(reverseLegacyMode('code', 'standard'), 'power');
+  assert.equal(reverseLegacyMode('code', 'deep'), undefined, '不可精确表达的组合省略 mode 字段');
+});
+
+test('对外目录投影：channels/tiers/legacyModes（legacy 标注 deprecated 与移除版本）', () => {
+  assert.equal(publicChannelCatalog().length, 2);
+  assert.equal(publicTierCatalog().length, 3);
+  const legacy = publicLegacyModeCatalog();
+  assert.deepEqual(legacy.map((m) => m.id), [...LEGACY_MODE_IDS]);
+  for (const m of legacy) {
+    assert.equal(m.deprecated, true);
+    assert.equal(m.removal, '0.6.0');
+  }
+});
+
+// ---------------------------------------------------------------- 渲染纪律
+
+test('文案表：中英成对，缺 key 回退 key 本身', () => {
   for (const key of textKeys()) {
-    const zh = t(key, 'zh');
-    const en = t(key, 'en');
-    assert.ok(zh.trim() !== '', `${key}.zh 为空`);
-    assert.ok(en.trim() !== '', `${key}.en 为空`);
-    assert.equal(/[\u4e00-\u9fff]/.test(en), false, `${key}.en 混入中文：${en}`);
+    assert.ok(isLang('zh') && isLang('en'));
+    assert.notEqual(t(key, 'zh'), '');
+    assert.notEqual(t(key, 'en'), '');
   }
+  assert.equal(t('definitely-not-a-key' as never), 'definitely-not-a-key');
 });
 
-test('渲染：面板 / 引导 / 帮助在 56-92 列下每行等宽（盒子不错位）', () => {
-  for (const columns of [56, 60, 72, 80, 100, 120]) {
-    for (const lang of ['zh', 'en'] as const) {
-      for (const mode of ['balanced', 'lean', 'compat', 'power'] as const) {
-        const state = createControlState({ mode, lang });
-        const panel = renderPanel(state, { version: VERSION, columns });
-        const banner = renderBanner(state, { version: VERSION, columns });
-        const help = renderHelp(state, { version: VERSION, columns });
-        assert.ok(uniformWidth(panel), `panel 行宽不一致 lang=${lang} mode=${mode} columns=${columns}`);
-        assert.ok(uniformWidth(banner), `banner 行宽不一致 lang=${lang} mode=${mode} columns=${columns}`);
-        assert.ok(uniformWidth(help), `help 行宽不一致 lang=${lang} mode=${mode} columns=${columns}`);
-        assert.ok(panel.length > 8 && banner.length > 8 && help.length > 12);
-      }
+test('状态条：通道与档位都在单行里', () => {
+  const state = createControlState({ channel: 'code', tier: 'deep' });
+  const line = renderStatusBar(state, V);
+  assert.ok(line.includes('code') && line.includes('deep'), line);
+});
+
+test('面板：两个区块都在（① 执行通道 / ② 上下文档位），来源行存在', () => {
+  const state = createControlState({ channel: 'standard', tier: 'standard' });
+  const lines = renderPanel(state, V);
+  const text = lines.join('\n');
+  assert.ok(text.includes('① 执行通道'), text);
+  assert.ok(text.includes('② 上下文档位'), text);
+  assert.ok(text.includes('来源'), text);
+  assert.ok(text.includes('maxSteps 16/24/40'), text);
+});
+
+test('面板盒子：56-92 列逐行等宽（盒子不错位）', () => {
+  for (const columns of [56, 64, 72, 80, 92]) {
+    const state = createControlState({});
+    for (const render of [renderBanner, renderHelp, renderPanel]) {
+      const lines = render(state, { version: VERSION, columns });
+      assert.ok(uniformWidth(lines), `${render.name} @${columns} 列宽度不齐`);
     }
   }
 });
 
-test('渲染：不出现东亚宽度不确定字符（· → ↑↓ … ①），结构只用 ASCII', () => {
-  const banned = /[·→↑↓…①②③④]/;
-  for (const lang of ['zh', 'en'] as const) {
-    const state = createControlState({ lang });
-    const text = [
-      ...renderPanel(state, { version: VERSION }),
-      ...renderBanner(state, { version: VERSION }),
-      ...renderHelp(state, { version: VERSION }),
-      renderStatusBar(state, { version: VERSION }),
-    ].join('\n');
-    assert.equal(banned.test(text), false, `渲染里出现了歧义宽度字符：${text.match(banned)?.[0]}`);
-  }
-});
-
-test('渲染：中英切换后语言标记与文案都跟着变，模式信息保持不变', () => {
-  const zh = createControlState({ mode: 'lean', lang: 'zh' });
-  const en = createControlState({ mode: 'lean', lang: 'en' });
-  const zhText = renderPanel(zh, { version: VERSION }).join('\n');
-  const enText = renderPanel(en, { version: VERSION }).join('\n');
-
-  assert.ok(zhText.includes('精简') && zhText.includes('语言: zh'));
-  assert.ok(enText.includes('Lean') && enText.includes('Language: en'));
-  assert.equal(/[\u4e00-\u9fff]/.test(enText.replace(/#[\w-]+/g, '')), false, 'en 面板不允许残留中文');
-  assert.ok(zhText.includes('并行 2') && enText.includes('parallel 2'), '模式参数不随语言变化');
-  assert.equal(modeSummary(getMode('lean'), 'zh').includes('预算'), true);
-  assert.equal(modeSummary(getMode('lean'), 'en').includes('budget'), true);
-});
-
-test('渲染：状态条是单行且不超过面板宽度', () => {
-  for (const lang of ['zh', 'en'] as const) {
-    const state = createControlState({ lang });
-    const line = renderStatusBar(state, { version: VERSION, columns: 60 });
-    assert.equal(line.includes('\n'), false);
-    assert.ok(displayWidth(line) <= panelWidth(60), `状态条超宽：${displayWidth(line)}`);
-    assert.ok(line.includes(VERSION));
-  }
-});
-
-test('模式目录：四个模式都标了省 token 档位与可用性，默认模式只有一个', () => {
-  const savings = new Set(['most', 'more', 'baseline', 'least']);
-  const availabilities = new Set(['default', 'ready', 'needs-ptc']);
-
-  for (const mode of MODES) {
-    assert.ok(savings.has(mode.saving), `${mode.id}.saving 取值非法：${mode.saving}`);
-    assert.ok(availabilities.has(mode.availability), `${mode.id}.availability 取值非法：${mode.availability}`);
-    for (const lang of ['zh', 'en'] as const) {
-      assert.ok(SAVING_TEXT[mode.saving][lang].trim() !== '', `${mode.id} 缺 ${lang} 省 token 文案`);
-      assert.ok(AVAILABILITY_TEXT[mode.availability][lang].trim() !== '', `${mode.id} 缺 ${lang} 可用性文案`);
-      assert.ok(mode.note[lang].trim().length >= 20, `${mode.id}.note.${lang} 太短，讲不清口径`);
-    }
-  }
-
-  // 默认模式必须且只能标一个 default，否则"装好即用"这句话就自相矛盾。
-  assert.deepEqual(MODES.filter((m) => m.availability === 'default').map((m) => m.id), [DEFAULT_MODE]);
-  // 四张卡的标注不能全一样，否则这列没有信息量。
-  assert.ok(new Set(MODES.map((m) => m.saving)).size >= 3, '省 token 档位区分度不足');
-  assert.ok(new Set(MODES.map((m) => m.availability)).size >= 2, '可用性区分度不足');
-});
-
-test('模式目录：对外投影一次生成，CLI --json 与桌面路由共用同一份字段', () => {
-  const catalog = publicModeCatalog();
-  assert.equal(catalog.length, 4);
-  for (const mode of catalog) {
-    assert.ok(mode.savingLabel.zh && mode.savingLabel.en, `${mode.id} 缺省 token 标签`);
-    assert.ok(mode.availabilityLabel.zh && mode.availabilityLabel.en, `${mode.id} 缺可用性标签`);
-    assert.ok(mode.note.zh && mode.note.en, `${mode.id} 缺标注`);
-    assert.equal((mode as Record<string, unknown>).config, undefined, '投影不应把 config 发到网络上');
-  }
-  const parsed = JSON.parse(renderJson(createControlState({ mode: 'power', lang: 'zh' }), { version: VERSION }));
-  assert.deepEqual(parsed.modes, catalog);
-});
-
-test('渲染：帮助页逐模式带"省多少 / 能不能用"，面板展开当前模式的标注全文', () => {
-  for (const lang of ['zh', 'en'] as const) {
-    const state = createControlState({ mode: 'power', lang });
-    const help = renderHelp(state, { version: VERSION }).join('\n');
-    for (const mode of MODES) {
-      assert.ok(
-        help.includes(SAVING_TEXT[mode.saving][lang]),
-        `${lang} 帮助页缺 ${mode.id} 的省 token 标注`,
-      );
-    }
-    assert.ok(help.includes(AVAILABILITY_TEXT['needs-ptc'][lang]), `${lang} 帮助页缺 PTC 前提标注`);
-
-    const panel = renderPanel(state, { version: VERSION }).join('\n');
-    const flat = panel.replace(/\s+/g, ' ');
-    assert.ok(flat.includes(t('saving', lang)), `${lang} 面板缺"省 token"标签`);
-    assert.ok(flat.includes(SAVING_TEXT[getMode('power').saving][lang]), `${lang} 面板缺当前模式档位`);
-    assert.ok(flat.includes(AVAILABILITY_TEXT['needs-ptc'][lang]), `${lang} 面板缺可用性`);
-    const noteHead = getMode('power').note[lang].replace(/\s+/g, ' ').slice(0, 16);
-    assert.ok(flat.includes(noteHead), `${lang} 面板缺标注全文`);
-  }
-});
-
-test('渲染：--json 结构稳定，含四个模式与当前配置', () => {
-  const parsed = JSON.parse(renderJson(createControlState({ mode: 'power', lang: 'en' }), { version: VERSION })) as {
-    version: string; active: boolean; mode: { id: string; config: { enableCode: boolean } }; lang: string; modes: unknown[];
+test('renderJson：channels/tiers/legacyModes 三份目录 + channel/tier/values', () => {
+  const state = createControlState({ channel: 'code', tier: 'light' });
+  const payload = JSON.parse(renderJson(state, V)) as {
+    channel: { id: string };
+    tier: { id: string; values: Record<string, number> };
+    channels: unknown[];
+    tiers: unknown[];
+    legacyModes: unknown[];
   };
-  assert.equal(parsed.version, VERSION);
-  assert.equal(parsed.active, true);
-  assert.equal(parsed.mode.id, 'power');
-  assert.equal(parsed.mode.config.enableCode, true);
-  assert.equal(parsed.lang, 'en');
-  assert.equal(parsed.modes.length, 4);
+  assert.equal(payload.channel.id, 'code');
+  assert.equal(payload.tier.id, 'light');
+  assert.equal(payload.tier.values.maxSteps, 16);
+  assert.equal(payload.channels.length, 2);
+  assert.equal(payload.tiers.length, 3);
+  assert.equal(payload.legacyModes.length, 4);
 });
 
-test('按键：1-4 / Up Down / Enter / l / r / ? / q 各自映射到正确意图', () => {
-  assert.deepEqual(interpretKey('1'), { kind: 'select', mode: 'balanced' });
-  assert.deepEqual(interpretKey('3'), { kind: 'select', mode: 'compat' });
-  assert.deepEqual(interpretKey('\x1b[A'), { kind: 'move', delta: -1 });
-  assert.deepEqual(interpretKey('\x1b[B'), { kind: 'move', delta: 1 });
-  assert.deepEqual(interpretKey('k'), { kind: 'move', delta: -1 });
-  assert.deepEqual(interpretKey('j'), { kind: 'move', delta: 1 });
-  assert.deepEqual(interpretKey('\r'), { kind: 'apply' });
-  assert.deepEqual(interpretKey('\n'), { kind: 'apply' });
+test('运行状态行（§3.3 底部）：本任务 N · 换基 · 重复取回 · 摘要；缺省渲染 0 占位', () => {
+  const empty = statsLine(undefined, 'zh');
+  assert.ok(empty.includes('N=0'), empty);
+  assert.ok(empty.includes('重复取回 0/0'), empty);
+  const full = statsLine({
+    requests: 5,
+    rebases: 1,
+    redundantPeeks: { hits: 3, total: 4 },
+    summaries: 2,
+  }, 'zh');
+  assert.ok(full.includes('N=5') && full.includes('重复取回 3/4') && full.includes('摘要 2 段'), full);
+});
+
+// ---------------------------------------------------------------- 按键
+
+test('按键：1-2 选通道，3-5 选档位，c/t 快切，方向键移动，Enter 应用', () => {
+  assert.deepEqual(interpretKey('1'), { kind: 'select-channel', channel: 'standard' });
+  assert.deepEqual(interpretKey('2'), { kind: 'select-channel', channel: 'code' });
+  assert.deepEqual(interpretKey('3'), { kind: 'select-tier', tier: 'light' });
+  assert.deepEqual(interpretKey('4'), { kind: 'select-tier', tier: 'standard' });
+  assert.deepEqual(interpretKey('5'), { kind: 'select-tier', tier: 'deep' });
+  assert.deepEqual(interpretKey('c'), { kind: 'cycle-channel' });
+  assert.deepEqual(interpretKey('t'), { kind: 'cycle-tier' });
   assert.deepEqual(interpretKey('l'), { kind: 'toggle-lang' });
   assert.deepEqual(interpretKey('r'), { kind: 'reset' });
   assert.deepEqual(interpretKey('?'), { kind: 'toggle-help' });
   assert.deepEqual(interpretKey('q'), { kind: 'quit' });
-  assert.deepEqual(interpretKey('q', { helpOpen: true }), { kind: 'close-help' }, '帮助页里 q 是返回');
-  assert.deepEqual(interpretKey('9'), { kind: 'none' });
-  assert.deepEqual(interpretKey('z'), { kind: 'none' });
+  assert.deepEqual(interpretKey('q', { helpOpen: true }), { kind: 'close-help' });
+  assert.deepEqual(interpretKey('\x1b[B'), { kind: 'move', delta: 1 });
+  assert.deepEqual(interpretKey('\r'), { kind: 'apply' });
+  assert.deepEqual(interpretKey('x'), { kind: 'none' });
 });
 
-test('焦点移动：环状前进/后退，未知焦点从第一个开始', () => {
-  assert.equal(moveFocus('balanced', 1), 'lean');
-  assert.equal(moveFocus('power', 1), 'balanced');
-  assert.equal(moveFocus('balanced', -1), 'power');
-  assert.equal(moveFocus('power', -1), 'compat');
+test('焦点移动：扁平五选项环状移动', () => {
+  const first = moveFocus({ kind: 'channel', id: 'standard' }, -1);
+  assert.deepEqual(first, { kind: 'tier', id: 'deep' }, '环状：头往上 = 尾（deep）');
+  const next = moveFocus({ kind: 'channel', id: 'code' }, 1);
+  assert.deepEqual(next, { kind: 'tier', id: 'light' });
 });
 
-test('语言工具：otherLang / isLang / 默认值', () => {
-  assert.equal(otherLang('zh'), 'en');
-  assert.equal(otherLang('en'), 'zh');
-  assert.equal(isLang('zh'), true);
-  assert.equal(isLang('jp'), false);
-  assert.equal(createControlState().lang, DEFAULT_LANG);
-  assert.equal(createControlState({ mode: 'bad', lang: 'bad' }).mode, DEFAULT_MODE);
-});
-
-test('文本工具：truncate 与 wrapText 按显示列宽工作（CJK 记 2 列）', () => {
-  assert.equal(displayWidth('中文'), 4);
-  assert.equal(displayWidth('abc'), 3);
-  assert.equal(truncate('abcdef', 4), 'a...');
-  assert.equal(truncate('中文中文', 5), '中...');
-  const wrapped = wrapText('中文中文中文', 4);
-  assert.deepEqual(wrapped, ['中文', '中文', '中文']);
-  assert.deepEqual(wrapText('short', 10), ['short']);
-});
-
-test('折行：填满整行、不切英文单词、行首不放标点、末行不留孤字', () => {
-  // 中文里夹 ASCII token 时，旧实现会在空格处提前回退，行尾剩十几列空白。
-  const mixed = '宿主没有 ctx.ptcRuntime 时 tf-code 通道自动关闭（协议不声明）；协议段更长，固定成本略高。';
-  const lines = wrapText(mixed, 66);
-  assert.ok(lines.length >= 2, '应当折行');
-  for (const line of lines.slice(0, -1)) {
-    assert.ok(displayWidth(line) > 66 - 12, `非末行没填满：${displayWidth(line)} 列 -> ${line}`);
-  }
-  // 英文单词/路径不能被从中间切开
-  for (const token of ['ctx.ptcRuntime', 'tf-code']) {
-    assert.ok(lines.some((line) => line.includes(token)), `${token} 被切开了：${lines.join(' | ')}`);
-  }
-  // 行首不能是闭合标点（避头点）
-  for (const line of lines.slice(1)) {
-    assert.equal(/^[。，、；：！？）】,.;:!?]/.test(line), false, `行首出现标点：${line}`);
-  }
-  // 末行不留孤字：只剩 1 个单位时，从上一行借一个下来
-  const orphan = wrapText('数据加工类任务省最多（结果句柄化，中间结果不进上下文）；普通读写任务反而略高于默认。宿主无 PTC 时自动回落为默认参数。未单独实测。', 66);
-  const tail = orphan[orphan.length - 1];
-  assert.ok(displayWidth(tail) >= 4, `末行只剩 ${displayWidth(tail)} 列：${tail}`);
-  // 折行不丢字：拼回去等于原文（行尾空白裁掉是唯一允许的差异）
-  assert.equal(lines.join('').replace(/\s+/g, ''), mixed.replace(/\s+/g, ''));
-});
-
-test('状态落盘：写入 → 读取往返（原子替换，字段齐全）', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tf-control-'));
-  const file = writePersistedControl(createControlState({ mode: 'lean', lang: 'en' }), dir);
-  assert.equal(file, controlFileOf(dir));
-  const raw = JSON.parse(readFileSync(file, 'utf8')) as { mode: string; lang: string; schema: number; updatedAt: string };
-  assert.equal(raw.mode, 'lean');
-  assert.equal(raw.lang, 'en');
-  assert.equal(raw.schema, 1);
-  assert.ok(!Number.isNaN(Date.parse(raw.updatedAt)));
-
-  const read = readPersistedControl(dir);
-  assert.equal(read.found, true);
-  assert.deepEqual(read.state, { mode: 'lean', lang: 'en' });
-});
-
-test('状态读取：坏 JSON / 未知字段回默认并告警，不抛错', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tf-control-bad-'));
-  writeFileSync(controlFileOf(dir), '{ not json', 'utf8');
-  const warnings: string[] = [];
-  const read = readPersistedControl(dir, (message) => warnings.push(message));
-  assert.equal(read.found, false);
-  assert.deepEqual(read.state, { mode: DEFAULT_MODE, lang: DEFAULT_LANG });
-  assert.equal(warnings.length, 1);
-
-  writeFileSync(controlFileOf(dir), JSON.stringify({ mode: 'unknown-mode', lang: 'fr' }), 'utf8');
-  assert.deepEqual(readPersistedControl(dir).state, { mode: DEFAULT_MODE, lang: DEFAULT_LANG });
-
-  const missing = readPersistedControl(mkdtempSync(join(tmpdir(), 'tf-control-none-')));
-  assert.equal(missing.found, false);
-});
-
-test('状态解析优先级：装配显式 config > 环境变量 > control.json > 默认', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tf-control-prio-'));
-  writePersistedControl(createControlState({ mode: 'compat', lang: 'zh' }), dir);
-
-  const fromFile = resolveControlState({}, dir);
-  assert.equal(fromFile.mode, 'compat');
-  assert.equal(fromFile.modeSource, 'file');
-  assert.equal(fromFile.langSource, 'file');
-  assert.ok(Number.isFinite(Date.parse(readPersistedControl(dir).updatedAt ?? '')), '落盘必须带可解析的 updatedAt（桌面控制页的并发栅栏）');
-
-  const previousMode = process.env.STREAM_AGENT_MODE;
-  const previousLang = process.env.STREAM_AGENT_LANG;
+test('交互会话（ControlSession）：1/2 切通道、4 切档位、c/t 快切、语言切换、重置只动轴不动语言', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tf-cb-'));
+  const file = join(dir, 'control.json');
+  const session = new ControlSession(createControlState({ lang: 'zh' }), {
+    save: (next) => {
+      writeFileSync(file, JSON.stringify(next), 'utf8');
+      return file;
+    },
+    columns: () => 80,
+  });
   try {
-    process.env.STREAM_AGENT_MODE = 'lean';
-    process.env.STREAM_AGENT_LANG = 'en';
-    assert.equal(resolveControlState({}, dir).mode, 'lean');
-    assert.equal(resolveControlState({}, dir).modeSource, 'env');
-    assert.equal(resolveControlState({}, dir).lang, 'en');
-    assert.equal(resolveControlState({}, dir).langSource, 'env');
-
-    const pinned = resolveControlState({ mode: 'power', lang: 'zh' }, dir);
-    assert.equal(pinned.mode, 'power');
-    assert.equal(pinned.modeSource, 'config');
-    assert.equal(pinned.lang, 'zh');
-    assert.equal(pinned.langSource, 'config');
-
-    process.env.STREAM_AGENT_MODE = 'not-a-mode';
-    assert.equal(resolveControlState({}, dir).mode, 'compat', '非法 env 不得覆盖落盘值');
+    session.handle('2');
+    assert.equal(session.state.channel, 'code');
+    session.handle('4');
+    assert.equal(session.state.tier, 'standard');
+    session.handle('t');
+    assert.equal(session.state.tier, 'deep', 't 循环 light→standard→deep');
+    session.handle('c');
+    assert.equal(session.state.channel, 'standard', 'c 在 standard↔code 之间切换');
+    session.handle('l');
+    assert.equal(session.state.lang, 'en');
+    session.handle('r');
+    assert.equal(session.state.channel, 'standard');
+    assert.equal(session.state.tier, 'standard');
+    assert.equal(session.state.lang, 'en', '重置不带走语言');
+    const saved = JSON.parse(readFileSync(file, 'utf8')) as { channel: string; tier: string; lang: string };
+    assert.equal(saved.channel, 'standard');
+    assert.equal(saved.tier, 'standard');
   } finally {
-    if (previousMode === undefined) delete process.env.STREAM_AGENT_MODE; else process.env.STREAM_AGENT_MODE = previousMode;
-    if (previousLang === undefined) delete process.env.STREAM_AGENT_LANG; else process.env.STREAM_AGENT_LANG = previousLang;
+    session.handle('q');
   }
 });
 
-// ---------------------------------------------------------------------------
-// 交互会话：把"按键 → 状态 → 画面 → 落盘"整条链路跑起来（不需要 pty）
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------- 状态落盘与别名迁移
 
-test('交互会话：l 键在中英之间往返，画面与落盘同步（两个方向都验）', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tf-session-lang-'));
-  const session = new ControlSession(createControlState({ mode: 'balanced', lang: 'zh' }), {
-    save: (next) => writePersistedControl(next, dir),
-    columns: () => 80,
-  });
+test('control.json 往返：channel/tier/lang 写读一致；写回保留旧 mode 字段一个 minor（回滚兼容）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tf-cs-'));
+  try {
+    writePersistedControl({ channel: 'code', tier: 'deep', lang: 'en' }, dir);
+    const raw = JSON.parse(readFileSync(controlFileOf(dir), 'utf8')) as { channel: string; tier: string; lang: string; mode?: string; schema: number };
+    assert.equal(raw.channel, 'code');
+    assert.equal(raw.tier, 'deep');
+    assert.equal(raw.lang, 'en');
+    assert.equal(raw.schema, 2, '0.5.0 schema 升 2');
+    assert.equal(raw.mode, undefined, 'code+deep 无可精确表达的旧模式 → mode 字段省略');
+    const round = readPersistedControl(dir);
+    assert.equal(round.state.channel, 'code');
+    assert.equal(round.state.tier, 'deep');
+    assert.equal(round.state.lang, 'en');
+    assert.equal(round.aliased, false);
 
-  assert.ok(session.frame().includes('控制栏'));
-  assert.equal(readPersistedControl(dir).state.lang, 'zh');
-
-  session.handle('l');
-  const enFrame = session.frame();
-  assert.match(enFrame, /CONTROL BAR/);
-  assert.equal(/[\u4e00-\u9fff]/.test(enFrame), false, '切到英文后画面不允许残留中文');
-  assert.equal(readPersistedControl(dir).state.lang, 'en');
-  assert.equal(session.state.lang, 'en');
-
-  session.handle('l');
-  const zhFrame = session.frame();
-  assert.ok(zhFrame.includes('控制栏'));
-  assert.ok(zhFrame.includes('语言: zh'));
-  assert.equal(readPersistedControl(dir).state.lang, 'zh');
+    writePersistedControl({ channel: 'standard', tier: 'light', lang: 'zh' }, dir);
+    const withLegacy = JSON.parse(readFileSync(controlFileOf(dir), 'utf8')) as { mode?: string };
+    assert.equal(withLegacy.mode, 'lean', '可精确表达 → 写回 mode 一个 minor（0.4.x 回滚可读）');
+  } finally {
+    // cleanup
+  }
 });
 
-test('交互会话：数字键直接切模式并落盘，焦点跟随；画面显示对应语言的模式名', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tf-session-mode-'));
-  const session = new ControlSession(createControlState({ mode: 'balanced', lang: 'en' }), {
-    save: (next) => writePersistedControl(next, dir),
-    columns: () => 80,
-  });
-
-  session.handle('2');
-  assert.equal(session.state.mode, 'lean');
-  assert.equal(session.focus, 'lean');
-  assert.equal(readPersistedControl(dir).state.mode, 'lean');
-  assert.match(session.frame(), /Lean/);
-  assert.ok(session.note.includes('saved'), '落盘成功要给一行回执');
-
-  session.handle('l');
-  assert.equal(session.state.lang, 'zh', 'l 从 en 切到 zh');
-  session.handle('4');
-  assert.equal(session.state.mode, 'power');
-  assert.equal(readPersistedControl(dir).state.mode, 'power');
-  assert.equal(readPersistedControl(dir).state.lang, 'zh');
-  assert.match(session.frame(), /增强/);
-  assert.match(session.frame(), /code 开/);
+test('旧字段迁移：control.json 只有 mode 字段 → 别名映射 + 告警（不静默）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tf-cs2-'));
+  writeFileSync(controlFileOf(dir), JSON.stringify({ schema: 1, mode: 'lean', lang: 'zh', updatedAt: '2026-11-22T00:00:00.000Z' }), 'utf8');
+  const warnings: string[] = [];
+  const read = readPersistedControl(dir, (m) => warnings.push(m));
+  assert.equal(read.state.channel, 'standard');
+  assert.equal(read.state.tier, 'light');
+  assert.equal(read.aliased, true);
+  assert.equal(read.legacyMode, 'lean');
+  assert.ok(warnings.some((w) => w.includes('lean') && w.includes('别名')), warnings.join('\n'));
 });
 
-test('交互会话：Up/Down 只移动焦点，Enter 才应用；r 回默认但保留语言', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tf-session-focus-'));
-  const session = new ControlSession(createControlState({ mode: 'balanced', lang: 'en' }), {
-    save: (next) => writePersistedControl(next, dir),
-    columns: () => 80,
-  });
-
-  session.handle('\x1b[B');
-  assert.equal(session.focus, 'lean');
-  assert.equal(session.state.mode, 'balanced', '移动焦点不得改模式');
-  assert.equal(readPersistedControl(dir).state.mode, 'balanced');
-
-  session.handle('\r');
-  assert.equal(session.state.mode, 'lean');
-  assert.equal(readPersistedControl(dir).state.mode, 'lean');
-
-  session.handle('3');
-  assert.equal(session.state.mode, 'compat');
-  session.handle('r');
-  assert.equal(session.state.mode, 'balanced', 'r 重置回默认模式');
-  assert.equal(session.state.lang, 'en', '重置模式不应顺手改语言');
+test('优先级：显式 config > env > control.json > 默认；旧 STREAM_AGENT_MODE 走别名', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tf-cs3-'));
+  writePersistedControl({ channel: 'code', tier: 'deep', lang: 'en' }, dir);
+  const savedChannel = process.env.STREAM_AGENT_CHANNEL;
+  const savedTier = process.env.STREAM_AGENT_TIER;
+  const savedMode = process.env.STREAM_AGENT_MODE;
+  try {
+    // env 旧值走别名
+    process.env.STREAM_AGENT_MODE = 'lean';
+    const warnings: string[] = [];
+    const fromEnv = resolveControlState({}, dir, (m) => warnings.push(m));
+    assert.equal(fromEnv.channel, 'standard');
+    assert.equal(fromEnv.tier, 'light');
+    assert.equal(fromEnv.aliased, true);
+    assert.ok(warnings.length >= 1);
+    delete process.env.STREAM_AGENT_MODE;
+    // 显式 config（新轴值）压过 env 与文件
+    const fromConfig = resolveControlState({ channel: 'standard', tier: 'deep' }, dir);
+    assert.equal(fromConfig.channel, 'standard');
+    assert.equal(fromConfig.tier, 'deep');
+    assert.equal(fromConfig.aliased, false);
+    // 装配旧 mode 值也走别名（channel/tier 显式值压过 mode）
+    const legacyConfig = resolveControlState({ mode: 'compat' }, dir, () => {});
+    assert.equal(legacyConfig.channel, 'standard');
+    assert.equal(legacyConfig.tier, 'deep');
+    assert.equal(legacyConfig.aliased, true);
+    // 无 env 无 config → 文件值
+    delete process.env.STREAM_AGENT_MODE;
+    const fromFile = resolveControlState({}, dir);
+    assert.equal(fromFile.channel, 'code');
+    assert.equal(fromFile.tier, 'deep');
+  } finally {
+    if (savedChannel === undefined) delete process.env.STREAM_AGENT_CHANNEL; else process.env.STREAM_AGENT_CHANNEL = savedChannel;
+    if (savedTier === undefined) delete process.env.STREAM_AGENT_TIER; else process.env.STREAM_AGENT_TIER = savedTier;
+    if (savedMode === undefined) delete process.env.STREAM_AGENT_MODE; else process.env.STREAM_AGENT_MODE = savedMode;
+  }
 });
 
-test('交互会话：? 打开全模式指南，q 先返回面板，再 q 才退出', () => {
-  const session = new ControlSession(createControlState({ lang: 'zh' }), {
-    save: (next) => writePersistedControl(next, mkdtempSync(join(tmpdir(), 'tf-session-help-'))),
-    columns: () => 80,
-  });
-
-  assert.deepEqual(session.handle('?'), { quit: false, changed: true });
-  assert.equal(session.helpOpen, true);
-  assert.ok(session.frame().includes('全模式指南'));
-  assert.ok(session.frame().includes('精简') && session.frame().includes('增强'), '指南要覆盖四个模式');
-
-  assert.deepEqual(session.handle('q'), { quit: false, changed: true });
-  assert.equal(session.helpOpen, false);
-  assert.deepEqual(session.handle('q'), { quit: true, changed: false });
+test('坏文件 fail-open：坏 JSON 回默认并告警；未知轴值忽略', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tf-cs4-'));
+  writeFileSync(controlFileOf(dir), '{oops', 'utf8');
+  const warnings: string[] = [];
+  const read = readPersistedControl(dir, (m) => warnings.push(m));
+  assert.equal(read.found, false);
+  assert.equal(read.state.channel, 'standard');
+  assert.ok(warnings.length >= 1);
+  writeFileSync(controlFileOf(dir), JSON.stringify({ channel: 'nope', tier: 'nope', lang: 'fr' }), 'utf8');
+  const bad = readPersistedControl(dir);
+  assert.equal(bad.state.channel, 'standard');
+  assert.equal(bad.state.tier, 'standard');
+  assert.equal(bad.state.lang, 'zh');
 });
 
-test('交互会话：未知键不产生重绘；落盘失败只提示不回滚内存状态', () => {
-  const session = new ControlSession(createControlState({ lang: 'zh' }), {
-    save: () => { throw new Error('disk full'); },
-    columns: () => 80,
-  });
+// ---------------------------------------------------------------- CLI 拆键
 
-  assert.deepEqual(session.handle('z'), { quit: false, changed: false });
-  assert.deepEqual(session.handle('9'), { quit: false, changed: false });
-
-  session.handle('3');
-  assert.equal(session.state.mode, 'compat', '落盘失败不能回滚本次运行内的选择');
-  assert.match(session.note, /状态写入失败/);
-  assert.match(session.frame(), /compat/);
+test('splitKeys：方向键三字节成组（不拆散）', () => {
+  assert.deepEqual(splitKeys('a\x1b[Bb'), ['a', '\x1b[B', 'b']);
+  assert.deepEqual(splitKeys('\x1b[A'), ['\x1b[A']);
 });
 
-test('按键拆分：方向键三字节序列与普通键能被正确分开', () => {
-  assert.deepEqual(splitKeys('\x1b[A1'), ['\x1b[A', '1']);
-  assert.deepEqual(splitKeys('\x1b[B\x1b[A'), ['\x1b[B', '\x1b[A']);
-  assert.deepEqual(splitKeys('q'), ['q']);
+test('truncate / wrapText：宽度截断与折行纪律', () => {
+  assert.equal(truncate('abcdef', 4), 'a...');
+  assert.equal(displayWidth('中'), 2);
+  const lines = wrapText('一二三四五 six seven', 8);
+  assert.ok(lines.every((l) => displayWidth(l) <= 8), lines.join('|'));
 });

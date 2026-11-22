@@ -65,32 +65,39 @@ async function invoke(ctx: any, req: any): Promise<any> {
 function runtimeStub(overrides: Record<string, unknown> = {}): any {
   const calls: string[] = [];
   const status = {
-    version: '0.2.1',
+    version: '0.5.0',
     takeover: true,
-    mode: 'balanced',
-    modeSource: 'file',
-    modeLocked: false,
+    channel: 'standard',
+    channelSource: 'file',
+    channelLocked: false,
+    tier: 'standard',
+    tierSource: 'file',
+    tierLocked: false,
     lang: 'zh',
     langSource: 'file',
     langLocked: false,
     effective: {
-      selfReadFeedback: 'receipt',
-      enableCode: 'auto',
-      persistFallback: true,
-      maxParallelToolCalls: 3,
-      maxReentries: 8,
-      budgetTokens: null,
+      maxSteps: 24,
+      maxInputTokens: 20000,
+      compactAggressiveness: 'balanced',
+      surfacePolicy: 'reserved-only',
     },
-    modes: [],
-    updatedAt: '2026-11-16T00:00:00.000Z',
+    channels: [],
+    tiers: [],
+    legacyModes: [],
+    updatedAt: '2026-11-22T00:00:00.000Z',
     stateFile: '/tmp/control.json',
     ...overrides,
   };
   return {
     calls,
     status: () => status,
-    setMode(mode: string) {
-      calls.push(`mode:${mode}`);
+    setChannel(channel: string) {
+      calls.push(`channel:${channel}`);
+      return { ok: true, persisted: true };
+    },
+    setTier(tier: string) {
+      calls.push(`tier:${tier}`);
       return { ok: true, persisted: true };
     },
     setLang(lang: string) {
@@ -178,58 +185,56 @@ test('文案表：中英键集合完全一致，且没有空串或遗漏翻译',
   }
 });
 
-test('路由 GET：运行时在位时返回接管状态与四模式目录', async () => {
+test('路由 GET：运行时在位时返回接管状态与两轴目录', async () => {
   const runtime = runtimeStub();
   const res = await invoke(ctxWith({ streamAgentRuntime: runtime }), makeReq());
   assert.equal(res.status, 200);
   const body = JSON.parse(res.payload);
   assert.equal(body.ok, true);
   assert.equal(body.status.takeover, true);
-  assert.equal(body.status.mode, 'balanced');
-  assert.equal(body.status.modeSource, 'file');
+  assert.equal(body.status.channel, 'standard');
+  assert.equal(body.status.channelSource, 'file');
+  assert.equal(body.status.tier, 'standard');
 });
 
-test('路由 GET：模式目录带省 token 档位、可用性与标注（页面据此渲染，不自己编）', async () => {
-  // 运行时缺席时走 fallbackStatus()，它自己拼 modes——这条路径以前漏过字段，
-  // 所以专门在降级分支上断言，避免"有 loop 时页面有标注、没 loop 时没有"。
+test('路由 GET：降级分支的目录投影带通道/档位/旧别名（页面据此渲染，不自己编）', async () => {
+  // 运行时缺席时走 fallbackStatus()，它自己拼 channels/tiers/legacyModes——
+  // 专门在降级分支上断言，避免"有 loop 时页面有目录、没 loop 时没有"。
   const res = await invoke(ctxWith({}), makeReq());
   const body = JSON.parse(res.payload);
-  assert.equal(body.status.modes.length, 4);
-  for (const mode of body.status.modes) {
-    assert.ok(['most', 'more', 'baseline', 'least'].includes(mode.saving), `${mode.id} 缺省 token 档位`);
-    assert.ok(mode.savingLabel.zh && mode.savingLabel.en, `${mode.id} 缺双语档位标签`);
-    assert.ok(['default', 'ready', 'needs-ptc'].includes(mode.availability), `${mode.id} 缺可用性`);
-    assert.ok(mode.availabilityLabel.zh && mode.availabilityLabel.en, `${mode.id} 缺双语可用性标签`);
-    assert.ok(mode.note.zh && mode.note.en, `${mode.id} 缺双语标注`);
-  }
+  assert.equal(body.status.channels.length, 2);
+  assert.equal(body.status.tiers.length, 3);
+  assert.ok(body.status.tiers.every((x) => x.values && typeof x.values.maxSteps === 'number'), '档位目录带实际数值');
+  assert.equal(body.status.legacyModes.length, 4);
+  assert.ok(body.status.legacyModes.every((m) => m.deprecated === true && m.removal === '0.6.0'), '旧模式目录标注弃用与移除版本');
 });
 
-test('路由 POST：切模式/语言走运行时服务，并回报 persisted', async () => {
+test('路由 POST：切通道/档位/语言走运行时服务，并回报 persisted', async () => {
   const runtime = runtimeStub();
   const ctx = ctxWith({ streamAgentRuntime: runtime });
 
-  const modeRes = await invoke(
+  const channelRes = await invoke(
     ctx,
     makeReq({
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ mode: 'lean', expectedUpdatedAt: '2026-11-16T00:00:00.000Z' }),
+      body: JSON.stringify({ channel: 'code', tier: 'light', expectedUpdatedAt: '2026-11-22T00:00:00.000Z' }),
     }),
   );
-  assert.equal(modeRes.status, 200);
-  assert.equal(JSON.parse(modeRes.payload).persisted, true);
-  assert.deepEqual(runtime.calls, ['mode:lean']);
+  assert.equal(channelRes.status, 200);
+  assert.equal(JSON.parse(channelRes.payload).persisted, true);
+  assert.deepEqual(runtime.calls, ['channel:code', 'tier:light']);
 
   const langRes = await invoke(
     ctx,
     makeReq({
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ lang: 'en', expectedUpdatedAt: '2026-11-16T00:00:00.000Z' }),
+      body: JSON.stringify({ lang: 'en', expectedUpdatedAt: '2026-11-22T00:00:00.000Z' }),
     }),
   );
   assert.equal(langRes.status, 200);
-  assert.deepEqual(runtime.calls, ['mode:lean', 'lang:en']);
+  assert.deepEqual(runtime.calls, ['channel:code', 'tier:light', 'lang:en']);
 });
 
 test('路由 POST：过期 expectedUpdatedAt 返回 409 + 最新状态（多窗口不互相覆盖）', async () => {
@@ -239,13 +244,13 @@ test('路由 POST：过期 expectedUpdatedAt 返回 409 + 最新状态（多窗�
     makeReq({
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ mode: 'lean', expectedUpdatedAt: '2020-01-01T00:00:00.000Z' }),
+      body: JSON.stringify({ channel: 'code', expectedUpdatedAt: '2020-01-01T00:00:00.000Z' }),
     }),
   );
   assert.equal(res.status, 409);
   const body = JSON.parse(res.payload);
   assert.equal(body.error.code, 'stale');
-  assert.equal(body.status.mode, 'balanced');
+  assert.equal(body.status.channel, 'standard');
   assert.deepEqual(runtime.calls, []);
 });
 
@@ -259,11 +264,11 @@ test('路由 POST：expectedUpdatedAt=null 只在文件尚未写入时放行（�
     makeReq({
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ mode: 'lean', expectedUpdatedAt: null }),
+      body: JSON.stringify({ channel: 'code', expectedUpdatedAt: null }),
     }),
   );
   assert.equal(first.status, 200);
-  assert.deepEqual(virgin.calls, ['mode:lean']);
+  assert.deepEqual(virgin.calls, ['channel:code']);
 
   const written = runtimeStub();
   const late = await invoke(
@@ -271,7 +276,7 @@ test('路由 POST：expectedUpdatedAt=null 只在文件尚未写入时放行（�
     makeReq({
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ mode: 'lean', expectedUpdatedAt: null }),
+      body: JSON.stringify({ channel: 'code', expectedUpdatedAt: null }),
     }),
   );
   assert.equal(late.status, 409);
@@ -293,13 +298,13 @@ test('路由 POST：expectedUpdatedAt=null 只在文件尚未写入时放行（�
 });
 
 test('路由 POST：装配配置/环境变量锁定时拒绝修改', async () => {
-  const runtime = runtimeStub({ modeSource: 'config', modeLocked: true });
+  const runtime = runtimeStub({ channelSource: 'config', channelLocked: true });
   const res = await invoke(
     ctxWith({ streamAgentRuntime: runtime }),
     makeReq({
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ mode: 'power' }),
+      body: JSON.stringify({ channel: 'code' }),
     }),
   );
   assert.equal(res.status, 409);
@@ -307,7 +312,7 @@ test('路由 POST：装配配置/环境变量锁定时拒绝修改', async () =>
   assert.deepEqual(runtime.calls, []);
 });
 
-test('路由边界：未鉴权 401、跨站 403、非 JSON 415、非法模式 400', async () => {
+test('路由边界：未鉴权 401、跨站 403、非 JSON 415、非法通道/档位 400', async () => {
   const deniedCtx = { get: () => ({ admit: () => ({ rejection: 401 }) }) };
   assert.equal((await invoke(deniedCtx, makeReq())).status, 401);
 
@@ -319,19 +324,26 @@ test('路由边界：未鉴权 401、跨站 403、非 JSON 415、非法模式 40
 
   const notJson = await invoke(
     ctxWith({}),
-    makeReq({ method: 'POST', headers: { 'content-type': 'text/plain' }, body: 'mode=lean' }),
+    makeReq({ method: 'POST', headers: { 'content-type': 'text/plain' }, body: 'channel=code' }),
   );
   assert.equal(notJson.status, 415);
 
-  const badMode = await invoke(
+  const badChannel = await invoke(
     ctxWith({}),
-    makeReq({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'turbo' }) }),
+    makeReq({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ channel: 'turbo' }) }),
   );
-  assert.equal(badMode.status, 400);
-  assert.equal(JSON.parse(badMode.payload).error.code, 'invalid-mode');
+  assert.equal(badChannel.status, 400);
+  assert.equal(JSON.parse(badChannel.payload).error.code, 'invalid-channel');
+
+  const badTier = await invoke(
+    ctxWith({}),
+    makeReq({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tier: 'ultra' }) }),
+  );
+  assert.equal(badTier.status, 400);
+  assert.equal(JSON.parse(badTier.payload).error.code, 'invalid-tier');
 });
 
-test('降级路径：运行时缺席时写状态文件，并明确告知需要重启', async () => {
+test('降级路径：运行时缺席时写状态文件（旧 mode 值按别名映射），并明确告知需要重启', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tf-ui-fallback-'));
   const previous = process.env.STREAM_AGENT_STATE_DIR;
   process.env.STREAM_AGENT_STATE_DIR = dir;
@@ -341,14 +353,15 @@ test('降级路径：运行时缺席时写状态文件，并明确告知需要�
       makeReq({
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ mode: 'compat', lang: 'en' }),
+        body: JSON.stringify({ channel: 'standard', tier: 'deep', lang: 'en' }),
       }),
     );
     assert.equal(res.status, 200);
     const body = JSON.parse(res.payload);
     assert.equal(body.degraded, true);
     assert.equal(body.status.takeover, false);
-    assert.equal(body.status.mode, 'compat');
+    assert.equal(body.status.channel, 'standard');
+    assert.equal(body.status.tier, 'deep');
     assert.equal(body.status.lang, 'en');
     assert.ok(body.notice.includes('重启'));
     assert.ok(existsSync(join(dir, 'control.json')));

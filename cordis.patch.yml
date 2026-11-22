@@ -68,12 +68,11 @@
       inject: [llm, tools, agents, sessions, sessionProjections]
       config:
         announceTakeover: true
-        maxParallelToolCalls: 3
-        # v0.4.2：maxReentries 不在装配里钉死——由模式默认值决定（balanced 12 / lean 8 /
-        # compat 16 / power 14）。语义是"防打转兜底"不是"任务步数预算"（真机
-        # session-7fbfef8f/2079562e：钉死 8 曾把任务在第 8 步硬杀）。
+        # 0.5.0 两轴（§4.2）：channel（执行通道 standard|code）× tier（上下文档位
+        # light|standard|deep）。缺省读 control.json（旧 STREAM_AGENT_MODE / config.mode
+        # 走别名映射，0.6.0 移除）；maxSteps/maxInputTokens 等数值由档位决定，
+        # 装配显式值为不可逾越上限（§4.6）。档位只改数值，不改工具面（D2/D3 修复）。
         streamIdleTimeoutMs: 30000
-        # K1（0.3.0）：tf-code 默认关闭——协议段 0 字符，模型不会幻觉调用。
-        # 显式开启走 power 模式，或把本行改为 true（前提：宿主挂载 @deepseek-ai/dsh-ptc-runtime，
-        # 且 K2-K6 五项已验收，见 docs/protocol.md 的开启说明）。
-        enableCode: false
+        # 0.5.0 工具面：reserved-only（默认，第三方工具透传）；'profile' = 0.4.x 过滤
+        # 行为（已弃用，仅回退演练 §12.4）。
+        surfacePolicy: reserved-only

@@ -1,10 +1,16 @@
-// kernel/control-bar.ts —— 控制栏的纯渲染 + 按键状态机（v0.2.1）
+// kernel/control-bar.ts —— 控制栏的纯渲染 + 按键状态机（0.5.0：两区块）
 //
 // 三块职责，全部无副作用：
 //   ① 文案表：中文/英文成对出现（TextKey 由表自身推导）；运行期缺 key 回退为 key 本身。
 //      两个语言的输出必须结构性一致——同一份面板，只换文字。
-//   ② 渲染：状态条（单行）、面板（交互）、引导（首次装载）、帮助（全模式指南）、JSON。
-//   ③ 按键：把一次按键解释成意图（选模式 / 切语言 / 帮助 / 退出），由调用方落盘。
+//   ② 渲染：状态条（单行）、面板（两区块交互）、引导（首次装载）、帮助、JSON。
+//   ③ 按键：把一次按键解释成意图（选通道 / 选档位 / 切语言 / 帮助 / 退出），由调用方落盘。
+//
+// 0.5.0 两区块设计（计划书 §3.3）：
+//   区块 A「执行通道」：standard / code——用户选择的是模型看到什么（原生工具 / 单一入口），
+//     "依赖 PTC"是探测结果不是选项（区块 A 不出现"PTC 模式"字样）。
+//   区块 B「上下文档位」：light / standard / deep——只改数值，不改工具面、并行度、执行器。
+//   两个区块都可回退：A→standard 即 0.4.0 balanced 行为面；B→standard 即 0.4.0 数值面。
 //
 // 宽度纪律（终端排版的坑，实测踩过）：
 //   · CJK 记 2 列；结构分隔符一律用 ASCII（| > -> * ），因为 · → ① … 这些
@@ -12,10 +18,22 @@
 //     同一份输出在两种终端会错位。盒子只用 ─│╭╮╰╯（公认 1 列）。
 //   · 长文案按显示列宽换行，不截断——中文没有空格，逐字符折行。
 //
-// 与宿主无关：本文件不 import 任何东西，node --test 直接可测。
+// 与宿主无关：本文件不 import 任何宿主模块，node --test 直接可测。
 
-import { AVAILABILITY_TEXT, DEFAULT_MODE, MODES, SAVING_TEXT, getMode, isModeId, modeByOrder, publicModeCatalog } from './modes.ts';
-import type { ModeId, ModeSpec } from './modes.ts';
+import {
+  CHANNEL_SPECS,
+  TIER_SPECS,
+  DEFAULT_CHANNEL,
+  DEFAULT_TIER,
+  getChannel,
+  getTier,
+  isChannelId,
+  isTierId,
+  publicChannelCatalog,
+  publicTierCatalog,
+  publicLegacyModeCatalog,
+} from './modes.ts';
+import type { ChannelId, ChannelSpec, TierId, TierSpec } from './modes.ts';
 
 export type Lang = 'zh' | 'en';
 export const LANGS: readonly Lang[] = ['zh', 'en'];
@@ -46,14 +64,29 @@ const TEXT = {
     zh: '内建 agent-loop 仍在工作，检查 bundle 是否装载',
     en: 'built-in agent-loop still running; check whether the bundle is mounted',
   },
-  mode: { zh: '模式', en: 'Mode' },
+  blockA: { zh: '① 执行通道', en: '(1) Execution channel' },
+  blockB: { zh: '② 上下文档位', en: '(2) Context tier' },
+  channel: { zh: '通道', en: 'Channel' },
+  tier: { zh: '档位', en: 'Tier' },
   current: { zh: '当前', en: 'Current' },
+  focus: { zh: '焦点', en: 'Focus' },
+  source: { zh: '来源', en: 'Source' },
+  sourcePreset: { zh: 'preset 完整兼容', en: 'preset: full compatibility' },
+  sourceBridge: { zh: '内置窄桥（受限）', en: 'built-in narrow bridge (limited)' },
+  sourceNone: { zh: '不可用', en: 'unavailable' },
+  sourceStandard: { zh: '不适用（标准通道）', en: 'n/a (standard channel)' },
+  sourceUnavailableDetail: {
+    zh: '代码通道不可用：未检测到 PTC 预设或 ptcRuntime',
+    en: 'code channel unavailable: no PTC preset or ptcRuntime detected',
+  },
   fits: { zh: '适合', en: 'Use when' },
   cost: { zh: '代价', en: 'Trade-off' },
-  saving: { zh: '省 token', en: 'Token saving' },
-  availability: { zh: '可用性', en: 'Availability' },
-  note: { zh: '标注', en: 'Note' },
-  steps: { zh: '上手', en: 'Start' },
+  tierValues: { zh: '数值', en: 'Values' },
+  tierAdvanced: { zh: '高级', en: 'Advanced' },
+  advancedHint: {
+    zh: '取回预算 / 前缀策略 / 重复抑制（peekBudgetChars / prefixPolicy / spanLedger）',
+    en: 'peek budget / prefix policy / dup suppression (peekBudgetChars / prefixPolicy / spanLedger)',
+  },
   keys: { zh: '按键', en: 'Keys' },
   commands: { zh: '命令', en: 'Commands' },
   docs: { zh: '文档', en: 'Docs' },
@@ -61,20 +94,20 @@ const TEXT = {
   openBar: { zh: '打开控制栏', en: 'Open control bar' },
   langLabel: { zh: '语言', en: 'Language' },
   helpTitle: {
-    zh: '全模式指南（选错模式的代价比选错命令更高）',
-    en: 'Mode guide (picking the wrong mode costs more than the wrong command)',
+    zh: '两区块指南（选错通道的代价比选错档位更高）',
+    en: 'Two-block guide (picking the wrong channel costs more than the wrong tier)',
   },
   helpHint: {
-    zh: '1-4 切模式，l 切语言，q 返回',
-    en: '1-4 pick mode, l language, q back',
+    zh: '1-5 选通道/档位，c 切通道，t 切档位，l 切语言，q 返回',
+    en: '1-5 pick channel/tier, c channel, t tier, l language, q back',
   },
   panelHint: {
-    zh: '1-4 切模式 | Up/Down 移动 | Enter 应用 | l 中/英 | ? 帮助 | r 重置 | q 退出',
-    en: '1-4 mode | Up/Down move | Enter apply | l language | ? help | r reset | q quit',
+    zh: '1-5 选通道/档位 | Up/Down 移动 | Enter 应用 | c 通道 | t 档位 | l 中/英 | ? 帮助 | r 重置 | q 退出',
+    en: '1-5 pick | Up/Down move | Enter apply | c channel | t tier | l language | ? help | r reset | q quit',
   },
   bannerKeys: {
-    zh: '交互栏支持 1-4 切模式、l 切语言、? 看全模式指南',
-    en: 'Interactive bar: 1-4 mode, l language, ? full guide',
+    zh: '交互栏支持 1-5 选通道/档位、c/t 快切、l 切语言、? 看指南',
+    en: 'Interactive bar: 1-5 pick, c/t quick switch, l language, ? guide',
   },
   stepTitle: { zh: '上手四步', en: 'Four steps' },
   step1: {
@@ -82,24 +115,28 @@ const TEXT = {
     en: '1 Install   dsh plugin --profile desktop add <package or local path>',
   },
   step2: {
-    zh: '2 选模式 dsh-stream-agent mode lean（或在控制栏按 1-4）',
-    en: '2 Pick mode  dsh-stream-agent mode lean (or press 1-4 in the bar)',
+    zh: '2 选通道/档位 dsh-stream-agent channel standard（或 tier deep / 按 1-5）',
+    en: '2 Pick   dsh-stream-agent channel standard (or tier deep / press 1-5)',
   },
   step3: {
-    zh: '3 下任务 直接说需求，模型在一次流里跑完 tf-* 命令',
-    en: '3 Ask   describe the task; the model runs tf-* in one stream',
+    zh: '3 下任务 直接说需求，模型在一次流里跑完 tf-* 命令（或写 run_code 程序）',
+    en: '3 Ask   describe the task; the model runs tf-* (or run_code) in one stream',
   },
   step4: {
     zh: '4 核对   dsh-stream-agent status',
     en: '4 Verify   dsh-stream-agent status',
   },
-  receipt: { zh: '回执', en: 'receipt' },
-  full: { zh: '全文', en: 'full' },
-  codeAuto: { zh: 'code 跟随宿主', en: 'code auto' },
-  codeOn: { zh: 'code 开', en: 'code on' },
-  codeOff: { zh: 'code 关', en: 'code off' },
-  parallel: { zh: '并行', en: 'parallel' },
-  budget: { zh: '预算', en: 'budget' },
+  executor: { zh: '执行器', en: 'executor' },
+  surface: { zh: '工具面', en: 'surface' },
+  passthrough: { zh: '透传', en: 'passthrough' },
+  reservedOnly: { zh: '透传（tf-* 保留）', en: 'passthrough (tf-* reserved)' },
+  tfCodeOnly: { zh: '仅 tf-code', en: 'tf-code only' },
+  protocolOnly: { zh: '协议独占', en: 'protocol-only' },
+  taskN: { zh: '本任务 N', en: 'task N' },
+  rebase: { zh: '换基', en: 'rebase' },
+  redundant: { zh: '重复取回', en: 'redundant peek' },
+  summaries: { zh: '摘要', en: 'summaries' },
+  seg: { zh: '段', en: 'blocks' },
   saved: { zh: '已保存', en: 'saved' },
   writeFailed: { zh: '状态写入失败（本次运行内仍生效）', en: 'state write failed (still active in this run)' },
   noteLangZh: { zh: '已切换到中文（按 l 切回英文）', en: 'Switched to Chinese (press l for English)' },
@@ -108,9 +145,17 @@ const TEXT = {
     zh: '当前不是交互终端，已输出一次性面板（--once 可强制）',
     en: 'Not an interactive terminal; printed the one-shot panel (--once forces it)',
   },
-  unknownMode: {
-    zh: '未知模式，可选值：balanced / lean / compat / power',
-    en: 'Unknown mode; valid: balanced / lean / compat / power',
+  unknownChannel: {
+    zh: '未知通道，可选值：standard / code',
+    en: 'Unknown channel; valid: standard / code',
+  },
+  unknownTier: {
+    zh: '未知档位，可选值：light / standard / deep',
+    en: 'Unknown tier; valid: light / standard / deep',
+  },
+  legacyAliased: {
+    zh: '（旧模式值已按别名映射：0.5.x 保留别名，0.6.0 移除）',
+    en: '(legacy mode value mapped via alias: kept in 0.5.x, removed in 0.6.0)',
   },
   unknownLang: { zh: '未知语言，可选值：zh / en', en: 'Unknown language; valid: zh / en' },
   usage: { zh: '用法', en: 'Usage' },
@@ -132,7 +177,7 @@ export function textKeys(): TextKey[] {
 }
 
 // ---------------------------------------------------------------------------
-// ② 宽度 / 换行 / 盒子
+// ② 宽度 / 换行 / 盒子（与 0.4.0 逐字节一致的排版原语）
 // ---------------------------------------------------------------------------
 
 /** 东亚宽字符记 2 列（与主流终端一致）。 */
@@ -144,8 +189,7 @@ export function charWidth(ch: string): number {
     || (code >= 0xac00 && code <= 0xd7a3)
     || (code >= 0xf900 && code <= 0xfaff)
     || (code >= 0xfe30 && code <= 0xfe6f)
-    || (code >= 0xff00 && code <= 0xff60)
-    || (code >= 0xffe0 && code <= 0xffe6);
+    || (code >= 0xff00 && code <= 0xffe6);
   return wide ? 2 : 1;
 }
 
@@ -179,14 +223,6 @@ export function padRight(text: string, width: number): string {
 
 /**
  * 断行单位：宽字符（CJK/全角）逐字可断；ASCII 连续非空白算一个整体，不切开单词。
- *
- * 旧实现按字符贪心、遇空格回退，英文短句没问题，但中文里夹着 `ctx.ptcRuntime`
- * 这种 token 时会在空格处提前回退，行尾留下十几列空白——一屏里好几行右端参差，
- * 看着像表格没对齐。改成"先切单位再贪心填充"：中文能填满整行，英文单词不被打断。
- *
- * 闭合标点额外粘到前一个单位上：中文逐字断行时 `。` 极易被挤到下一行行首，
- * 一屏里出现一个孤零零的句号。粘上之后，装不下就整对一起换行，最多让上一行
- * 少 2 列，不会出现行首标点。
  */
 const CLOSING_PUNCT = new Set([...'。，、；：！？）〕］｝》」』〉】,.;:!?)]}']);
 
@@ -269,8 +305,7 @@ export function wrapText(text: string, width: number): string[] {
     lineWidth += w;
   }
   flush();
-  // 末行只剩一个单位时从上一行借一个下来：中文逐字断行很容易把"测。"单独留成
-  // 一行 4 列，一屏里出现这种孤字比行尾差几列更扎眼。
+  // 末行只剩一个单位时从上一行借一个下来。
   if (lines.length >= 2) {
     const last = lines[lines.length - 1];
     const prev = lines[lines.length - 2];
@@ -309,14 +344,7 @@ export function box(title: string, lines: readonly string[], width: number): str
   return out;
 }
 
-/** 标签块：label + 折行正文（首行带标签，续行对齐缩进）。 */
-/**
- * 渲染"标签 + 值"的行，超宽按词折行，续行与首行的值列左对齐。
- *
- * `labelWidth` 传进来时把标签右补空格到该显示宽度：一屏里多个标签长度不同（中文
- * "当前/合适/省 token"，英文 "Note/Token saving"），不补空格右侧数值就会参差，
- * 80 列下看起来像没对齐的表格。调用方用它传同一块里最长的标签宽度。
- */
+/** 渲染"标签 + 值"的行，超宽按词折行，续行与首行的值列左对齐。 */
 function labeled(label: string, value: string, width: number, labelWidth?: number): string[] {
   const pad = labelWidth === undefined ? 0 : Math.max(0, labelWidth - displayWidth(label));
   const prefix = `${label}${' '.repeat(pad)}  `;
@@ -327,54 +355,118 @@ function labeled(label: string, value: string, width: number, labelWidth?: numbe
 }
 
 // ---------------------------------------------------------------------------
-// ③ 状态
+// ③ 状态（0.5.0：channel + tier + lang 两轴三字段）
 // ---------------------------------------------------------------------------
 
 export interface ControlState {
-  mode: ModeId;
+  channel: ChannelId;
+  tier: TierId;
   lang: Lang;
 }
 
 export function createControlState(partial: Partial<ControlState> = {}): ControlState {
   return {
-    mode: isModeId(partial.mode) ? partial.mode : DEFAULT_MODE,
+    channel: isChannelId(partial.channel) ? partial.channel : DEFAULT_CHANNEL,
+    tier: isTierId(partial.tier) ? partial.tier : DEFAULT_TIER,
     lang: isLang(partial.lang) ? partial.lang : DEFAULT_LANG,
   };
 }
 
-/** 模式的关键参数一句话（面板与状态条共用，中英一致）。 */
-export function modeSummary(mode: ModeSpec, lang: Lang): string {
-  const feedback = mode.config.selfReadFeedback === 'receipt' ? t('receipt', lang) : t('full', lang);
-  const code = mode.config.enableCode === 'auto'
-    ? t('codeAuto', lang)
-    : mode.config.enableCode === true ? t('codeOn', lang) : t('codeOff', lang);
-  const parts = [feedback, code, `${t('parallel', lang)} ${mode.config.maxParallelToolCalls}`];
-  if (mode.config.budgetTokens !== undefined) {
-    parts.push(`${t('budget', lang)} ${Math.round(mode.config.budgetTokens / 1000)}k`);
-  }
-  return parts.join(' | ');
-}
-
 /**
- * 模式的"省多少 + 能不能用"一句话标注（引导面板 / 帮助页每模式一行）。
- *
- * 这两件事是新人选模式时最先问的，所以放在同一行；定量口径与"未单独实测"写在
- * `mode.note` 里，只在面板（当前模式详情）展开，避免帮助页变成一屏论文。
+ * 运行时状态（控制栏底部状态行的数据源；全部可选——缺省渲染 0 占位，不臆断）。
+ * 数据由 loop 的 controlStatus 服务回填（ControlStatsFace）。
  */
-export function modeBadges(mode: ModeSpec, lang: Lang): string {
-  return `${SAVING_TEXT[mode.saving][lang]} | ${AVAILABILITY_TEXT[mode.availability][lang]}`;
+export interface ControlStats {
+  /** 执行器来源：native / ptc-preset / ptc-bridge / degraded-sidecar */
+  executor?: string;
+  /** 工具面：透传 / 仅 tf-code / 协议独占 */
+  surface?: string;
+  /** 代码通道来源判定（undefined = 标准通道，不判定） */
+  codeSource?: 'preset' | 'bridge' | 'none';
+  /** 本任务请求数（N） */
+  requests?: number;
+  /** 换基次数（本会话） */
+  rebases?: number;
+  /** 重复取回：命中已投递且未变化 / 取回总数 */
+  redundantPeeks?: { hits: number; total: number };
+  /** 摘要段数（压缩产生的摘要块数） */
+  summaries?: number;
 }
 
-/** 模式选择条：[1]*均衡  [2] 精简  [3] 兼容  [4] 增强（* = 已应用，> = 焦点） */
-export function modeStrip(state: ControlState, focus?: ModeId): string {
-  return MODES.map((m) => {
-    const mark = m.id === state.mode ? '*' : focus === m.id ? '>' : ' ';
-    return `[${m.order}]${mark}${m.label[state.lang]}`;
+/** 档位数值行（控制栏区块 B）：只展示实际数值，不做定性宣传（§4.2）。 */
+export function tierValuesLine(lang: Lang): string {
+  const steps = TIER_SPECS.map((x) => x.values.maxSteps).join('/');
+  const input = TIER_SPECS.map((x) => `${Math.round(x.values.maxInputTokens / 1000)}k`).join('/');
+  const compaction = TIER_SPECS.map((x) => x.values.compactAggressiveness).join('/');
+  return lang === 'zh'
+    ? `maxSteps ${steps} · maxInputTokens ${input} · 压缩 ${compaction}`
+    : `maxSteps ${steps} · maxInputTokens ${input} · compaction ${compaction}`;
+}
+
+/** 通道选择条：[1]*标准  [2] 代码（* = 已应用，> = 焦点） */
+export function channelStrip(state: ControlState, focus?: ChannelId): string {
+  return CHANNEL_SPECS.map((c) => {
+    const mark = c.id === state.channel ? '*' : focus === c.id ? '>' : ' ';
+    return `[${c.order}]${mark}${c.label[state.lang]}`;
   }).join(' ');
 }
 
+/** 档位选择条：[3] 轻 [4]*标准 [5] 深（序号与 1-5 直选键位一致） */
+export function tierStrip(state: ControlState, focus?: TierId): string {
+  return TIER_SPECS.map((x) => {
+    const mark = x.id === state.tier ? '*' : focus === x.id ? '>' : ' ';
+    return `[${x.order + 2}]${mark}${x.label[state.lang]}`;
+  }).join(' ');
+}
+
+/** 代码通道来源说明行（探测结果由调用方注入；undefined = 标准通道不判定）。 */
+export function codeSourceLine(source: ControlStats['codeSource'], lang: Lang): string {
+  if (source === 'preset') return t('sourcePreset', lang);
+  if (source === 'bridge') return t('sourceBridge', lang);
+  if (source === 'none') return `${t('sourceNone', lang)}（${t('sourceUnavailableDetail', lang)}）`;
+  return t('sourceStandard', lang);
+}
+
+/** 运行时状态行（面板底部）：缺省字段渲染 0 占位。 */
+export function statsLine(stats: ControlStats | undefined, lang: Lang): string {
+  const s = stats ?? {};
+  const redundant = s.redundantPeeks === undefined
+    ? '0/0'
+    : `${s.redundantPeeks.hits}/${s.redundantPeeks.total}`;
+  const parts = [
+    `${t('taskN', lang)}=${s.requests ?? 0}`,
+    `${t('rebase', lang)} ${s.rebases ?? 0}`,
+    `${t('redundant', lang)} ${redundant}`,
+    `${t('summaries', lang)} ${s.summaries ?? 0} ${t('seg', lang)}`,
+  ];
+  return `${t('status', lang)}：${parts.join(' · ')}`;
+}
+
 // ---------------------------------------------------------------------------
-// ④ 渲染
+// ④ 焦点（扁平五选项：两个通道 + 三个档位；1-5 直选）
+// ---------------------------------------------------------------------------
+
+export type FocusTarget =
+  | { kind: 'channel'; id: ChannelId }
+  | { kind: 'tier'; id: TierId };
+
+export const FOCUSABLE: readonly FocusTarget[] = [
+  ...CHANNEL_SPECS.map((c) => ({ kind: 'channel' as const, id: c.id })),
+  ...TIER_SPECS.map((x) => ({ kind: 'tier' as const, id: x.id })),
+];
+
+function focusIndex(focus: FocusTarget | undefined): number {
+  if (focus === undefined) return -1;
+  return FOCUSABLE.findIndex((f) => f.kind === focus.kind && f.id === focus.id);
+}
+
+/** 渲染成可直接 write 的文本（CLI 与测试共用）。 */
+export function renderToText(lines: readonly string[]): string {
+  return `${lines.join('\n')}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// ⑤ 渲染
 // ---------------------------------------------------------------------------
 
 export interface RenderOptions {
@@ -383,20 +475,21 @@ export interface RenderOptions {
   active?: boolean;
   /** 终端列数（process.stdout.columns）；缺省 80 列布局 */
   columns?: number;
-  /** 交互栏的焦点模式（未应用） */
-  focus?: ModeId;
+  /** 交互栏的焦点选项（未应用） */
+  focus?: FocusTarget;
+  /** 运行时状态（控制栏底部状态行；CLI 独立进程不注入） */
+  stats?: ControlStats;
 }
 
 /** 单行状态条：贴在任何输出上方都不喧哗。非 TTY（无 columns）不截断，交给调用方重定向。 */
 export function renderStatusBar(state: ControlState, options: RenderOptions): string {
   const { lang } = state;
-  const mode = getMode(state.mode);
   const status = options.active === undefined
     ? undefined
     : options.active ? t('active', lang) : t('inactive', lang);
   const parts = [`dsh-stream-agent ${options.version}`];
   if (status !== undefined) parts.push(status);
-  parts.push(`${t('mode', lang)} ${mode.order} ${mode.label[lang]}`, modeSummary(mode, lang));
+  parts.push(`${t('channel', lang)} ${state.channel}`, `${t('tier', lang)} ${state.tier}`);
   const line = parts.join(' | ');
   const limit = options.columns === undefined ? Number.POSITIVE_INFINITY : panelWidth(options.columns);
   return truncate(line, limit);
@@ -406,7 +499,8 @@ export function renderStatusBar(state: ControlState, options: RenderOptions): st
 export function renderBanner(state: ControlState, options: RenderOptions): string[] {
   const { lang } = state;
   const width = panelWidth(options.columns);
-  const mode = getMode(state.mode);
+  const channel = getChannel(state.channel);
+  const tier = getTier(state.tier);
   const colon = lang === 'zh' ? '：' : ': ';
   const statusLine = options.active === undefined
     ? undefined
@@ -415,9 +509,9 @@ export function renderBanner(state: ControlState, options: RenderOptions): strin
       : `* ${t('inactive', lang)}${colon}${t('inactiveHint', lang)}`;
   const lines = [
     ...(statusLine === undefined ? [] : [statusLine]),
-    `${t('mode', lang)}: ${mode.order} ${mode.label[lang]} (${mode.id}) | ${modeSummary(mode, lang)}`,
-    ...labeled(t('fits', lang), mode.useWhen[lang], width - 4),
-    ...labeled(t('saving', lang), modeBadges(mode, lang), width - 4),
+    `${t('blockA', lang)}: ${channelStrip(state)} | ${t('current', lang)} ${channel.id} (${channel.label[lang]})`,
+    `${t('blockB', lang)}: ${tierStrip(state)} | ${t('current', lang)} ${tier.id} | ${tierValuesLine(lang)}`,
+    ...labeled(t('fits', lang), `${channel.useWhen[lang]} / ${tier.useWhen[lang]}`, width - 4),
     '',
     t('stepTitle', lang),
     `  ${t('step1', lang)}`,
@@ -432,83 +526,95 @@ export function renderBanner(state: ControlState, options: RenderOptions): strin
   return box(`dsh-stream-agent v${options.version} - ${t('barTitle', lang)}`, lines, width);
 }
 
-/** 交互面板：模式条 + 当前模式详情 + 键位 + 命令。 */
+/** 交互面板：区块 A（执行通道）+ 区块 B（上下文档位）+ 键位 + 命令 + 运行状态。 */
 export function renderPanel(state: ControlState, options: RenderOptions): string[] {
   const { lang } = state;
   const width = panelWidth(options.columns);
-  const mode = getMode(state.mode);
-  const focus = options.focus === undefined ? mode : getMode(options.focus);
+  const channel = getChannel(state.channel);
+  const tier = getTier(state.tier);
+  const focusChannel = options.focus?.kind === 'channel' ? getChannel(options.focus.id) : undefined;
+  const focusTier = options.focus?.kind === 'tier' ? getTier(options.focus.id) : undefined;
   const statusLine = options.active === undefined
     ? []
     : [`${t('status', lang)}: ${options.active ? t('active', lang) : t('inactive', lang)}`];
-  // 整块共用同一标签宽度：中文最长是"省 token"，英文是 "Token saving"。
+  // 整块共用同一标签宽度。
   const labelWidth = Math.max(
     displayWidth(t('current', lang)),
+    displayWidth(t('source', lang)),
     displayWidth(t('fits', lang)),
     displayWidth(t('cost', lang)),
-    displayWidth(t('saving', lang)),
-    displayWidth(t('availability', lang)),
-    displayWidth(t('note', lang)),
+    displayWidth(t('tierValues', lang)),
+    displayWidth(t('tierAdvanced', lang)),
     displayWidth(t('commands', lang)),
     displayWidth(t('keys', lang)),
   );
   const lines = [
     ...statusLine,
-    `${t('mode', lang)}: ${modeStrip(state, options.focus)}`,
-    ...labeled(t('current', lang), `${focus.order} ${focus.label[lang]} (${focus.id}) | ${modeSummary(focus, lang)}`, width - 4, labelWidth),
-    ...labeled(t('fits', lang), focus.useWhen[lang], width - 4, labelWidth),
-    ...labeled(t('cost', lang), focus.tradeoff[lang], width - 4, labelWidth),
-    ...labeled(t('saving', lang), SAVING_TEXT[focus.saving][lang], width - 4, labelWidth),
-    ...labeled(t('availability', lang), AVAILABILITY_TEXT[focus.availability][lang], width - 4, labelWidth),
-    ...labeled(t('note', lang), focus.note[lang], width - 4, labelWidth),
+    t('blockA', lang),
+    `  ${channelStrip(state, options.focus?.kind === 'channel' ? options.focus.id : undefined)}`,
+    ...labeled(t('current', lang), `${channel.label[lang]} (${channel.id}) — ${channel.tagline[lang]}`, width - 4, labelWidth),
+    ...labeled(t('fits', lang), channel.useWhen[lang], width - 4, labelWidth),
+    ...labeled(t('cost', lang), channel.tradeoff[lang], width - 4, labelWidth),
+    ...labeled(t('source', lang), codeSourceLine(options.stats?.codeSource, lang), width - 4, labelWidth),
+    ...(focusChannel !== undefined && focusChannel.id !== state.channel
+      ? labeled(t('focus', lang), `> ${focusChannel.label[lang]} (${focusChannel.id}) — ${focusChannel.tagline[lang]}`, width - 4, labelWidth)
+      : []),
+    t('blockB', lang),
+    `  ${tierStrip(state, options.focus?.kind === 'tier' ? options.focus.id : undefined)}`,
+    ...labeled(t('current', lang), `${tier.label[lang]} (${tier.id}) — ${tier.useWhen[lang]}`, width - 4, labelWidth),
+    ...labeled(t('tierValues', lang), tierValuesLine(lang), width - 4, labelWidth),
+    ...labeled(t('cost', lang), tier.tradeoff[lang], width - 4, labelWidth),
+    ...labeled(t('tierAdvanced', lang), t('advancedHint', lang), width - 4, labelWidth),
     '',
-    ...labeled(t('commands', lang), 'dsh-stream-agent bar | status | mode <id> | lang <zh|en>', width - 4, labelWidth),
+    ...labeled(t('commands', lang), 'dsh-stream-agent bar | status | channel <standard|code> | tier <light|standard|deep> | lang <zh|en>', width - 4, labelWidth),
     '',
     ...labeled(t('keys', lang), t('panelHint', lang), width - 4, labelWidth),
+    statsLine(options.stats, lang),
     `${t('langLabel', lang)}: ${state.lang} | ${t('docs', lang)}: README.md#control-bar`,
   ];
   return box(`dsh-stream-agent v${options.version} - ${t('barTitle', lang)}`, lines, width);
 }
 
-/** 全模式指南：四个模式逐一给出"适合 / 代价"，并标出当前模式。 */
+/** 两区块指南：通道与档位逐一给出"适合 / 代价"，并标出当前选择。 */
 export function renderHelp(state: ControlState, options: RenderOptions): string[] {
   const { lang } = state;
   const width = panelWidth(options.columns);
   const inner = width - 4;
-  const lines: string[] = [t('helpTitle', lang), ''];
-  // 四个模式共用同一标签宽度，纵向扫视时"适合/代价/省 token"的值列才在同一列。
-  const labelWidth = Math.max(
-    displayWidth(`  ${t('fits', lang)}`),
-    displayWidth(`  ${t('cost', lang)}`),
-    displayWidth(`  ${t('saving', lang)}`),
-  );
-  for (const mode of MODES) {
-    const mark = mode.id === state.mode ? '*' : ' ';
-    lines.push(`[${mode.order}]${mark}${mode.label[lang]} (${mode.id}) | ${modeSummary(mode, lang)}`);
-    lines.push(...labeled('', mode.tagline[lang], inner).map((line) => `  ${line.trimStart()}`));
-    lines.push(...labeled(`  ${t('fits', lang)}`, mode.useWhen[lang], inner, labelWidth));
-    lines.push(...labeled(`  ${t('cost', lang)}`, mode.tradeoff[lang], inner, labelWidth));
-    lines.push(...labeled(`  ${t('saving', lang)}`, modeBadges(mode, lang), inner, labelWidth));
-    lines.push('');
+  const lines: string[] = [t('helpTitle', lang), '', t('blockA', lang)];
+  for (const c of CHANNEL_SPECS) {
+    const mark = c.id === state.channel ? '*' : ' ';
+    lines.push(`[${c.order}]${mark}${c.label[lang]} (${c.id})`);
+    lines.push(...labeled(`  ${t('fits', lang)}`, c.useWhen[lang], inner));
+    lines.push(...labeled(`  ${t('cost', lang)}`, c.tradeoff[lang], inner));
+    lines.push(...labeled(`  0.4.0`, c.legacyBehavior[lang], inner));
   }
-  lines.push(t('helpHint', lang));
+  lines.push('', t('blockB', lang));
+  for (const x of TIER_SPECS) {
+    const mark = x.id === state.tier ? '*' : ' ';
+    lines.push(`[${x.order + 2}]${mark}${x.label[lang]} (${x.id}) | ${tierValuesLine(lang).replace(/ · /g, ` / `)}`);
+    lines.push(...labeled(`  ${t('fits', lang)}`, x.useWhen[lang], inner));
+    lines.push(...labeled(`  ${t('cost', lang)}`, x.tradeoff[lang], inner));
+  }
+  lines.push('', t('helpHint', lang));
   return box(`dsh-stream-agent v${options.version} - ${t('barTitle', lang)}`, lines, width);
 }
 
 /** 机器可读状态（--json / status --json）。 */
 export function renderJson(state: ControlState, options: RenderOptions): string {
-  const mode = getMode(state.mode);
   return JSON.stringify({
     version: options.version,
     active: options.active !== false,
-    mode: { id: mode.id, order: mode.order, label: mode.label[state.lang], config: mode.config },
+    channel: { id: state.channel, label: getChannel(state.channel).label[state.lang] },
+    tier: { id: state.tier, label: getTier(state.tier).label[state.lang], values: getTier(state.tier).values },
     lang: state.lang,
-    modes: publicModeCatalog(),
+    channels: publicChannelCatalog(),
+    tiers: publicTierCatalog(),
+    legacyModes: publicLegacyModeCatalog(),
   }, null, 2);
 }
 
 // ---------------------------------------------------------------------------
-// ⑤ 按键 → 意图
+// ⑥ 按键 → 意图
 // ---------------------------------------------------------------------------
 
 export type KeyAction =
@@ -519,7 +625,10 @@ export type KeyAction =
   | { kind: 'reset' }
   | { kind: 'move'; delta: 1 | -1 }
   | { kind: 'apply' }
-  | { kind: 'select'; mode: ModeId }
+  | { kind: 'select-channel'; channel: ChannelId }
+  | { kind: 'select-tier'; tier: TierId }
+  | { kind: 'cycle-channel' }
+  | { kind: 'cycle-tier' }
   | { kind: 'none' };
 
 /** 把一次按键（原始终端序列）解释为控制栏意图。q 在帮助页是"返回"，在面板是"退出"。 */
@@ -531,29 +640,33 @@ export function interpretKey(raw: string, context: { helpOpen?: boolean } = {}):
   if (key === '?' || key === 'h' || key === 'H') return { kind: 'toggle-help' };
   if (key === 'l' || key === 'L') return { kind: 'toggle-lang' };
   if (key === 'r' || key === 'R') return { kind: 'reset' };
+  // 1-5 直选（与面板标注一致）：1-2 通道，3-5 档位
+  if (/^[1-5]$/.test(key)) {
+    const target = FOCUSABLE[Number(key) - 1];
+    if (target !== undefined) {
+      return target.kind === 'channel'
+        ? { kind: 'select-channel', channel: target.id }
+        : { kind: 'select-tier', tier: target.id };
+    }
+  }
+  // 快捷切换：c 通道（standard↔code），t 档位（light→standard→deep→light）
+  if (key === 'c' || key === 'C') return { kind: 'cycle-channel' };
+  if (key === 't' || key === 'T') return { kind: 'cycle-tier' };
   if (key === '\x1b[A' || key === 'k' || key === 'K') return { kind: 'move', delta: -1 };
   if (key === '\x1b[B' || key === 'j' || key === 'J') return { kind: 'move', delta: 1 };
-  if (/^[1-4]$/.test(key)) {
-    const mode = modeByOrder(Number(key));
-    if (mode !== undefined) return { kind: 'select', mode: mode.id };
-  }
   if (key === '\r' || key === '\n' || key === ' ') return { kind: 'apply' };
   return { kind: 'none' };
 }
 
-/** 焦点移动（↑↓）：在 MODES 里环状移动。 */
-export function moveFocus(focus: ModeId, delta: 1 | -1): ModeId {
-  const index = MODES.findIndex((m) => m.id === focus);
+/** 焦点移动（↑↓）：在扁平五选项里环状移动。 */
+export function moveFocus(focus: FocusTarget, delta: 1 | -1): FocusTarget {
+  const index = focusIndex(focus);
   const base = index < 0 ? 0 : index;
-  return MODES[(base + delta + MODES.length) % MODES.length].id;
+  return FOCUSABLE[(base + delta + FOCUSABLE.length) % FOCUSABLE.length]!;
 }
 
-/** "应用焦点"的落点（Enter）：返回焦点模式（越界回默认）。 */
-export function selectFocus(focus: ModeId): ModeId {
-  return getMode(focus).id;
-}
-
-/** 渲染成可直接 write 的文本（CLI 与测试共用）。 */
-export function renderToText(lines: readonly string[]): string {
-  return `${lines.join('\n')}\n`;
+/** "应用焦点"的落点（Enter）：返回焦点选项（未聚焦 = 当前值）。 */
+export function applyFocus(focus: FocusTarget | undefined, state: ControlState): ControlState {
+  if (focus === undefined) return state;
+  return focus.kind === 'channel' ? { ...state, channel: focus.id } : { ...state, tier: focus.id };
 }

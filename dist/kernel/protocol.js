@@ -16,7 +16,7 @@
 //     不能复活——命令级失败兜底仍在驱动器里，构成防御纵深）。
 //   - 某段在某档没有专属文本时回退用 full 文本（如 lean/minimal 的 plan、lean 的 finalSummary）。
 
-export const PROTOCOL_SECTION_IDS = ['syntax', 'plan', 'results', 'selfread', 'timing', 'finalSummary', 'rules']         ;
+export const PROTOCOL_SECTION_IDS = ['syntax', 'plan', 'results', 'selfread', 'timing', 'finalSummary', 'rules', 'peek']         ;
                                                                       
 
 export const PROTOCOL_LEVELS = ['full', 'lean', 'minimal']         ;
@@ -29,9 +29,9 @@ export function asProtocolLevel(value                    )                {
 
 /** 各档默认含哪些段（canonical 段序以 PROTOCOL_SECTION_IDS 为准，与这里排列无关）。 */
 export const LEVEL_SECTIONS                                                      = {
-  full: ['syntax', 'plan', 'results', 'selfread', 'timing', 'finalSummary', 'rules'],
-  lean: ['syntax', 'plan', 'results', 'selfread', 'timing', 'finalSummary', 'rules'],
-  minimal: ['syntax', 'plan', 'results', 'finalSummary', 'rules'],
+  full: ['syntax', 'plan', 'results', 'selfread', 'timing', 'finalSummary', 'rules', 'peek'],
+  lean: ['syntax', 'plan', 'results', 'selfread', 'timing', 'finalSummary', 'rules', 'peek'],
+  minimal: ['syntax', 'plan', 'results', 'finalSummary', 'rules', 'peek'],
 };
 
 // ---------------------------------------------------------------------------
@@ -219,6 +219,17 @@ const MINIMAL_RULES = `规则：
 3. 命令闭合即开始执行；见 [tf-stream:error] 先修复或改道。
 4. 只允许上表的 tf-* 标记：不要输出 <｜｜DSML｜｜…>、<think>、JSON tool_call 等原生调用格式。`;
 
+/** full.peek：取回纪律（0.5.0 §7.3(4) 协议引导——目标 k→1，分页取回每次都是一次新请求）。
+ *  文本为自有 PROTOCOL-v1 语义（语义见 PROTOCOL-v1.md §peek；thinkflow 列为参考实现）。 */
+const FULL_PEEK = `## 取回纪律（分页取回的真实成本）
+每一次取回（tf-peek）都是一次新请求：模型要重发整段上下文，第 k 次取回的额外成本约
+(k−1) × 本次上下文。因此：
+- 要找内容：先 tf-grep 取行号 → 再 tf-peek 取 ±40 行窗口；不要从 L1 起逐段取回。
+- 禁止对同一文件重复取回同一区间：命中已投递且未变化时只回一行 [unchanged]，
+  不返回正文；部分重叠时只返回新增区间。
+- 大文件（超出读取上限）只投行锚索引与未投递区间——按索引定位后再取，不要整读。
+- 每回合取回有字符预算（超预算会收到 [budget] 提示）：先用 tf-grep 缩小范围。`;
+
 /** 各档各段文本；缺项回退 full（composeProtocolText 负责回退）。 */
 export const SECTION_TEXTS                                                                    = {
   full: {
@@ -229,6 +240,7 @@ export const SECTION_TEXTS                                                      
     timing: FULL_TIMING,
     finalSummary: FULL_FINALSUMMARY,
     rules: FULL_RULES,
+    peek: FULL_PEEK,
   },
   lean: {
     syntax: LEAN_SYNTAX,
@@ -238,6 +250,7 @@ export const SECTION_TEXTS                                                      
     timing: LEAN_TIMING,
     finalSummary: FULL_FINALSUMMARY,
     rules: LEAN_RULES,
+    peek: FULL_PEEK,
   },
   minimal: {
     syntax: MINIMAL_SYNTAX,
@@ -245,6 +258,7 @@ export const SECTION_TEXTS                                                      
     results: MINIMAL_RESULTS,
     finalSummary: MINIMAL_FINALSUMMARY,
     rules: MINIMAL_RULES,
+    peek: FULL_PEEK,
   },
 };
 

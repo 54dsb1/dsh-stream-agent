@@ -15,8 +15,15 @@ window.__ModuleLoader__.load({
 		 * The page is a dsh web-client plugin: it registers one main panel and one
 		 * sidebar rail icon through ctx.slots, then talks to its own Host half over
 		 * the same-origin route /stream-agent/control. No Electron API, no preload
-		 * bridge, no duplicated state: mode/lang still live in control.json and the
-		 * loop's in-memory control object is the one writer.
+		 * bridge, no duplicated state: channel/tier/lang still live in control.json
+		 * and the loop's in-memory control object is the one writer.
+		 *
+		 * 0.5.0 two blocks (计划书 §3.3)：
+		 *   区块 A「执行通道」standard/code——用户选择的是模型看到什么；"依赖 PTC"是
+		 *   探测结果不是选项（页面不出现"PTC 模式"字样，来源行如实显示探测结果）。
+		 *   区块 B「上下文档位」light/standard/deep——只改数值，每档展示实际数值
+		 *   （maxSteps/maxInputTokens/压缩强度），不做定性宣传。
+		 *   两个区块都可回退：A→standard 即 0.4.0 balanced 行为面；B→standard 即 0.4.0 数值面。
 		 */
 
 		const ROUTE = "/stream-agent/control";
@@ -25,7 +32,7 @@ window.__ModuleLoader__.load({
 		const TEXT = {
 			zh: {
 				title: "控制栏",
-				subtitle: "单流协议运行模式与语言。改完立即对新会话生效，已有会话保持原设置。",
+				subtitle: "执行通道与上下文档位。改完立即对新会话生效，已有会话在下一个任务边界生效；通道切换会重建上下文缓存（换基一次）。",
 				refresh: "刷新",
 				refreshing: "刷新中…",
 				loading: "正在读取控制状态…",
@@ -34,16 +41,34 @@ window.__ModuleLoader__.load({
 				hostUnreachable: "宿主没有响应控制路由。确认插件已装入当前 profile，并重启客户端。",
 				active: "接管生效",
 				inactive: "未接管",
-				inactiveHint: "loop 没有注册 agent factory。模式仍可写入状态文件，但修复装载并重启后才会生效。",
+				inactiveHint: "loop 没有注册 agent factory。通道/档位仍可写入状态文件，但修复装载并重启后才会生效。",
 				statusTitle: "当前状态",
-				modeTitle: "运行模式",
-				modeHint: "四选一。每张卡都写了“什么时候选”和“代价”，不确定就先用均衡。",
-				paramsTitle: "生效参数",
+				channelTitle: "① 执行通道",
+				channelHint: "选模型看到什么：标准 = tf-* 命令；代码 = 单一 run_code 入口。",
+				tierTitle: "② 上下文档位",
+				tierHint: "只改数值：步数上限、单请求上下文上限、压缩强度。不改工具面与执行器。",
+				tierValuesTitle: "实际数值",
+				advancedTitle: "高级",
+				advancedHint: "取回预算 / 前缀策略 / 重复抑制（peekBudgetChars / prefixPolicy / spanLedger）",
+				sourceTitle: "代码通道来源",
+				sourcePreset: "preset 完整兼容",
+				sourceBridge: "内置窄桥（受限）",
+				sourceNone: "不可用：未检测到 PTC 预设或 ptcRuntime",
+				sourceStandard: "不适用（标准通道）",
+				runtimeTitle: "运行状态",
+				taskN: "本任务 N",
+				rebases: "换基",
+				redundant: "重复取回",
+				summaries: "摘要",
+				segments: "段",
+				executor: "执行器",
+				surface: "工具面",
 				langTitle: "控制栏语言",
 				langHint: "只影响控制栏文案与页面，不改模型输出语言。",
 				cacheHit: "缓存命中",
 				version: "版本",
-				mode: "模式",
+				channel: "通道",
+				tier: "档位",
 				source: "来源",
 				language: "语言",
 				stateFile: "状态文件",
@@ -58,39 +83,30 @@ window.__ModuleLoader__.load({
 				sourceDefault: "默认值",
 				sourceRuntime: "本次运行（未落盘）",
 				selected: "当前",
-				apply: "切到这个模式",
+				apply: "切换",
 				applying: "应用中…",
 				useWhen: "什么时候选",
 				tradeoff: "代价",
-				saving: "省 token",
-				availability: "可用性",
-				saved: "已保存，对新会话生效。",
+				legacy: "0.4.0 行为对照",
+				saved: "已保存。通道对新会话立即生效，会话内在下一个任务边界生效。",
 				noticeConflict: "状态已被其他窗口或 CLI 修改，已刷新为最新值。",
 				writeFailed: "写入失败",
 				params: {
-					selfReadFeedback: "自写回验",
-					enableCode: "tf-code",
-					persistFallback: "本地兜底",
-					maxParallelToolCalls: "并行命令",
-					maxReentries: "最大重入",
-					budgetTokens: "token 预算",
-					toolSurface: "工具面档",
-				},
-				values: {
-					receipt: "只回回执",
-					full: "全文回灌",
-					auto: "跟随宿主",
-					on: "开启",
-					off: "关闭",
-					unlimited: "不限",
+					maxSteps: "步数上限",
+					maxInputTokens: "上下文上限",
+					compactAggressiveness: "压缩强度",
+					peekBudgetChars: "取回预算",
+					keepRecent: "保留条数",
+					maxSummaryChars: "摘要上限",
+					surfacePolicy: "工具面策略",
 				},
 				cli: "命令行等价操作",
-				cliHint: "dsh-stream-agent mode <id> · dsh-stream-agent lang <zh|en> · dsh-stream-agent bar",
+				cliHint: "dsh-stream-agent channel <standard|code> · tier <light|standard|deep> · lang <zh|en> · bar",
 				docs: "说明文档：README.md#桌面客户端控制页",
 			},
 			en: {
 				title: "Control bar",
-				subtitle: "Single-stream runtime mode and language. Changes apply to new sessions immediately; existing sessions keep their settings.",
+				subtitle: "Execution channel and context tier. Changes apply to new sessions immediately; running sessions pick them up at the next task boundary; channel switches rebuild the prompt cache once (planned rebase).",
 				refresh: "Refresh",
 				refreshing: "Refreshing…",
 				loading: "Reading control state…",
@@ -99,16 +115,34 @@ window.__ModuleLoader__.load({
 				hostUnreachable: "The Host did not answer the control route. Confirm the plugin is installed in this profile, then restart the client.",
 				active: "Takeover active",
 				inactive: "Not taking over",
-				inactiveHint: "The loop did not register an agent factory. Mode changes still write the state file, but they only apply after the load failure is fixed and the client restarts.",
+				inactiveHint: "The loop did not register an agent factory. Channel/tier changes still write the state file, but they only apply after the load failure is fixed and the client restarts.",
 				statusTitle: "Current state",
-				modeTitle: "Runtime mode",
-				modeHint: "Pick one of four. Every card states when to choose it and what it costs; start with Balanced when unsure.",
-				paramsTitle: "Effective parameters",
+				channelTitle: "(1) Execution channel",
+				channelHint: "Pick what the model sees: Standard = tf-* commands; Code = single run_code entry.",
+				tierTitle: "(2) Context tier",
+				tierHint: "Numbers only: step cap, per-request context cap, compaction strength. Never touches tool surface or executor.",
+				tierValuesTitle: "Actual values",
+				advancedTitle: "Advanced",
+				advancedHint: "peek budget / prefix policy / dup suppression (peekBudgetChars / prefixPolicy / spanLedger)",
+				sourceTitle: "Code channel source",
+				sourcePreset: "preset: full compatibility",
+				sourceBridge: "built-in narrow bridge (limited)",
+				sourceNone: "unavailable: no PTC preset or ptcRuntime detected",
+				sourceStandard: "n/a (standard channel)",
+				runtimeTitle: "Runtime status",
+				taskN: "task N",
+				rebases: "rebases",
+				redundant: "redundant peeks",
+				summaries: "summaries",
+				segments: "blocks",
+				executor: "executor",
+				surface: "surface",
 				langTitle: "Control bar language",
 				langHint: "Only the control bar and this page; it does not change the model's output language.",
 				cacheHit: "Cache hit",
 				version: "Version",
-				mode: "Mode",
+				channel: "Channel",
+				tier: "Tier",
 				source: "Source",
 				language: "Language",
 				stateFile: "State file",
@@ -123,34 +157,25 @@ window.__ModuleLoader__.load({
 				sourceDefault: "default",
 				sourceRuntime: "this run (not persisted)",
 				selected: "Current",
-				apply: "Switch to this mode",
+				apply: "Switch",
 				applying: "Applying…",
 				useWhen: "When to choose",
 				tradeoff: "Trade-off",
-				saving: "Token saving",
-				availability: "Availability",
-				saved: "Saved. Applies to new sessions.",
+				legacy: "0.4.0 behavior",
+				saved: "Saved. Applies to new sessions immediately; running sessions switch at the next task boundary.",
 				noticeConflict: "Another window or the CLI changed the state; refreshed to the latest value.",
 				writeFailed: "Write failed",
 				params: {
-					selfReadFeedback: "Self-read feedback",
-					enableCode: "tf-code",
-					persistFallback: "Local fallback",
-					maxParallelToolCalls: "Parallel commands",
-					maxReentries: "Max re-entries",
-					budgetTokens: "Token budget",
-					toolSurface: "Tool surface",
-				},
-				values: {
-					receipt: "receipt only",
-					full: "full echo",
-					auto: "follow Host",
-					on: "on",
-					off: "off",
-					unlimited: "unlimited",
+					maxSteps: "Step cap",
+					maxInputTokens: "Context cap",
+					compactAggressiveness: "Compaction",
+					peekBudgetChars: "Peek budget",
+					keepRecent: "Keep recent",
+					maxSummaryChars: "Summary cap",
+					surfacePolicy: "Surface policy",
 				},
 				cli: "CLI equivalents",
-				cliHint: "dsh-stream-agent mode <id> · dsh-stream-agent lang <zh|en> · dsh-stream-agent bar",
+				cliHint: "dsh-stream-agent channel <standard|code> · tier <light|standard|deep> · lang <zh|en> · bar",
 				docs: "Docs: README.en.md#desktop-control-page",
 			},
 		};
@@ -169,11 +194,11 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		function valueLabel(t, key, value) {
-			if (value === null || value === undefined) return t.values.unlimited;
-			if (typeof value === "boolean") return value ? t.values.on : t.values.off;
-			if (typeof value === "string") return t.values[value] ?? value;
-			return String(value);
+		function codeSourceLabel(t, codeSource) {
+			if (codeSource === "preset") return t.sourcePreset;
+			if (codeSource === "bridge") return t.sourceBridge;
+			if (codeSource === "none") return t.sourceNone;
+			return t.sourceStandard;
 		}
 
 		async function call(method, body) {
@@ -266,57 +291,71 @@ window.__ModuleLoader__.load({
 		function Params({ status, t }) {
 			const effective = status.effective ?? {};
 			const rows = [
-				["selfReadFeedback", effective.selfReadFeedback],
-				["enableCode", effective.enableCode],
-				["persistFallback", effective.persistFallback],
-				["maxParallelToolCalls", effective.maxParallelToolCalls],
-				["maxReentries", effective.maxReentries],
-				["budgetTokens", effective.budgetTokens],
-				["toolSurface", effective.toolSurface],
+				["maxSteps", effective.maxSteps],
+				["maxInputTokens", effective.maxInputTokens],
+				["compactAggressiveness", effective.compactAggressiveness],
+				["peekBudgetChars", effective.peekBudgetChars],
+				["keepRecent", effective.keepRecent],
+				["maxSummaryChars", effective.maxSummaryChars],
+				["surfacePolicy", effective.surfacePolicy],
 			];
 			return h("div", { className: "sa-params" },
 				rows.map(([key, value]) => h("div", { className: "sa-param", key },
 					h("span", { className: "sa-param-key" }, t.params[key] ?? key),
-					h("span", { className: "sa-param-value" }, valueLabel(t, key, value)),
+					h("span", { className: "sa-param-value" }, value === null || value === undefined ? "—" : String(value)),
 				)),
 			);
 		}
 
-		function ModeCard({ mode, lang, active, locked, busy, onSelect }) {
+		function ChannelCard({ channel, lang, active, locked, busy, source, onSelect }) {
 			const t = copyFor(lang);
 			return h("button", {
 				type: "button",
 				className: `sa-mode${active ? " sa-mode-active" : ""}`,
 				disabled: locked || busy,
 				"aria-pressed": active,
-				onClick: () => onSelect(mode.id),
+				onClick: () => onSelect(channel.id),
 				title: active ? t.selected : t.apply,
 			},
 				h("div", { className: "sa-mode-head" },
-					h("span", { className: "sa-mode-order" }, mode.order),
-					h("span", { className: "sa-mode-name" }, mode.label[lang]),
+					h("span", { className: "sa-mode-order" }, channel.order),
+					h("span", { className: "sa-mode-name" }, channel.label[lang]),
 					active ? h(Badge, { tone: "brand" }, t.selected) : null,
 				),
-				h("div", { className: "sa-mode-tagline" }, mode.tagline[lang]),
+				h("div", { className: "sa-mode-tagline" }, channel.tagline[lang]),
 				h("div", { className: "sa-mode-row" },
 					h("span", { className: "sa-mode-row-label" }, t.useWhen),
-					h("span", null, mode.useWhen[lang]),
+					h("span", null, channel.useWhen[lang]),
 				),
 				h("div", { className: "sa-mode-row sa-mode-cost" },
 					h("span", { className: "sa-mode-row-label" }, t.tradeoff),
-					h("span", null, mode.tradeoff[lang]),
+					h("span", null, channel.tradeoff[lang]),
 				),
 				h("div", { className: "sa-mode-row sa-mode-saving" },
-					h("span", { className: "sa-mode-row-label" }, t.saving),
-					h("span", null, mode.savingLabel?.[lang] ?? mode.saving),
+					h("span", { className: "sa-mode-row-label" }, t.legacy),
+					h("span", null, channel.legacyBehavior[lang]),
 				),
-				h("div", { className: "sa-mode-row" },
-					h("span", { className: "sa-mode-row-label" }, t.availability),
-					h("span", null, mode.availabilityLabel?.[lang] ?? mode.availability),
+			);
+		}
+
+		function TierButton({ tier, lang, active, locked, busy, onSelect }) {
+			const t = copyFor(lang);
+			const v = tier.values;
+			const values = `maxSteps ${v.maxSteps} · maxInputTokens ${Math.round(v.maxInputTokens / 1000)}k · ${t.params.compactAggressiveness} ${v.compactAggressiveness}`;
+			return h("button", {
+				type: "button",
+				className: `sa-tier${active ? " sa-tier-active" : ""}`,
+				disabled: locked || busy,
+				"aria-pressed": active,
+				onClick: () => onSelect(tier.id),
+				title: `${t.apply}: ${values}`,
+			},
+				h("div", { className: "sa-tier-head" },
+					h("span", { className: "sa-mode-name" }, tier.label[lang]),
+					active ? h(Badge, { tone: "brand" }, t.selected) : null,
 				),
-				mode.note?.[lang]
-					? h("div", { className: "sa-mode-note" }, mode.note[lang])
-					: null,
+				h("div", { className: "sa-tier-values" }, values),
+				h("div", { className: "sa-tier-when" }, tier.useWhen[lang]),
 			);
 		}
 
@@ -349,10 +388,12 @@ window.__ModuleLoader__.load({
 				);
 			}
 
-			const locked = status.modeLocked === true;
+			const channelLocked = status.channelLocked === true;
+			const tierLocked = status.tierLocked === true;
 			const langLocked = status.langLocked === true;
-			const source = sourceLabel(t, status.modeSource);
-			const activeMode = (status.modes ?? []).find((mode) => mode.id === status.mode);
+			const channelSourceLabel = sourceLabel(t, status.channelSource);
+			const runtime = status.runtime ?? null;
+			const codeSource = status.channel === "code" ? status.codeSource : undefined;
 
 			return h("div", { className: "sa-root" },
 				h("div", { className: "sa-shell" },
@@ -376,16 +417,17 @@ window.__ModuleLoader__.load({
 					h("section", { className: "sa-section" },
 						h("h2", { className: "sa-section-title" }, t.statusTitle),
 						h("div", { className: "sa-grid" },
-							h(StatusCell, { label: t.mode },
-								activeMode ? `${activeMode.order} · ${activeMode.label[lang]}` : status.mode,
-								locked ? h(Badge, { tone: "warn" }, t.locked) : null,
+							h(StatusCell, { label: t.channel },
+								`${status.channel}`,
+								channelLocked ? h(Badge, { tone: "warn" }, t.locked) : null,
 							),
-							h(StatusCell, { label: t.source }, source),
+							h(StatusCell, { label: t.tier }, `${status.tier}`),
+							h(StatusCell, { label: t.source }, channelSourceLabel),
 							h(StatusCell, { label: t.language }, status.lang),
-							h(StatusCell, { label: t.updatedAt }, status.updatedAt ? new Date(status.updatedAt).toLocaleString() : t.never),
 							h(StatusCell, { label: t.stateFile, wide: true },
 								h("code", { className: "sa-code", title: status.stateFile }, status.stateFile),
 							),
+							h(StatusCell, { label: t.updatedAt }, status.updatedAt ? new Date(status.updatedAt).toLocaleString() : t.never),
 							// v0.4.2：运行时缓存命中率（当前会话有缓存数据才显示；离线/mock 隐藏该行）。
 							status.cache && status.cache.cacheHitRatio !== null && status.cache.cacheHitRatio !== undefined
 								? h(StatusCell, { label: t.cacheHit },
@@ -394,26 +436,86 @@ window.__ModuleLoader__.load({
 								)
 								: null,
 						),
-						locked ? h("div", { className: "sa-hint" }, status.modeSource === "env" ? t.lockedEnv : t.lockedConfig) : null,
+						channelLocked ? h("div", { className: "sa-hint" }, status.channelSource === "env" ? t.lockedEnv : t.lockedConfig) : null,
 					),
 
+					// 区块 A：执行通道（§3.3——不出现"PTC 模式"字样；来源是探测结果行）
 					h("section", { className: "sa-section" },
 						h("div", { className: "sa-section-head" },
-							h("h2", { className: "sa-section-title" }, t.modeTitle),
-							h("span", { className: "sa-section-hint" }, t.modeHint),
+							h("h2", { className: "sa-section-title" }, t.channelTitle),
+							h("span", { className: "sa-section-hint" }, t.channelHint),
 						),
 						h("div", { className: "sa-modes" },
-							(status.modes ?? []).map((mode) => h(ModeCard, {
-								key: mode.id,
-								mode,
+							(status.channels ?? []).map((channel) => h(ChannelCard, {
+								key: channel.id,
+								channel,
 								lang,
-								active: mode.id === status.mode,
-								locked,
+								active: channel.id === status.channel,
+								locked: channelLocked,
 								busy,
-								onSelect: (id) => mutate({ mode: id }),
+								source: codeSource,
+								onSelect: (id) => mutate({ channel: id }),
 							})),
 						),
+						h("div", { className: "sa-mode-row", style: { marginTop: "10px" } },
+							h("span", { className: "sa-mode-row-label" }, t.sourceTitle),
+							h("span", null, codeSourceLabel(t, codeSource)),
+						),
 					),
+
+					// 区块 B：上下文档位（§3.3——只改数值，每档显示实际数值）
+					h("section", { className: "sa-section" },
+						h("div", { className: "sa-section-head" },
+							h("h2", { className: "sa-section-title" }, t.tierTitle),
+							h("span", { className: "sa-section-hint" }, t.tierHint),
+						),
+						h("div", { className: "sa-tiers" },
+							(status.tiers ?? []).map((tier) => h(TierButton, {
+								key: tier.id,
+								tier,
+								lang,
+								active: tier.id === status.tier,
+								locked: tierLocked,
+								busy,
+								onSelect: (id) => mutate({ tier: id }),
+							})),
+						),
+						h("div", { className: "sa-mode-row", style: { marginTop: "10px" } },
+							h("span", { className: "sa-mode-row-label" }, t.advancedTitle),
+							h("span", null, t.advancedHint),
+						),
+					),
+
+					// 运行状态（§3.3 底部状态行：本任务 N · 换基 · 重复取回 · 摘要）
+					runtime ? h("section", { className: "sa-section" },
+						h("h2", { className: "sa-section-title" }, t.runtimeTitle),
+						h("div", { className: "sa-params" },
+							h("div", { className: "sa-param" },
+								h("span", { className: "sa-param-key" }, t.taskN),
+								h("span", { className: "sa-param-value" }, String(runtime.requests ?? 0)),
+							),
+							h("div", { className: "sa-param" },
+								h("span", { className: "sa-param-key" }, t.rebases),
+								h("span", { className: "sa-param-value" }, String(runtime.rebases ?? 0)),
+							),
+							h("div", { className: "sa-param" },
+								h("span", { className: "sa-param-key" }, t.redundant),
+								h("span", { className: "sa-param-value" }, `${runtime.redundantPeeks?.hits ?? 0}/${runtime.redundantPeeks?.total ?? 0}`),
+							),
+							h("div", { className: "sa-param" },
+								h("span", { className: "sa-param-key" }, t.summaries),
+								h("span", { className: "sa-param-value" }, `${runtime.summaries ?? 0} ${t.segments}`),
+							),
+							h("div", { className: "sa-param" },
+								h("span", { className: "sa-param-key" }, t.executor),
+								h("span", { className: "sa-param-value" }, runtime.executor ?? "native"),
+							),
+							h("div", { className: "sa-param" },
+								h("span", { className: "sa-param-key" }, t.surface),
+								h("span", { className: "sa-param-value" }, runtime.surface ?? "—"),
+							),
+						),
+					) : null,
 
 					h("section", { className: "sa-section" },
 						h("h2", { className: "sa-section-title" }, t.paramsTitle),
@@ -517,10 +619,18 @@ window.__ModuleLoader__.load({
 .sa-code{font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Consolas,monospace);font-size:12px;word-break:break-all;color:var(--dsw-alias-label-secondary,#5f6368);}
 .sa-hint{margin-top:10px;color:var(--dsw-alias-label-tertiary,#80868b);font-size:12px;}
 .sa-modes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;}
+.sa-tiers{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;}
 .sa-mode{appearance:none;text-align:left;font:inherit;color:inherit;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));background:var(--dsw-alias-bg-layer-1,#fff);border-radius:var(--dsw-radius-md,8px);padding:13px 14px;cursor:pointer;transition:border-color .15s,background .15s,box-shadow .15s;display:flex;flex-direction:column;gap:8px;}
 .sa-mode:hover:not(:disabled){border-color:var(--dsw-alias-border-selected,var(--dsw-alias-brand-primary,#4d6bfe));background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.02));}
 .sa-mode:disabled{cursor:default;opacity:.72;}
 .sa-mode-active{border-color:var(--dsw-alias-brand-primary,#4d6bfe);box-shadow:0 0 0 1px var(--dsw-alias-brand-primary,#4d6bfe) inset;}
+.sa-tier{appearance:none;text-align:left;font:inherit;color:inherit;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));background:var(--dsw-alias-bg-layer-1,#fff);border-radius:var(--dsw-radius-md,8px);padding:12px 13px;cursor:pointer;transition:border-color .15s,background .15s,box-shadow .15s;display:flex;flex-direction:column;gap:6px;}
+.sa-tier:hover:not(:disabled){border-color:var(--dsw-alias-border-selected,var(--dsw-alias-brand-primary,#4d6bfe));background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.02));}
+.sa-tier:disabled{cursor:default;opacity:.72;}
+.sa-tier-active{border-color:var(--dsw-alias-brand-primary,#4d6bfe);box-shadow:0 0 0 1px var(--dsw-alias-brand-primary,#4d6bfe) inset;}
+.sa-tier-head{display:flex;align-items:center;gap:8px;}
+.sa-tier-values{font-family:var(--dsw-font-mono,ui-monospace,Consolas,monospace);font-size:11px;color:var(--dsw-alias-label-secondary,#5f6368);}
+.sa-tier-when{font-size:12px;color:var(--dsw-alias-label-primary,#1a1a1a);}
 .sa-mode-head{display:flex;align-items:center;gap:8px;}
 .sa-mode-order{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:6px;background:var(--dsw-alias-bg-layer-2,#f3f4f6);color:var(--dsw-alias-label-secondary,#5f6368);font-size:11px;font-weight:700;flex:none;}
 .sa-mode-name{font-weight:650;font-size:14px;}
@@ -549,7 +659,7 @@ window.__ModuleLoader__.load({
 .sa-fail-title{font-size:17px;font-weight:650;margin-bottom:6px;}
 .sa-fail-text{color:var(--dsw-alias-label-secondary,#5f6368);font-size:13px;margin-bottom:10px;}
 .sa-fail-detail{font-family:var(--dsw-font-mono,ui-monospace,Consolas,monospace);font-size:11px;color:var(--dsw-alias-state-error-primary,#d93025);margin-bottom:16px;word-break:break-all;}
-@media (max-width:760px){.sa-shell{padding:20px 16px 36px}.sa-modes{grid-template-columns:1fr}.sa-params{grid-template-columns:repeat(2,minmax(0,1fr))}.sa-grid{grid-template-columns:1fr}.sa-header{flex-direction:column}}
+@media (max-width:760px){.sa-shell{padding:20px 16px 36px}.sa-modes{grid-template-columns:1fr}.sa-tiers{grid-template-columns:1fr}.sa-params{grid-template-columns:repeat(2,minmax(0,1fr))}.sa-grid{grid-template-columns:1fr}.sa-header{flex-direction:column}}
 @media (prefers-reduced-motion:reduce){.sa-skeleton{animation:none}}
 `;
 

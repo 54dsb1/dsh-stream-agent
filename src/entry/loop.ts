@@ -27,11 +27,42 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { TfStreamParser, splitEditBody } from '../kernel/parser.ts';
 import type { TfCommand, ParserEvent } from '../kernel/parser.ts';
-import { ContextRenderer, assertRequestPrefix, PrefixBrokenError, renderHash } from '../kernel/render.ts';
+import { ContextRenderer, assertRequestPrefix, PrefixBrokenError, renderHash, contextRebasedLine } from '../kernel/render.ts';
 import type { RenderMessage, RequestBaseline } from '../kernel/render.ts';
-import { ObservationLedger } from '../kernel/obs.ts';
+import { ObservationLedger, renderReadIndex } from '../kernel/obs.ts';
 import type { ObservationResult } from '../kernel/obs.ts';
 import { checkFinalSummary } from '../kernel/final.ts';
+import {
+  compactItems,
+  renderStateDigest,
+  renderEffectLine,
+  shouldElideEffect,
+} from '../kernel/compaction.ts';
+import type { CompactAggressiveness } from '../kernel/compaction.ts';
+import {
+  checkTaskBudgetFloor,
+  observeBudget,
+  shouldCompact,
+  shouldStopForSteps,
+} from '../kernel/governor.ts';
+import {
+  CHANNELS,
+  TIERS,
+  DEFAULT_CHANNEL,
+  DEFAULT_TIER,
+  DEFAULT_BUDGET_TOKENS_OBSERVE,
+  getChannel,
+  getTier,
+  isChannelId,
+  isTierId,
+  isLegacyModeId,
+  resolveLegacyMode,
+  publicChannelCatalog,
+  publicTierCatalog,
+  publicLegacyModeCatalog,
+} from '../kernel/modes.ts';
+import type { ChannelId, TierId, TierValues } from '../kernel/modes.ts';
+import { isLang } from '../kernel/control-bar.ts';
 import {
   appendLedgerRecord,
   createJsonlPersistence,
@@ -47,11 +78,9 @@ import { asPluginEffect, getService } from './cordis-compat.ts';
 import { readPersistedControl, resolveControlState, writePersistedControl } from './control-state.ts';
 import type { ControlStateWithSource } from './control-state.ts';
 import { appendIntentRecord, intentFileOf, loadIntentRecords, pendingIntents, reconcilePendingIntents } from './intent-log.ts';
-import { clearTakeover, markTakeover } from './takeover-registry.ts';
+import { clearTakeover, markTakeover, markDegrade, takeover } from './takeover-registry.ts';
 import { ToolSurfaceHolder, degradedLine } from './tool-surface.ts';
-import type { SurfaceProfile, ToolSurface, ToolsServiceLike } from './tool-surface.ts';
-import { isModeId, modeConfig, publicModeCatalog } from '../kernel/modes.ts';
-import { isLang } from '../kernel/control-bar.ts';
+import type { SurfacePolicy, SurfaceProfile, ToolSurface, ToolsServiceLike } from './tool-surface.ts';
 import { composeProtocolText, asProtocolLevel, PROTOCOL_SECTION_IDS } from '../kernel/protocol.ts';
 import type { ProtocolLevel, ProtocolSectionId } from '../kernel/protocol.ts';
 import { VERSION } from '../version.ts';
@@ -263,18 +292,84 @@ export interface StreamDriverConfig {
    *  失败的写、被拒的 final、纯 prose 步都算零产出；只读/只 peek 但拿到新信息算产出。 */
   stallReentries?: number;
   /** v0.4.0（自 0.3.3 回流）：回合请求硬上限（含生产性重入）。达到后进入兜底交付，
-   *  绝不无限烧请求。缺省 = max(4, maxReentries * 2)。 */
+   *  绝不无限烧请求。缺省 = max(4, maxReentries * 2)。
+   *  0.5.0：改名为 **maxSteps**（§4.5.2 N 上限，档位值 16/24/40）；maxRequests 保留为别名。 */
   maxRequests?: number;
-  /** v0.4.0（自 0.3.3 回流）：收束期最多再给几次请求（到达停滞/硬上限后）。缺省 2。 */
-  closeOutRequests?: number;
+  /** 0.5.0（§4.5.2）：单任务请求数上限（N 上限）。触顶停止探索、注入收束指令要求 tf-final。
+   *  0 = 无上限（仅观测）。缺省 = maxRequests（兼容）→ 再缺省 max(4, maxReentries*2)。 */
+  maxSteps?: number;
+  /** 0.5.0（§4.5.2）：单请求上下文上限（C 上限，token 估算）。触顶触发压缩（压缩旧段并
+   *  记录 handle，计划性换基）。0 = 不压缩（仅观测）。缺省 = 档位值（light 12k / standard
+   *  20k / deep 48k）。 */
+  maxInputTokens?: number;
+  /** 0.5.0：压缩强度（档位值 aggressive/balanced/conservative）——决定触发压缩的填充率。 */
+  compactAggressiveness?: CompactAggressiveness;
+  /** 0.5.0（§7.6）：压缩保留最近条数（档位值 12/30/60）。 */
+  keepRecent?: number;
+  /** 0.5.0（§7.6）：摘要总长上限（字符；档位值 8k/16k/32k）。 */
+  maxSummaryChars?: number;
+  /** 0.5.0（§7.3(3)）：每回合取回字符上限（tf-peek/span 通道；0 = 不限制）。缺省档位值。 */
+  peekBudgetChars?: number;
+  /** 0.5.0（§5.6）：效果压缩开关（默认 true）。false = 保留程序全文（回退点：
+   *  上下文 hash 对比 0.4.0）。 */
+  effectElision?: boolean;
+  /** 0.5.0（§5.6）：最近 N 个效果不折叠（默认 3）。 */
+  effectElisionKeepRecent?: number;
+  /** 0.5.0（§5.6）：语义状态摘要一行注入（默认 true）。false = 不注入。 */
+  stateDigest?: boolean;
+  /** 0.5.0（§7.6）：surface replace 压缩总开关（代码通道的主压缩路径；标准通道走
+   *  dropAppendHead + 确定性摘要）。false = 不压缩（回退点：消息序列逐字节一致）。 */
+  surfaceCompaction?: boolean;
+  /** 0.5.0（§7.3）：已投递 span 账本（默认 true）。false = 无重复抑制（行为等价 0.4.0）。 */
+  spanLedger?: boolean;
+  /** 0.5.0（§7.3）：read 输出带行锚索引（默认 true）。false = 回到头部截断（0.4.x 行为）。 */
+  peekIndex?: boolean;
+  /** 0.5.0（§7.5 双旋钮·读取侧）：单次 read 返回上限（字符），超出转索引。缺省 32k。 */
+  maxReadChars?: number;
+  /** 0.5.0（§7.5 双旋钮·回灌侧）：单次 read 注入多少（回灌侧）。0 = 不截断（默认；
+   *  读取侧已控住）；8000 = 0.4.x 行为（回退点）。 */
+  readFeedbackLimit?: number;
+  /** 0.5.0（§8.5）：前缀策略。'auto'（默认）= 三类分别处置（planned-rebase 正常路径 +
+   *  append-drift 受限换基 + stable-drift/shrink fail-closed）；'rebase' = 允许换基（受
+   *  rebaseBudgetRatio / maxRebases 限流）；'fail' = 绝不换基，违约必报错（§12.4 回退）。 */
+  prefixPolicy?: 'auto' | 'rebase' | 'fail';
+  /** 0.5.0（§8.4）：允许自动换基的剩余预算倍率（默认 1.5）。 */
+  rebaseBudgetRatio?: number;
+  /** 0.5.0（§8.5）：每回合换基限流（默认 2）。 */
+  maxRebasesPerTurn?: number;
+  /** 0.5.0（§8.5）：每会话换基限流（默认 8）。 */
+  maxRebasesPerSession?: number;
+  /** 0.5.0（§6.3）：工具面策略。'reserved-only'（默认）= 只管 tf-* 前缀，其余透传；
+   *  'profile' = 0.4.x 过滤行为（仅回退演练，已弃用）。 */
+  surfacePolicy?: SurfacePolicy;
+  /** v0.4.0 工具面档位（仅 surfacePolicy='profile' 时生效；'off' 已删除——D2） */
+  toolSurface?: SurfaceProfile;
+  /** 0.5.0（§6.2）：loop 接管优先级（默认 100；数值大者优先——仅用于诊断展示）。 */
+  takeoverPriority?: number;
+  /** 0.5.0（§6.2）：setFactory 冲突处置。'degrade'（默认）= 不接管转 sidecar（控制栏
+   *  状态 + 诊断，上下文治理全部关闭）；'refuse' = 抛错明确冲突。 */
+  takeoverOnConflict?: 'degrade' | 'refuse';
+  /** 0.5.0（§5.2）：代码通道来源。'auto'（默认）= 按 §5.2 判定（preset 探针 → bridge →
+   *  不可用回退标准）；显式 'preset'/'bridge' 绕过探测。 */
+  codeChannelSource?: 'auto' | 'preset' | 'bridge';
+  /** 执行通道（0.5.0 §4.2）：'standard'（默认）/ 'code'。通道切换在任务边界生效
+   *  （计划性换基）。 */
+  channel?: ChannelId;
+  /** 上下文档位（0.5.0 §4.2）：light / standard / deep——只改数值。 */
+  tier?: TierId;
   /** v0.4.0（自 0.3.3 回流）：单请求 tf-read 完整正文注入预算（字符）。超出部分转"预览 +
    *  句柄"，下一请求再按需补全——把新内容摊平，避免一次读五个文件造成缓存大块 miss。
    *  0/负数 = 关闭（回退点）；缺省 DEFAULT_READ_FEEDBACK_BUDGET_PER_REQUEST。 */
   readFeedbackBudgetPerRequest?: number;
   /** 流空闲看门狗：流在此时长内无任何 chunk → abort（fault-timeout 路径） */
   streamIdleTimeoutMs?: number;
-  /** 任务级 token 预算（O5 阶梯分母；缺省 = 阶梯关闭，恒为 normal 档） */
+  /** 任务级 token 预算（O5 阶梯分母；缺省 = 阶梯关闭，恒为 normal 档）。
+   *  0.5.0：降为半观测——显式设置时阶梯仍生效（基数已修复为任务起点，D1），
+   *  未设置时只做观测告警（observeBudgetTokens，D7：cacheRead 不再按 1:1 计入控制）。 */
   budgetTokens?: number;
+  /** 0.5.0：观测预算阈值（token；默认 60,000）。任务级花费（严格口径，不含 cacheRead）
+   *  超阈值写 warn 与报表，**不改变执行行为**（D7 修复落点）。 */
+  observeBudgetTokens?: number;
   /** 饥饿防线阈值（透传 obs.ts） */
   starvationThreshold?: number;
   /** 原生工具 schema 文本（双通道：声明给模型的可用原生工具；缺省 = 协议独占） */
@@ -299,22 +394,18 @@ export interface StreamDriverConfig {
    *  不重复回灌全文——全文本就在模型上下文里，掐断"写→读回验"循环；
    *  'full' = v0.1 行为（完整反馈，读外部文件仍走此路径）。 */
   selfReadFeedback?: 'receipt' | 'full';
-  /** tf-code 程序化通道（PTC 桥接）。K1（0.3.0）：**默认关闭**——只有显式
-   *  `enableCode: true` 且 executeCode 端口在位才启用（协议文本才声明 tf-code 段）；
-   *  缺省/false 都关闭。不做会话级动态开关（协议段构造期冻结，动态切换会破坏前缀单调）。 */
+  /** tf-code 程序化通道（PTC 桥接）。0.5.0：由执行通道（channel）与来源判定取代——
+   *  channel='code' 且来源=bridge 时启用；显式 true 仍强制开启（兼容旧装配）。 */
   enableCode?: boolean;
   /** tf-code 默认超时（毫秒）；缺省 = 宿主 provider 默认（Node 后端 120s，上限 600s）。 */
   codeTimeoutMs?: number;
   /** tf-code 协议段覆盖（缺省 DEFAULT_CODE_PROTOCOL_SECTION；仅通道启用时追加） */
   codeProtocolText?: string;
-  /** v0.4.0 工具面档位（P1）：'core' | 'standard'（默认）| 'full' | 'off'（0.3.x 回退点）。
-   *  只影响原生 tools 声明面与降级语义；tf-call 可达性始终是冻结面的全量。 */
-  toolSurface?: SurfaceProfile;
   /** v0.4.0 原生通道（P1）：请求携带 tools schema。默认 false（§15 默认文本）——
    *  schema 的每请求 token 成本 > tf-call 的逐调用成本；开启场景 = 模型对原生
    *  tool_call 的结构化收益优先（provider 原生并行/错误形状）。 */
   nativeTools?: boolean;
-  /** v0.4.0 tf-call 通用调用通道（G2：命令表净增 1）。默认 true；toolSurface=off 强制关。 */
+  /** v0.4.0 tf-call 通用调用通道（G2：命令表净增 1）。默认 true。 */
   callCommand?: boolean;
   /** v0.4.0 tf-call 协议段覆盖（缺省 DEFAULT_CALL_PROTOCOL_SECTION；仅通道启用时追加） */
   callProtocolText?: string;
@@ -490,6 +581,8 @@ export type DriverRecord =
   | { seq: number; kind: 'final'; summary?: string }
   | { seq: number; kind: 'fault'; fault: string; detail?: string }
   | { seq: number; kind: 'observation'; handle: string | null; key: string; infoGain: string; reason: string }
+  /** 0.5.0（§8.6）：cache-reset 事件——cause / contextTokens / estimatedColdCost */
+  | { seq: number; kind: 'cache-reset'; cause: string; contextTokens: number; estimatedColdCost: number }
   /** K2 沙箱事实记账（tf-code 每次运行一条；宿主未报告的字段缺省） */
   | { seq: number; kind: 'sandbox'; cmdId: string; mode?: string; enforcement?: string; deniedCount: number }
   /** F5 计划与验收（tf-plan 每次声明/修订一条） */
@@ -499,7 +592,7 @@ export type DriverRecord =
   | { seq: number; kind: 'turn-end'; reason: TurnEndReason };
 
 /** plugin record 通道（真实宿主）。类型语法 plugin:tf-agent/<record>（dsh-session types.d.ts:527）。 */
-export type TfAgentRecordType = 'plugin:tf-agent/command' | 'plugin:tf-agent/final' | 'plugin:tf-agent/fault' | 'plugin:tf-agent/step' | 'plugin:tf-agent/plan' | 'plugin:tf-agent/intent' | 'plugin:tf-agent/surface';
+export type TfAgentRecordType = 'plugin:tf-agent/command' | 'plugin:tf-agent/final' | 'plugin:tf-agent/fault' | 'plugin:tf-agent/step' | 'plugin:tf-agent/plan' | 'plugin:tf-agent/intent' | 'plugin:tf-agent/surface' | 'plugin:tf-agent/cache';
 
 export interface LedgerSink {
   record(type: TfAgentRecordType, data: unknown): void;
@@ -570,6 +663,25 @@ export const DEFAULT_CALL_PROTOCOL_SECTION = `## tf-call 通用调用（映射�
   tf-* 覆盖到的操作继续用 tf-*（更短）；两者可混用，depends_on/accepts 语义一致。
 - 结果按工具类型分族处理（读类结果注入、写类只记回执），与 tf-* 同一套规则；JSON 引号
   转义错误会收到 bad-json-arguments 注入，修正 body 重发即可。`;
+
+// ---------------------------------------------------------------------------
+// 0.5.0 执行通道的协议面（§3.2 能力矩阵）
+// ---------------------------------------------------------------------------
+
+/** 0.5.0（§7.5 双旋钮·读取侧）：单次 read 返回上限（字符）。超出转行锚索引（§7.3(1)）。 */
+export const DEFAULT_MAX_READ_CHARS = 32_000;
+
+/** 代码通道（preset 来源）的系统提示：不引导 tf-*（协议段 0 字符；§5.3 完全让位——
+ *  "对 system prompt 的贡献为 0 字符"的让位清单不含 system 措辞本身，但引导模型输出
+ *  tf-* 命令会造成幻觉调用，故整条换为通道措辞）。 */
+export const DEFAULT_CODE_CHANNEL_SYSTEM_PROMPT = '你是运行在 DeepSeek Harness 里的 agent（代码通道）：像通常一样直接调用会话内的工具（数据加工用 run_code 程序）。上下文治理（压缩、状态摘要、度量）由 stream-agent 提供，不改变你的工具面。';
+
+/** 代码通道（bridge 来源，受限窄桥）的协议段：约 200 字符，只写 tf-code 用法；
+ *  不传 stateOwner / programFormat / sandboxPolicy（§5.2 第二分支）。 */
+export const DEFAULT_CODE_BRIDGE_PROTOCOL_SECTION = `## tf-code（内置窄桥）
+<tf-code id="c1">（async TS 函数体）</tf-code>
+程序内：await tools.read({file_path}) / tools.write({file_path, content}) / tools.pwsh({command, description})。
+只 return 最终值（中间结果不进上下文）；失败会以 [tf-stream:code-error] 注入。`;
 
 /** F3：tf-code 首成功/变化结果完整注入的默认上限（字符）。4000 ≈ 2k tokens：
  *  上限内值直接可见（省一次 tf-peek 往返），超限转骨架 + 句柄（中间结果不回灌的红线不破）。 */
@@ -675,6 +787,57 @@ function truncationNudge(truncation: { reason: string; raw: string }): string {
 }
 
 // ---------------------------------------------------------------------------
+// 0.5.0：按执行通道组装稳定前缀四段（§3.2 能力矩阵；构造期冻结）
+// ---------------------------------------------------------------------------
+
+function composeChannelTexts(
+  channel: ChannelId,
+  codeSource: 'preset' | 'bridge' | 'none' | undefined,
+  cfg: { codeEnabled: boolean; callCommand: boolean; nativeTools: boolean; enablePlan: boolean },
+  config: StreamDriverConfig,
+): { system: string; protocol: string; toolSchemas: string; invariants: string } {
+  // 显式覆盖（测试注入）永远压过通道缺省
+  const system = config.systemPrompt;
+  const invariants = config.invariants === false ? '' : config.invariants ?? DEFAULT_INVARIANTS;
+  const toolSchemas = config.nativeToolSchemas
+    ?? (config.nativeTools
+      ? '（本请求的原生工具 schema 见 tools 字段；未列出的宿主工具一律走 tf-call）'
+      : undefined);
+  if (channel === 'code') {
+    // 代码通道：preset 来源协议段 0 字符（§5.3 完全让位）；bridge 来源只写 tf-code 用法
+    const base = codeSource === 'bridge'
+      ? (config.protocolText ?? config.codeProtocolText ?? DEFAULT_CODE_BRIDGE_PROTOCOL_SECTION)
+      : (config.protocolText ?? '');
+    return {
+      system: system ?? DEFAULT_CODE_CHANNEL_SYSTEM_PROMPT,
+      protocol: base,
+      toolSchemas: toolSchemas ?? (codeSource === 'bridge'
+        ? '（本通道只声明 tf-code 程序体；其余操作走会话原生工具）'
+        : '（工具面由会话 preset 决定；本插件不注册、不裁剪任何工具）'),
+      invariants: config.invariants === false ? '' : config.invariants
+        ?? '不变量：工具面由会话 preset 决定，本插件不注册不裁剪；上下文压缩（surface replace）可能替换旧消息为摘要，原文按句柄保留可取回。',
+    };
+  }
+  // 标准通道：0.4.x 组装 + 0.5.0 peek 段（kernel/protocol.ts LEVEL_SECTIONS 已含）
+  const baseProtocol = config.protocolText
+    ?? composeProtocolText({
+      level: config.protocolLevel ?? 'full',
+      sections: config.protocolSections,
+      enablePlan: cfg.enablePlan,
+    });
+  const protocolText = baseProtocol
+    + (cfg.codeEnabled ? `\n\n${config.codeProtocolText ?? DEFAULT_CODE_PROTOCOL_SECTION}` : '')
+    + (cfg.callCommand ? `\n\n${config.callProtocolText ?? DEFAULT_CALL_PROTOCOL_SECTION}` : '')
+    + (config.protocolAppend ? `\n\n${config.protocolAppend}` : '');
+  return {
+    system: system ?? DEFAULT_SYSTEM_PROMPT,
+    protocol: protocolText,
+    toolSchemas: toolSchemas ?? '（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）',
+    invariants,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // ② SingleStreamDriver
 // ---------------------------------------------------------------------------
 
@@ -734,12 +897,34 @@ export interface DriverSnapshot {
   usage: { inputTokens: number; outputTokens: number };
   requestCount: number;
   stableHashes: readonly string[];
+  /** 0.5.0：执行通道与来源判定（四臂 benchmark 的 channel_source 指标，§12.2） */
+  channel: () => { channel: ChannelId; requestedChannel: ChannelId; tier: TierId; codeSource: 'preset' | 'bridge' | 'none' | undefined; channelFallback: string | undefined };
+  /** 0.5.0：取回度量（§7.4 指标表） */
+  peekMetrics: () => ReturnType<ObservationLedger['peekMetrics']>;
+  /** 0.5.0：换基计数（计划性/非计划性分账，§12.2 rebase_count） */
+  rebaseCounts: () => { planned: number; appendDrift: number; session: number };
 }
 
 let DRIVER_SEQ = 0;
 
+/** 0.5.0（§5.6(1)）：效果账条目（效果压缩的数据源）。 */
+interface EffectEntry {
+  effectId: string;
+  cmdId: string;
+  action: string;
+  target: string;
+  version?: number;
+  diffstat?: string;
+  verify: 'pass' | 'fail' | 'unverified';
+  acceptId?: string;
+  handle?: string;
+  digestIndex: number;
+}
+
 export class SingleStreamDriver {
   #ports: DriverPorts;
+  /** 0.5.0：装配 config 原样保留（通道切换重组协议面时取显式覆盖项）。 */
+  #configRef: StreamDriverConfig;
   readonly #cfg: {
     provider: string;
     model: string;
@@ -748,16 +933,59 @@ export class SingleStreamDriver {
     maxReentries: number;
     /** v0.4.0：连续零产出重入上限（默认 = maxReentries） */
     stallReentries: number;
-    /** v0.4.0：请求硬上限（默认 max(4, maxReentries*2)） */
-    maxRequests: number;
+    /** 0.5.0：单任务请求上限（N 上限；maxRequests 的改名与接管者，默认 max(4, maxReentries*2)） */
+    maxSteps: number;
+    /** 0.5.0：单请求上下文上限（C 上限；0 = 不压缩） */
+    maxInputTokens: number;
+    /** 0.5.0：压缩强度（档位值） */
+    compactAggressiveness: CompactAggressiveness;
+    /** 0.5.0：压缩保留最近条数（档位值） */
+    keepRecent: number;
+    /** 0.5.0：摘要总长上限（字符，档位值） */
+    maxSummaryChars: number;
+    /** 0.5.0：每回合取回字符上限（0 = 不限制） */
+    peekBudgetChars: number;
+    /** 0.5.0：效果压缩（默认 true；false = 保留全文——回退点） */
+    effectElision: boolean;
+    /** 0.5.0：最近 N 个效果不折叠（默认 3） */
+    effectElisionKeepRecent: number;
+    /** 0.5.0：语义状态摘要一行注入（默认 true） */
+    stateDigest: boolean;
+    /** 0.5.0：surface replace 压缩总开关（默认 true；false = 不压缩——回退点） */
+    surfaceCompaction: boolean;
+    /** 0.5.0：span 账本（默认 true；false = 无重复抑制——回退点） */
+    spanLedger: boolean;
+    /** 0.5.0：read 行锚索引（默认 true；false = 头部截断——回退点） */
+    peekIndex: boolean;
+    /** 0.5.0：单次 read 返回上限（字符；超出转索引） */
+    maxReadChars: number;
+    /** 0.5.0：前缀策略（默认 auto） */
+    prefixPolicy: 'auto' | 'rebase' | 'fail';
+    /** 0.5.0：允许自动换基的剩余预算倍率（默认 1.5） */
+    rebaseBudgetRatio: number;
+    /** 0.5.0：每回合换基限流（默认 2） */
+    maxRebasesPerTurn: number;
+    /** 0.5.0：每会话换基限流（默认 8） */
+    maxRebasesPerSession: number;
+    /** 0.5.0：工具面策略（默认 reserved-only） */
+    surfacePolicy: SurfacePolicy;
+    /** 0.5.0：执行通道（standard/code） */
+    channel: ChannelId;
+    /** 0.5.0：上下文档位（light/standard/deep） */
+    tier: TierId;
+    /** 0.5.0：档位数值（解析后的冻结快照；任务级指令可覆盖 N/C 两项） */
+    tierValues: TierValues;
+    /** 0.5.0：观测预算阈值（默认 60k；仅告警不改行为——D7） */
+    observeBudgetTokens: number;
     /** v0.4.0：收束期额外请求数（默认 2） */
     closeOutRequests: number;
     /** v0.4.0：单请求 tf-read 完整正文注入预算（字符；≤0 关闭） */
     readFeedbackBudgetPerRequest: number;
     streamIdleTimeoutMs: number;
+    /** 显式预算（阶梯控制；undefined = 阶梯关闭） */
     budgetTokens?: number;
-    /** tf-read 成功反馈完整原文的字符上限（缺省 DEFAULT_READ_FEEDBACK_LIMIT；超长截断保头尾） */
-    readFeedbackLimit?: number;
+    /** tf-read 成功反馈完整原文的字符上限（0 = 不截断——0.5.0 默认；8000 = 0.4.x 回退） */
+    readFeedbackLimit: number;
     /** 自写回验策略（修复限制 1）：'receipt'（默认）| 'full' */
     selfReadFeedback: 'receipt' | 'full';
     /** tf-code 通道是否启用（K1：仅显式 enableCode:true 且端口在位；决定协议文本是否声明 tf-code） */
@@ -777,13 +1005,9 @@ export class SingleStreamDriver {
   /** F7：段边界阈值（追加区字符数；≤0 = 关闭） */
   segmentMaxChars: number;
   toolMapping: ToolMapping;
-  /** v0.4.0 工具面档位（§16 决议 2：缺省 standard）。'off' = 0.3.x 行为（无宿主面，
-   *  tf-call 关闭——回退点）。 */
-  toolSurface: SurfaceProfile;
-  /** v0.4.0 原生通道开关（§15：默认文本 false）。开启时请求携带冻结面 schema
-   *  （core 档白名单 / standard-full 全量），可达性同时保留 tf-call。 */
+  /** v0.4.0 原生通道开关（§15：默认文本 false）。开启时请求携带冻结面 schema。 */
   nativeTools: boolean;
-  /** v0.4.0 tf-call 通用通道开关（G2）。toolSurface=off 时强制关。 */
+  /** v0.4.0 tf-call 通用通道开关（G2）。 */
   callCommand: boolean;
   /** v0.4.0 toolSet 准入（R5 决议 3：beta 缺省 false——toolSet 只用于 schemas 视图，
    *  不传 execute；P6 复跑后再收紧）。 */
@@ -799,6 +1023,54 @@ export class SingleStreamDriver {
   #currentSurface: ToolSurface | undefined = undefined;
   /** 上一次注入的降级级别（同级别不重复注入；级别变化或恢复时重新注入）。 */
   #lastSurfaceDegraded: 'stale' | 'core' | 'protocol-only' | 'ok' = 'ok';
+  // ---- 0.5.0 执行通道（§3.2/§5.2）：请求值 + 生效值 + 来源判定 + 回退原因 ----
+  /** 用户/装配请求的通道（可能因来源不可用被拒绝）。 */
+  #requestedChannel: ChannelId;
+  /** 生效通道（代码通道来源皆无时回退 standard——不静默，原因在 #channelFallback）。 */
+  #channel: ChannelId;
+  /** 代码通道来源（undefined = 标准通道）。preset=完全让位 / bridge=受限窄桥。 */
+  #codeSource: 'preset' | 'bridge' | 'none' | undefined;
+  /** 代码通道被拒原因（undefined = 无回退）。控制栏与 status 展示。 */
+  #channelFallback: string | undefined = undefined;
+  /** 任务边界待切换的通道（§3.3 约束 5：切换在下一个用户任务生效；任务中排队）。 */
+  #pendingChannel: ChannelId | null = null;
+  /** 任务边界待切换的档位（同上；只改数值，不换前缀——无需换基）。 */
+  #pendingTier: TierId | null = null;
+  /** 本会话换基次数（maxRebasesPerSession 限流 + 控制栏展示）。 */
+  #rebasesSession = 0;
+  /** 本回合换基次数（maxRebasesPerTurn 限流）。 */
+  #rebasesTurn = 0;
+  /** 本回合取回字符累计（peekBudgetChars 预算；回合开始清零）。 */
+  #peekBudgetUsed = 0;
+  /** 本任务请求数（控制栏"本任务 N"；pushUserTask 清零）。 */
+  #taskRequestCount = 0;
+  /** 本任务换基次数（控制栏"换基"；pushUserTask 清零）。 */
+  #rebasesTask = 0;
+  /** 装配层探测到的代码通道可用来源（null = 不可用；setChannel('code') 的判据）。 */
+  #availableCodeSource: 'preset' | 'bridge' | null = null;
+  /** 任务起点取回度量快照（重复取回 0/0 的任务级口径）。 */
+  #peekMetricsBase = { hits: 0, total: 0 };
+  /** 本任务起点计量快照（D1 修复：budgetLevel 用任务级差值，不再用会话累计）。 */
+  #usageBase = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  #injectedCharsBase = 0;
+  /** 任务级预算指令（[tf-budget: 8steps/20k] 解析结果；只覆盖本任务的 N/C 两旋钮）。 */
+  #taskBudget: { maxSteps?: number; maxInputTokens?: number } | null = null;
+  /** 本任务预算下限检查结果（runTurn 启动时判定一次）。 */
+  #taskBudgetBlocked: string | null = null;
+  /** 任务级观测告警已发（同任务只告警一次）。 */
+  #budgetWarned = false;
+  /** 效果账（§5.6(1)：效果压缩的数据源；按时间序，最新在尾）。 */
+  readonly #effects: EffectEntry[] = [];
+  /** 效果序号（p1、p2…）。 */
+  #effectCounter = 0;
+  /** 摘要段数（压缩产生的摘要块数；控制栏 stats 用）。 */
+  #summaryBlocks = 0;
+  /** S5 快照贡献端口（apply() 注入 systemPrompt.context；代码通道的状态摘要注入通道）。 */
+  #runtimeContextPort: ((text: string) => void) | undefined = undefined;
+  /** 最近一次 S5 状态摘要文本（去重：同文本不重发）。 */
+  #lastDigestSent: string | null = null;
+  /** 最近一次随回灌注入的状态摘要（去重：同文本不重复占请求体积）。 */
+  #lastDigestInjected: string | null = null;
   readonly #records: DriverRecord[] = [];
   readonly #commands = new Map<string, CommandRecord>();
   readonly #inFlight = new Set<Promise<void>>();
@@ -1009,6 +1281,40 @@ export class SingleStreamDriver {
 
   constructor(ports: DriverPorts, config: StreamDriverConfig, renderer?: ContextRenderer, obs?: ObservationLedger) {
     this.#ports = ports;
+    this.#configRef = config;
+    // ---- 0.5.0 档位数值（§4.2 表；tier 只改数值）----
+    const tierSpec = getTier(config.tier ?? DEFAULT_TIER);
+    const tv = tierSpec.values;
+    // ---- 0.5.0 代码通道三来源判定（§5.2）：装配层探测结果经 config.codeSource 注入；
+    // 显式 codeChannelSource 绕过探测；来源皆无 → 拒绝进入，回退标准（不静默降级）。----
+    let requestedChannel: ChannelId = config.channel ?? DEFAULT_CHANNEL;
+    let codeSource: 'preset' | 'bridge' | 'none' | undefined;
+    if (requestedChannel === 'code') {
+      if (config.codeChannelSource === 'preset' || config.codeChannelSource === 'bridge') {
+        codeSource = config.codeChannelSource;
+      } else if (config.codeSource !== undefined) {
+        codeSource = config.codeSource;
+      } else {
+        codeSource = 'none';
+      }
+      if (codeSource === 'none') {
+        // §5.2 第三分支：拒绝进入代码通道，回退标准通道（warn + 台账 + 控制栏状态，
+        // 绝不静默降级）。控制状态由 takeover/控制页读取 runtimeChannel 看到回退事实。
+        const reason = '代码通道不可用：未检测到 PTC 预设或 ptcRuntime（来源判定 none）——回退标准通道';
+        (ports.onWarning ?? (() => {}))(`[stream-loop] ${reason}`);
+        this.#channelFallback = reason;
+        requestedChannel = DEFAULT_CHANNEL;
+        codeSource = undefined;
+      }
+    }
+    this.#requestedChannel = config.channel ?? DEFAULT_CHANNEL;
+    this.#channel = requestedChannel;
+    this.#codeSource = codeSource;
+    // 装配层探测结果（apply() 注入）：setChannel('code') 的可用性判据。
+    this.#availableCodeSource = config.codeSource === 'preset' || config.codeSource === 'bridge'
+      ? config.codeSource
+      : null;
+    const codeChannel = requestedChannel === 'code';
     this.#cfg = {
       provider: config.provider,
       model: config.model,
@@ -1021,16 +1327,46 @@ export class SingleStreamDriver {
       // 打转"都算进 maxReentries，13 步的真实任务（读文件/改文件/跑检查）会在干到一半时
       // 被硬杀，桌面端只剩最后一句 prose（真机 session-6bb805db / 27876fd9）。
       stallReentries: config.stallReentries ?? config.maxReentries ?? 12,
-      maxRequests: config.maxRequests ?? Math.max(4, (config.maxReentries ?? 12) * 2),
+      // 0.5.0（§4.5.2）：maxSteps 接管 maxRequests（N 上限，档位值 16/24/40）。
+      // 显式 maxReentries（无 maxSteps/maxRequests）时保留旧派生 max(4, maxReentries*2)，
+      // 兼容 0.4.x 装配；0 = 无上限（仅观测）。
+      maxSteps: config.maxSteps
+        ?? config.maxRequests
+        ?? (config.maxReentries !== undefined ? Math.max(4, config.maxReentries * 2) : tv.maxSteps),
+      maxInputTokens: config.maxInputTokens ?? tv.maxInputTokens,
+      compactAggressiveness: config.compactAggressiveness ?? tv.compactAggressiveness,
+      keepRecent: config.keepRecent ?? tv.keepRecent,
+      maxSummaryChars: config.maxSummaryChars ?? tv.maxSummaryChars,
+      peekBudgetChars: config.peekBudgetChars ?? tv.peekBudgetChars,
+      effectElision: config.effectElision !== false,
+      effectElisionKeepRecent: Math.max(0, config.effectElisionKeepRecent ?? 3),
+      stateDigest: config.stateDigest !== false,
+      surfaceCompaction: config.surfaceCompaction !== false,
+      spanLedger: config.spanLedger !== false,
+      peekIndex: config.peekIndex !== false,
+      maxReadChars: config.maxReadChars ?? DEFAULT_MAX_READ_CHARS,
+      prefixPolicy: config.prefixPolicy ?? 'auto',
+      rebaseBudgetRatio: config.rebaseBudgetRatio ?? 1.5,
+      maxRebasesPerTurn: Math.max(0, config.maxRebasesPerTurn ?? 2),
+      maxRebasesPerSession: Math.max(0, config.maxRebasesPerSession ?? 8),
+      surfacePolicy: config.surfacePolicy ?? 'reserved-only',
+      channel: requestedChannel,
+      tier: config.tier ?? DEFAULT_TIER,
+      tierValues: tv,
+      observeBudgetTokens: config.observeBudgetTokens ?? config.budgetTokens ?? DEFAULT_BUDGET_TOKENS_OBSERVE,
       closeOutRequests: Math.max(0, config.closeOutRequests ?? 2),
       readFeedbackBudgetPerRequest: config.readFeedbackBudgetPerRequest
         ?? DEFAULT_READ_FEEDBACK_BUDGET_PER_REQUEST,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? 30_000,
       budgetTokens: config.budgetTokens,
+      // 0.5.0（§7.5 双旋钮）：回灌侧默认 0 = 不截断（读取侧 maxReadChars 已控住）；
+      // 8000 = 0.4.x 行为回退点。
+      readFeedbackLimit: config.readFeedbackLimit ?? 0,
       selfReadFeedback: config.selfReadFeedback ?? 'receipt',
-      // K1（0.3.0）：默认关闭——只有显式 enableCode:true 且端口在位才启用。
-      // 0.2.0 的"端口在位即启用"（auto）语义已按 M2/K1 结论收口：协议段默认 0 字符。
-      codeEnabled: config.enableCode === true && ports.executeCode !== undefined,
+      // 0.5.0：tf-code 通道 = channel==='code'（bridge 来源，本插件执行）或显式 enableCode。
+      // preset 来源下执行器是宿主 tool-executor-ptc，本插件不执行 tf-code（让位，§5.3）。
+      codeEnabled: ((codeChannel && codeSource === 'bridge') || config.enableCode === true)
+        && ports.executeCode !== undefined,
       codeTimeoutMs: config.codeTimeoutMs,
       codeQuota: { ...DEFAULT_CODE_QUOTA, ...(config.codeQuota ?? {}) },
       codeValueInjectLimit: config.codeValueInjectLimit ?? DEFAULT_CODE_VALUE_INJECT_LIMIT,
@@ -1039,45 +1375,36 @@ export class SingleStreamDriver {
       enablePlan: config.enablePlan ?? true,
       segmentMaxChars: config.segmentMaxChars ?? DEFAULT_SEGMENT_MAX_CHARS,
       toolMapping: config.toolMapping ?? DEFAULT_TOOL_MAPPING,
-      // v0.4.0 工具面（P1）：'off' 档 = 0.3.x 行为回退点；无宿主服务面（headless/离线）
-      // 时 tf-call 段不声明（协议文本与 0.3.x 一致，mock 剧本匹配不受影响）
-      toolSurface: config.toolSurface ?? 'standard',
       nativeTools: config.nativeTools === true,
-      callCommand: (config.toolSurface ?? 'standard') !== 'off'
-        && config.callCommand !== false
-        && ports.toolsService !== undefined,
+      callCommand: config.callCommand !== false && ports.toolsService !== undefined,
       strictAdmission: config.strictAdmission === true,
       // v0.4.3（P0-6 探针）：离线探针专用（生产不得设置）；undefined = 关闭，零开销。
       ...(config.faultPrefixDrift === undefined ? {} : { faultPrefixDrift: config.faultPrefixDrift }),
     };
-    // tf-code 协议段只在实际可执行时声明（稳定前缀构造期冻结：通道不存在就不会被模型幻觉调用）
-    // v0.4.0：tf-call 协议段同理（callCommand 决定声明与否；'off' 档不声明，0.3.x 回退点）
-    // v0.4.1：基座协议由 kernel/protocol.ts 组件化组装（档位/段增删/enablePlan 硬联动）；
-    //   显式 protocolText 仍整段替换（压过档位与段配置）；protocolAppend 追加在末尾（构造期冻结）。
-    const baseProtocol = config.protocolText
-      ?? composeProtocolText({
-        level: config.protocolLevel ?? 'full',
-        sections: config.protocolSections,
-        enablePlan: this.#cfg.enablePlan,
-      });
-    const protocolText = baseProtocol
-      + (this.#cfg.codeEnabled ? `\n\n${config.codeProtocolText ?? DEFAULT_CODE_PROTOCOL_SECTION}` : '')
-      + (this.#cfg.callCommand ? `\n\n${config.callProtocolText ?? DEFAULT_CALL_PROTOCOL_SECTION}` : '')
-      + (config.protocolAppend ? `\n\n${config.protocolAppend}` : '');
+    // ---- 0.5.0 协议面按通道组装（§3.2 能力矩阵；稳定前缀构造期冻结）----
+    // standard：基座协议（full/lean/minimal）+ code 段（bridge 时）+ call 段 + append；
+    // code+preset：协议段 0 字符（§5.3 完全让位）；system 也换成代码通道措辞（不引导 tf-*）；
+    // code+bridge：只写 tf-code 用法（约 200 字符；不传 stateOwner/programFormat/sandboxPolicy）。
+    const texts = composeChannelTexts(requestedChannel, codeSource, this.#cfg, config);
     this.#renderer = renderer ?? new ContextRenderer({
-      system: config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
-      protocol: protocolText,
-      toolSchemas: config.nativeToolSchemas ?? (this.#cfg.nativeTools
-        ? '（本请求的原生工具 schema 见 tools 字段；未列出的宿主工具一律走 tf-call）'
-        : '（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）'),
-      invariants: config.invariants === false ? '' : config.invariants ?? DEFAULT_INVARIANTS,
+      system: texts.system,
+      protocol: texts.protocol,
+      toolSchemas: texts.toolSchemas,
+      invariants: texts.invariants,
     });
     this.#surface = new ToolSurfaceHolder(ports.toolsService, {
-      profile: this.#cfg.toolSurface,
+      policy: this.#cfg.surfacePolicy,
+      profile: config.toolSurface ?? 'standard',
       nativeTools: this.#cfg.nativeTools,
       callCommand: this.#cfg.callCommand,
+      // 代码通道让位：模型侧无 tf-call（§5.3——"本插件对 ctx.tools 的注册数为 0，
+      // 对 system prompt 的贡献为 0 字符"的可验证面之一）。
+      callReserved: codeChannel,
     });
-    this.#obs = obs ?? new ObservationLedger({ starvationThreshold: config.starvationThreshold });
+    this.#obs = obs ?? new ObservationLedger({
+      starvationThreshold: config.starvationThreshold,
+      spanLedger: this.#cfg.spanLedger,
+    });
     this.#warn = ports.onWarning ?? (() => {});
     this.#gate = ports.gate;
   }
@@ -1172,6 +1499,326 @@ export class SingleStreamDriver {
     this.#resumeHalt = null;
   }
 
+  // ------------------------------------------------ 0.5.0 会话级控制（§4.6 优先级：任务指令 > 会话默认 > 装配上限）
+
+  /**
+   * 会话级通道切换（§4.6）。排队到下一个用户任务边界生效（§3.3 约束 5：任务进行中提交
+   * 的切换请求排队，不中断当前任务）。切换 = 工具面 + 协议段变化 = 计划性换基（§8.3），
+   * 受 maxRebasesPerSession 限流（超限拒绝并要求确认——R1）。
+   * 代码通道需要装配层探测到来源（preset/bridge）；皆无时拒绝进入并如实返回原因。
+   */
+  setChannel(channel: ChannelId): { ok: boolean; code?: string; detail?: string } {
+    if (!isChannelId(channel)) return { ok: false, code: 'invalid-channel' };
+    if (channel === this.#channel && this.#pendingChannel === null) return { ok: true };
+    if (channel === 'code' && this.#availableCodeSource === null) {
+      const detail = '代码通道不可用：未检测到 PTC 预设或 ptcRuntime——拒绝进入，不静默降级（§5.2）';
+      this.#warn(`[stream-loop] setChannel('code') 被拒：${detail}`);
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'channel-refused', detail });
+      return { ok: false, code: 'code-unavailable', detail };
+    }
+    if (this.#rebasesSession >= this.#cfg.maxRebasesPerSession && channel !== this.#cfg.channel) {
+      const detail = `本会话换基已达上限 ${this.#cfg.maxRebasesPerSession}（maxRebasesPerSession）：通道切换需要确认（R1）`;
+      this.#warn(`[stream-loop] setChannel 排队被拒：${detail}`);
+      return { ok: false, code: 'rebase-limit', detail };
+    }
+    this.#pendingChannel = channel;
+    return { ok: true };
+  }
+
+  /** 会话级档位切换（只改数值，不换前缀不换基）。排队到任务边界生效。 */
+  setTier(tier: TierId): { ok: boolean; code?: string } {
+    if (!isTierId(tier)) return { ok: false, code: 'invalid-tier' };
+    this.#pendingTier = tier;
+    return { ok: true };
+  }
+
+  /**
+   * 会话级预算调整（§4.6 runtime.setBudget）。maxSteps/maxInputTokens 两旋钮；
+   * undefined = 恢复档位默认；0 = 无上限（仅观测）。装配级显式上限（config）优先——
+   * 这里只能收窄，不能突破装配上限（§4.6：装配级作为不可逾越上限）。
+   */
+  setBudget(budget: { maxSteps?: number; maxInputTokens?: number }): { ok: boolean; code?: string; detail?: string } {
+    if (budget.maxSteps !== undefined) {
+      const ceiling = this.#configRef.maxSteps ?? this.#configRef.maxRequests ?? this.#cfg.tierValues.maxSteps;
+      if (ceiling > 0 && budget.maxSteps > ceiling) {
+        return { ok: false, code: 'exceeds-assembly-limit', detail: `maxSteps ${budget.maxSteps} 超过装配上限 ${ceiling}` };
+      }
+      this.#sessionBudget.maxSteps = budget.maxSteps;
+    }
+    if (budget.maxInputTokens !== undefined) {
+      const ceiling = this.#configRef.maxInputTokens ?? this.#cfg.tierValues.maxInputTokens;
+      if (ceiling > 0 && budget.maxInputTokens > ceiling) {
+        return { ok: false, code: 'exceeds-assembly-limit', detail: `maxInputTokens ${budget.maxInputTokens} 超过装配上限 ${ceiling}` };
+      }
+      this.#sessionBudget.maxInputTokens = budget.maxInputTokens;
+    }
+    return { ok: true };
+  }
+
+  /** 会话级预算（setBudget 落点；与档位值合成生效值）。 */
+  #sessionBudget: { maxSteps?: number; maxInputTokens?: number } = {};
+
+  /** 旧模式别名（0.5.x 保留，0.6.0 移除）：legacy mode → (channel, tier) 两路排队。 */
+  setMode(mode: string): { ok: boolean; code?: string; detail?: string; aliased?: boolean } {
+    if (!isLegacyModeId(mode)) return { ok: false, code: 'invalid-mode' };
+    const mapped = resolveLegacyMode(mode);
+    this.#warn(`[stream-loop] setMode("${mode}") 是旧模式值，已按别名映射为 channel=${mapped.channel}/tier=${mapped.tier}（0.5.x 保留别名，0.6.0 移除）`);
+    const tierResult = this.setTier(mapped.tier);
+    const channelResult = this.setChannel(mapped.channel);
+    return {
+      ok: channelResult.ok && tierResult.ok,
+      ...(channelResult.ok ? {} : { code: channelResult.code, detail: channelResult.detail }),
+      aliased: true,
+    };
+  }
+
+  /**
+   * 任务边界切换应用（pushUserTask 调用；§3.3 约束 5）。
+   * 档位：只改数值（不换前缀不换基）。通道：计划性换基（rebuild 前缀四段 + 基线重置 +
+   * [tf-stream:context-rebased] + cache-reset 记账）。
+   */
+  #applyPendingSwitches(): void {
+    if (this.#pendingTier !== null) {
+      const tier = this.#pendingTier;
+      this.#pendingTier = null;
+      if (tier !== this.#cfg.tier) {
+        const tv = getTier(tier).values;
+        this.#cfg.tier = tier;
+        this.#cfg.tierValues = tv;
+        this.#cfg.compactAggressiveness = tv.compactAggressiveness;
+        this.#cfg.keepRecent = tv.keepRecent;
+        this.#cfg.maxSummaryChars = tv.maxSummaryChars;
+        this.#cfg.peekBudgetChars = tv.peekBudgetChars;
+        // N/C 两旋钮：会话级 setBudget 显式值优先；否则档位值；装配显式值为不可逾越上限
+        // （§4.6 优先级：任务指令 > 会话默认 > 装配上限）。
+        this.#cfg.maxSteps = this.#sessionBudget.maxSteps ?? tv.maxSteps;
+        this.#cfg.maxInputTokens = this.#sessionBudget.maxInputTokens ?? tv.maxInputTokens;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'tier-switch', detail: `档位 → ${tier}（只改数值，不换基）：maxSteps=${this.effectiveLimits().maxSteps} maxInputTokens=${this.effectiveLimits().maxInputTokens}` });
+        this.#ledgerWrite('plugin:tf-agent/surface', { event: 'tier-switch', tier, maxSteps: this.effectiveLimits().maxSteps, maxInputTokens: this.effectiveLimits().maxInputTokens });
+      }
+    }
+    if (this.#pendingChannel !== null) {
+      const next = this.#pendingChannel;
+      this.#pendingChannel = null;
+      if (next === this.#cfg.channel) return;
+      if (next === 'code' && this.#availableCodeSource === null) {
+        this.#warn('[stream-loop] 任务边界通道切换被拒：代码通道来源不可用（不静默降级）');
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'channel-refused', detail: '任务边界切换到 code 被拒：来源判定 none' });
+        return;
+      }
+      const previous = this.#cfg.channel;
+      this.#channel = next;
+      this.#cfg.channel = next;
+      this.#codeSource = next === 'code' ? this.#availableCodeSource! : undefined;
+      const texts = composeChannelTexts(next, this.#codeSource, this.#cfg, this.#configRef);
+      const contextTokens = estimatePromptTokens(this.#renderer.stableMessages());
+      // 计划性换基（§8.3）：重置 preflight 基线 + 前缀组件更新 + policyLog（planned-rebase）
+      this.#renderer.rebase({
+        reason: `通道切换 ${previous} → ${next}（任务边界）`,
+        system: texts.system,
+        protocol: texts.protocol,
+        toolSchemas: texts.toolSchemas,
+        invariants: texts.invariants,
+        contextTokens,
+      });
+      // 模型可见一行（§8.6 实现要求 1）：进追加区（durable，下一请求必然可见）
+      this.#renderer.appendHistory({ role: 'user', content: contextRebasedLine(`通道切换 → ${next === 'code' ? '代码' : '标准'}通道`) });
+      // wire 承诺基线作废（新时代第一条请求）
+      this.#lastRequest = null;
+      this.#resetSeq += 1;
+      this.#resetCause = 'channel-switch';
+      this.#rebasesSession += 1;
+      this.#rebasesTask += 1;
+      this.#noteCacheReset('channel-switch', contextTokens);
+      this.#surface.setCallReserved(next === 'code');
+      this.#record({
+        seq: ++DRIVER_SEQ, kind: 'fault', fault: 'channel-switch',
+        detail: `通道 ${previous} → ${next}（来源=${this.#codeSource ?? '-'}）：计划性换基 + cache-reset（contextTokens≈${contextTokens}）`,
+      });
+      this.#ledgerWrite('plugin:tf-agent/surface', { event: 'channel-switch', from: previous, to: next, source: this.#codeSource ?? null, rebase: 'planned', contextTokens });
+    }
+  }
+
+  /** 0.5.0（§8.6 实现要求 2）：cache-reset 事件——cause / contextTokens / estimatedColdCost。 */
+  #noteCacheReset(cause: string, contextTokens: number): void {
+    const record: DriverRecord = {
+      seq: ++DRIVER_SEQ,
+      kind: 'cache-reset',
+      cause,
+      contextTokens,
+      estimatedColdCost: contextTokens,
+    };
+    this.#record(record);
+    this.#ledgerWrite('plugin:tf-agent/cache', { cause, contextTokens, estimatedColdCost: contextTokens, at: new Date().toISOString() });
+  }
+
+  // ------------------------------------------ 0.5.0 P3：maxInputTokens 触顶压缩（§4.5.2/§7.6）
+
+  /**
+   * 单请求上下文上限触顶时的压缩（C 上限旋钮的落点）。在每次装配前判定：
+   *  - 估算 tokens ≥ triggerRatio × maxInputTokens → 压缩旧段（整块、保 keepRecent、
+   *    不越过当前任务块起点），产物 = 确定性摘要（kernel/compaction.ts，纯函数）+
+   *    原文句柄化（obs，可 tf-peek / request:N 取回）；
+   *  - 计划性换基（§8.3）：rebase() 重置基线 + [tf-stream:context-rebased] 注入 +
+   *    cache-reset 记账（cause='compaction'）；
+   *  - 受 maxRebasesPerTurn / maxRebasesPerSession 限流（超限跳过本次压缩，不静默——
+   *    记 fault）；surfaceCompaction=false（回退点）与 maxInputTokens=0 时不压缩。
+   */
+  #maybeCompactForInputBudget(turn: number): void {
+    if (!this.#cfg.surfaceCompaction) return;
+    const maxInput = this.effectiveLimits().maxInputTokens;
+    if (maxInput <= 0) return;
+    // 估算 = 稳定段 + 待转正尾块（上一请求发出、下一请求仍携带的部分）——触发判定看
+    // "下一请求的真实体积"，只看 stable 会漏掉刚注入的大块观测（真机形态）。
+    const stable = this.#renderer.stableMessages();
+    const pendingTail = this.#deliveredTail?.blocks ?? [];
+    const estimated = estimatePromptTokens([...stable, ...pendingTail]);
+    const decision = shouldCompact(estimated, {
+      maxInputTokens: maxInput,
+      maxSteps: this.effectiveLimits().maxSteps,
+      aggressiveness: this.#cfg.compactAggressiveness,
+    });
+    if (!decision.compact) return;
+    // 可压缩块 = 追加区头部、不越过当前任务块起点（#segmentKeepFrom）、
+    // 保底留 keepRecent 块不压（确定性摘要的"保留最近"纪律）。
+    const totalBlocks = this.#renderer.appendBlockCount;
+    const keepFloor = Math.max(this.#segmentKeepFrom, this.#cfg.keepRecent);
+    const droppable = totalBlocks - keepFloor;
+    if (droppable <= 0) {
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'compaction-skipped', detail: `${decision.reason}，但可压缩块为 0（keepFloor=${keepFloor} ≥ 总块数 ${totalBlocks}）——不压缩，照常发送` });
+      return;
+    }
+    if (this.#rebasesTurn >= this.#cfg.maxRebasesPerTurn || this.#rebasesSession >= this.#cfg.maxRebasesPerSession) {
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'compaction-skipped', detail: `换基限流（turn ${this.#rebasesTurn}/${this.#cfg.maxRebasesPerTurn}，session ${this.#rebasesSession}/${this.#cfg.maxRebasesPerSession}）——跳过压缩` });
+      return;
+    }
+    // 注：§8.4 换基成本判据（rebaseBudgetRatio）只约束 append-drift 受限换基
+    // （#assertWirePrefix）——计划性压缩不适用：压缩恰恰在**降低**后续每个请求的
+    // 未缓存输入，套"剩余预算 > rebase_cost × 1.5"会让压缩永远无法触发（触发点
+    // 0.7×maxInput > max/2.5）。计划性换基走 maxRebases 限流 + 记账（§8.3 判定表：
+    // planned-rebase = 正常执行并记账）。
+    // 折叠被丢弃块为确定性摘要（纯函数；原文块转 CompactItem——role 自块类型，内容原样；
+    // 0.5.0 §5.6(1)：携带已折叠效果的块（观测/回灌/digest 行含该效果句柄）→ 先行折叠为
+    // [applied pN] 一行（压缩是追加区唯一合法改写点，效果压缩在此生效）。
+    const dropCount = droppable;
+    const before = this.#renderer.stableMessages();
+    const droppedBlocks = before.slice(1).slice(0, dropCount); // [0] = system 前缀
+    const items = droppedBlocks.map((m) => {
+      const effectLine = this.#elidableEffectLineForBlock(m.content);
+      if (effectLine !== null) {
+        return { role: 'user' as const, content: effectLine };
+      }
+      return { role: m.role === 'assistant' ? 'assistant' as const : m.role === 'tool' ? 'tool' as const : 'user' as const, content: m.content };
+    });
+    const compacted = compactItems(items, {
+      keepRecent: 0, // 保留集合已由 keepFloor 表达
+      maxSummaryChars: this.#cfg.maxSummaryChars,
+      aggressiveness: this.#cfg.compactAggressiveness,
+    });
+    const { dropped } = this.#renderer.dropAppendHead(dropCount, {
+      reason: `maxInputTokens 触顶压缩（estimated≈${estimated} tokens ≥ ${decision.triggerRatio} × ${maxInput}；turn ${turn} 装配前）`,
+    });
+    // 原文句柄化（§7.6：原文去向 = OutputStore + handle）+ request:N 别名登记
+    for (const [i, text] of dropped.entries()) {
+      const observation = this.#obs.observe({
+        tool: 'tf-read',
+        ok: true,
+        key: `compact:turn${turn}:${i}`,
+        content: text,
+        callId: `cmp-t${turn}-${i}`,
+      });
+      if (observation.handle !== null) this.#obs.registerRequestHandle(turn, observation.handle);
+      this.#record({
+        seq: ++DRIVER_SEQ, kind: 'observation',
+        handle: observation.handle, key: `compact:turn${turn}:${i}`,
+        infoGain: 'low', reason: 'compaction-handleized',
+      });
+    }
+    // 摘要落追加区（压缩产物；确定性，同输入同字节）
+    if (compacted.summaryText !== '') {
+      this.#renderer.appendHistory({ role: 'user', content: compacted.summaryText });
+      this.#summaryBlocks += 1;
+    }
+    // 计划性换基（§8.3）：基线重置 + 模型可见一行 + 记账
+    this.#renderer.rebase({ reason: '上下文压缩（maxInputTokens 触顶）', contextTokens: estimated });
+    this.#renderer.appendHistory({ role: 'user', content: contextRebasedLine('压缩') });
+    this.#lastRequest = null;
+    this.#resetSeq += 1;
+    this.#resetCause = 'compaction';
+    this.#rebasesTurn += 1;
+    this.#rebasesSession += 1;
+    this.#rebasesTask += 1;
+    // 段边界游标同步前移（被丢块已离开追加区）
+    this.#segmentKeepFrom = Math.max(0, this.#segmentKeepFrom - dropCount);
+    this.#noteCacheReset('compaction', estimated);
+    this.#record({
+      seq: ++DRIVER_SEQ, kind: 'fault', fault: 'compaction',
+      detail: `${decision.reason} → 丢弃 ${dropped.length} 块（原文句柄化 obs:read:cmp-t${turn}-*，可 tf-peek/request:${turn} 取回）；摘要 ${compacted.summaryChars} 字符；换基记账 planned-rebase`,
+    });
+    this.#ledgerWrite('plugin:tf-agent/cache', { cause: 'compaction', turn, droppedBlocks: dropped.length, summaryChars: compacted.summaryChars, estimated, triggerRatio: decision.triggerRatio });
+  }
+
+  /** 生效的双旋钮值（任务指令 > 会话默认 > 档位值；§4.6）。 */
+  effectiveLimits(): { maxSteps: number; maxInputTokens: number } {
+    return {
+      maxSteps: this.#taskBudget?.maxSteps ?? this.#sessionBudget.maxSteps ?? this.#cfg.maxSteps,
+      maxInputTokens: this.#taskBudget?.maxInputTokens ?? this.#sessionBudget.maxInputTokens ?? this.#cfg.maxInputTokens,
+    };
+  }
+
+  /** S5 快照贡献端口（apply() 注入；代码通道的状态摘要注入通道，U10 探针面）。 */
+  setRuntimeContextPort(port: (text: string) => void): void {
+    this.#runtimeContextPort = port;
+  }
+
+  /** 当前语义状态摘要行（控制页 / S5 贡献共用同一投影；无计划时 null）。 */
+  stateDigestLine(): string | null {
+    if (!this.#cfg.stateDigest) return null;
+    if (this.#cfg.channel === 'standard' && !this.#cfg.enablePlan) return null;
+    const open = this.#plan === null ? [] : [...this.#plan.items.entries()].filter(([, item]) => item.status === 'open');
+    const failed = [...this.#commands.values()].filter((r) => r.status === 'failed').length;
+    return renderStateDigest({
+      goals: this.#plan?.items.size,
+      verified: this.#plan === null ? undefined : this.#plan.items.size - open.length,
+      open: open.map(([id, item]) => ({ id, text: item.text })),
+      failed,
+    });
+  }
+
+  /** 控制栏运行状态（§3.3 底部状态行数据源；ControlStatsFace）。 */
+  runtimeStatus(): {
+    channel: ChannelId; tier: TierId; codeSource: 'preset' | 'bridge' | 'none' | undefined;
+    channelFallback: string | undefined; requestedChannel: ChannelId;
+    requests: number; rebases: number; redundantPeeks: { hits: number; total: number };
+    summaries: number; executor: string; surface: string;
+    effective: { maxSteps: number; maxInputTokens: number };
+  } {
+    const peek = this.#obs.peekMetrics();
+    const executor = this.#cfg.channel === 'code'
+      ? (this.#codeSource === 'preset' ? 'ptc-preset' : this.#codeSource === 'bridge' ? 'ptc-bridge' : 'none')
+      : 'native';
+    const surface = this.#cfg.channel === 'code'
+      ? (this.#codeSource === 'preset' ? 'preset 原样（不注册不裁剪）' : '仅 tf-code')
+      : this.#cfg.surfacePolicy === 'reserved-only' ? '透传（tf-* 保留）' : 'profile（回退演练）';
+    return {
+      channel: this.#cfg.channel,
+      tier: this.#cfg.tier,
+      codeSource: this.#cfg.channel === 'code' ? this.#codeSource : undefined,
+      channelFallback: this.#channelFallback,
+      requestedChannel: this.#requestedChannel,
+      requests: this.#taskRequestCount,
+      rebases: this.#rebasesTask,
+      redundantPeeks: {
+        hits: Math.max(0, peek.redundantHits - this.#peekMetricsBase.hits),
+        total: Math.max(0, peek.peekRequests - this.#peekMetricsBase.total),
+      },
+      summaries: this.#summaryBlocks,
+      executor,
+      surface,
+      effective: this.effectiveLimits(),
+    };
+  }
+
   /** F7：按句柄取回观测原文（段边界丢弃的旧段原文、命令产出等）；未知句柄返回 null。
    *  只读通道，不进上下文——供排障/回取与评测断言使用。 */
   peekHandle(handle: string, fromLine = 1, toLine = Number.MAX_SAFE_INTEGER): string | null {
@@ -1203,6 +1850,39 @@ export class SingleStreamDriver {
     }
   }
 
+  /**
+   * 0.5.0（§5.6(1)）：效果落账。动作生效即记账（目标、版本、验证状态、句柄）；
+   * 验证状态：声明了 accepts → 全部验收项有回执才 'pass'（否则 'unverified'，不折叠）；
+   * 未声明 accepts 的成功写/执行 → 'pass'（回执即效果验证）。效果压缩在
+   * #commitStepDigest 折叠历史行为一行（[applied pN] …），原文按句柄保留。
+   */
+  #recordEffect(cmd: TfCommand, rec: CommandRecord, contentText: string): void {
+    if (this.#cfg.effectElision === false) return;
+    const accepts = cmd.attrs['accepts'];
+    let verify: 'pass' | 'fail' | 'unverified' = 'pass';
+    let acceptId: string | undefined;
+    if (accepts !== undefined && this.#plan !== null && this.#cfg.enablePlan) {
+      const ids = accepts.split(',').map((s) => s.trim()).filter((s) => s !== '');
+      const allVerified = ids.length > 0 && ids.every((id) => this.#plan!.items.get(id)?.status === 'verified');
+      verify = allVerified ? 'pass' : 'unverified';
+      acceptId = ids[0];
+    }
+    const versionMatch = /@v(\d+)$/.exec(rec.handle ?? '');
+    this.#effectCounter += 1;
+    this.#effects.push({
+      effectId: `p${this.#effectCounter}`,
+      cmdId: cmd.id,
+      action: cmd.name.replace(/^tf-/, ''),
+      target: cmd.attrs['path'] ?? cmd.attrs['cmd'] ?? cmd.attrs['pattern'] ?? cmd.attrs['description'] ?? cmd.id,
+      ...(versionMatch !== null ? { version: Number(versionMatch[1]) } : {}),
+      verify,
+      ...(acceptId !== undefined ? { acceptId } : {}),
+      ...(rec.handle !== undefined ? { handle: rec.handle } : {}),
+      digestIndex: this.#cmdOrder,
+    });
+    this.#ledgerWrite('plugin:tf-agent/plan', { kind: 'effect', effectId: `p${this.#effectCounter}`, cmdId: cmd.id, action: cmd.name, verify, handle: rec.handle ?? null, chars: contentText.length });
+  }
+
   /** Agent 作用域的工具执行器重绑（桌面端 preset 层）：
    *  web/desktop 组合把 tool-fs/tool-pwsh 从宿主平面挪进 agent preset 层（standard.patch.yml），
    *  entry 根 ctx 的 tools 服务解析不到 write/edit/bash → "unknown tool"。
@@ -1222,6 +1902,19 @@ export class SingleStreamDriver {
       usage: { ...this.#usage },
       requestCount: this.#requestCount,
       stableHashes: [...this.#stableHashes],
+      channel: () => ({
+        channel: this.#cfg.channel,
+        requestedChannel: this.#requestedChannel,
+        tier: this.#cfg.tier,
+        codeSource: this.#cfg.channel === 'code' ? this.#codeSource : undefined,
+        channelFallback: this.#channelFallback,
+      }),
+      peekMetrics: () => obs.peekMetrics(),
+      rebaseCounts: () => ({
+        planned: this.#records.filter((r) => r.kind === 'cache-reset' && (r.cause === 'compaction' || r.cause === 'channel-switch')).length,
+        appendDrift: this.#records.filter((r) => r.kind === 'fault' && r.fault === 'prefix-reset').length,
+        session: this.#rebasesSession,
+      }),
     };
   }
 
@@ -1250,28 +1943,99 @@ export class SingleStreamDriver {
     }
   }
 
-  // ------------------------------------------------------------------ O5 阶梯
+  // ------------------------------------------------------------------ O5 阶梯（0.5.0：任务级基数）
 
-  /** 任务级 token 预算阶梯（README O5：<70% normal；70-90% high-only；>90% final-only）。 */
+  /**
+   * 任务级 token 预算阶梯（README O5：<70% normal；70-90% high-only；>90% final-only）。
+   *
+   * 0.5.0 D1 修复：基数改为**任务起点**快照（pushUserTask 记录 #usageBase /
+   * #injectedCharsBase）——不再用会话累计，同会话后续任务不再开局即处 final-only。
+   * 0.5.0 D7 修复：严格口径 = input + output（cacheRead 不按 1:1 计入控制——缓存命中
+   * 越好越早降级的方向性错误就此消除；cacheRead 只进观测报表，tokens_total_with_cache 口径）。
+   * budgetTokens 未显式设置时阶梯关闭（恒 normal；预算治理走 maxSteps/maxInputTokens
+   * 双旋钮，§4.5.2），observeBudgetTokens 只做观测告警。
+   */
   budgetLevel(): BudgetLevel {
     const budget = this.#cfg.budgetTokens;
     if (budget === undefined || budget <= 0) return 'normal';
-    // v0.4.2：计费输入 = 未命中输入 + 缓存读 + 缓存写（口径对齐 dsh-llm Usage；三者互斥相加）。
-    // 适配器不上报缓存字段时 cacheRead/cacheWrite 为 0，行为与旧版逐字节一致。
-    const billedInput = this.#usage.inputTokens + this.#usage.cacheReadTokens + this.#usage.cacheWriteTokens;
-    const spent = billedInput + this.#usage.outputTokens + Math.ceil(this.#injectedChars / 4);
+    const input = Math.max(0, this.#usage.inputTokens - this.#usageBase.inputTokens);
+    const output = Math.max(0, this.#usage.outputTokens - this.#usageBase.outputTokens);
+    const injected = Math.max(0, this.#injectedChars - this.#injectedCharsBase);
+    const spent = input + output + Math.ceil(injected / 4);
     if (spent >= budget * 0.9) return 'final-only';
     if (spent >= budget * 0.7) return 'high-only';
     return 'normal';
   }
 
+  /** 任务级花费（严格口径：input + output + 注入折算；观测告警与报表用，不含 cacheRead）。 */
+  taskSpentTokens(): number {
+    const input = Math.max(0, this.#usage.inputTokens - this.#usageBase.inputTokens);
+    const output = Math.max(0, this.#usage.outputTokens - this.#usageBase.outputTokens);
+    const injected = Math.max(0, this.#injectedChars - this.#injectedCharsBase);
+    return input + output + Math.ceil(injected / 4);
+  }
+
+  /** 0.5.0 观测预算判定（budgetTokens 降为观测项——D7；超阈值 warn + 台账，不改行为）。 */
+  #observeBudgetOnce(turn: number): void {
+    const result = observeBudget(this.taskSpentTokens(), this.#cfg.observeBudgetTokens);
+    if (result === null || !result.warn || this.#budgetWarned) return;
+    this.#budgetWarned = true;
+    const detail = `观测预算：本任务花费 ${this.taskSpentTokens()} tokens ≥ 90% × ${this.#cfg.observeBudgetTokens}`
+      + `（观测告警，不改变执行行为；cacheRead 未按 1:1 计入——D7）`;
+    this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'budget-observe', detail });
+    this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'budget-observe', spent: this.taskSpentTokens(), threshold: this.#cfg.observeBudgetTokens, ratio: result.ratio, turn });
+    this.#warn(`[stream-loop] ${detail}`);
+  }
+
   // ------------------------------------------------------------------ 任务入口
 
-  /** 追加一条用户任务（Agent.followup 的驱动器侧入口：只进装配历史，不发请求）。
-   *  F7：记录当前任务块的起始下标——段边界只丢弃它之前的旧段（整块、完整回合边界）。 */
-  pushUserTask(text: string): void {
+  /**
+   * 追加一条用户任务（Agent.followup 的驱动器侧入口：只进装配历史，不发请求）。
+   *
+   * 0.5.0：
+   *  - D1 修复：记录任务起点计量快照（#usageBase / #injectedCharsBase）——budgetLevel
+   *    从此用任务级差值；
+   *  - §4.6 任务级预算指令：消息首行 `[tf-budget: 8steps/20k]` 解析后从正文剥离；
+   *    结构化来源 message.source.tfBudget 同步支持（followup 透传 message，本方法读取）；
+   *  - §3.3 约束 5：执行通道/档位切换在任务边界生效——pending 切换在此刻应用
+   *    （通道切换 = 计划性换基；档位切换只改数值不换基）；
+   *  - F7：记录当前任务块的起始下标——段边界只丢弃它之前的旧段。
+   */
+  pushUserTask(text: string, message?: unknown): void {
+    // —— 任务边界切换（先于任务块落位）——
+    this.#applyPendingSwitches();
+    // —— 任务级预算指令（§4.6：文本指令 + 结构化 source.tfBudget；文本指令优先剥除）——
+    // 装配级显式上限不可逾越（§4.6：任务指令 > 会话默认 > 装配上限——"上限"是硬顶，
+    // 任务指令只能收窄不能突破）。
+    const parsed = parseTaskBudgetDirective(text);
+    const structured = readStructuredTaskBudget(message);
+    const taskBudget = {
+      ...(parsed.budget ?? {}),
+      ...(structured ?? {}),
+    };
+    const assemblySteps = this.#configRef.maxSteps ?? this.#configRef.maxRequests ?? 0;
+    if (taskBudget.maxSteps !== undefined && assemblySteps > 0 && taskBudget.maxSteps > assemblySteps) {
+      taskBudget.maxSteps = assemblySteps;
+    }
+    const assemblyInput = this.#configRef.maxInputTokens ?? 0;
+    if (taskBudget.maxInputTokens !== undefined && assemblyInput > 0 && taskBudget.maxInputTokens > assemblyInput) {
+      taskBudget.maxInputTokens = assemblyInput;
+    }
+    this.#taskBudget = taskBudget;
+    // —— D1：任务起点计量快照 ——
+    this.#usageBase = { ...this.#usage };
+    this.#injectedCharsBase = this.#injectedChars;
+    this.#taskRequestCount = 0;
+    this.#rebasesTask = 0;
+    this.#budgetWarned = false;
+    this.#taskBudgetBlocked = null;
+    this.#effects.length = 0;
+    this.#effectCounter = 0;
+    this.#peekBudgetUsed = 0;
+    const peekMetricsBase = this.#obs.peekMetrics();
+    this.#peekMetricsBase = { hits: peekMetricsBase.redundantHits, total: peekMetricsBase.peekRequests };
     this.#segmentKeepFrom = this.#renderer.appendBlockCount;
-    this.#renderer.appendHistory({ role: 'user', content: text });
+    this.#renderer.appendHistory({ role: 'user', content: parsed.text });
   }
 
   /** 运行中回合的 steer 入口（修复限制 2）：下一请求装配时进追加区（对齐内建
@@ -1344,6 +2108,38 @@ export class SingleStreamDriver {
     const turn = ++this.#turnCounter;
     const controller = new AbortController();
     this.#turnController = controller;
+    this.#rebasesTurn = 0;
+    this.#peekBudgetUsed = 0;
+    // ---- 0.5.0（§4.5.3 / R11）：任务预算下限保护——低于 3×前缀估算时拒绝启动，
+    // 返回"至少需要 N"的明确提示，避免必然失败的任务烧掉整个前缀（零请求）。----
+    if (this.#taskBudgetBlocked === null) {
+      const prefixEstimate = estimatePromptTokens(this.#renderer.stableMessages());
+      const floor = checkTaskBudgetFloor(prefixEstimate, this.effectiveLimits().maxInputTokens);
+      if (!floor.ok) {
+        this.#taskBudgetBlocked = floor.reason;
+        const reason: TurnEndReason = { kind: 'blocked', detail: floor.reason };
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'task-budget-floor', detail: floor.reason });
+        this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'task-budget-floor', minimum: floor.minimumInputTokens, prefixEstimate, turn });
+        this.#ports.events?.turnStart(turn);
+        try {
+          this.#ports.events?.turnEnd(turn, reason);
+        } catch (eventError) {
+          this.#warn('turn/end 事件写入失败', eventError);
+        }
+        return reason;
+      }
+    } else {
+      // 同任务的后续回合沿用首回合的下限结论（任务级一次性判定；恢复出口 = 新任务）。
+      const reason: TurnEndReason = { kind: 'blocked', detail: this.#taskBudgetBlocked };
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'task-budget-floor', detail: `${this.#taskBudgetBlocked}（沿用本任务首回合判定）` });
+      this.#ports.events?.turnStart(turn);
+      try {
+        this.#ports.events?.turnEnd(turn, reason);
+      } catch (eventError) {
+        this.#warn('turn/end 事件写入失败', eventError);
+      }
+      return reason;
+    }
     // F7 长会话段边界：追加区超过阈值时，在新回合开始处整块丢弃旧段（保留当前任务块起
     // 的全部块）。被丢弃原文句柄化登记（可 tf-peek 回取），显式记录缓存重置点。
     if (this.#cfg.segmentMaxChars > 0 && this.#segmentKeepFrom > 0 && this.#renderer.appendChars > this.#cfg.segmentMaxChars) {
@@ -1448,6 +2244,9 @@ export class SingleStreamDriver {
       // 各位，下一请求的公共前缀即可覆盖上一请求的全部 prompt（无 transient 尾时缓存读零损失；
       // 有 transient（error/nudge）时该块在下一请求被丢弃，前缀在该 index 断裂——损失
       // bounded 一块，0.5.0 起按 transient-drop 计量）。
+      // ---- 0.5.0（§4.5.2）：maxInputTokens 触顶压缩——在装配前判定，触顶即压缩旧段
+      //（计划性换基：摘要落追加区 + 原文句柄化 + 基线重置 + 记账）。
+      this.#maybeCompactForInputBudget(turn);
       // ---- steer 注入（修复限制 2）：运行中到达的 steer 在下一请求（内建的"下一步"）生效
       // ——进追加区（只追加，前缀单调不破）；流内不打断：当前流早已跑完才会走到这里。
       if (this.#pendingSteers.length > 0) {
@@ -1574,6 +2373,8 @@ export class SingleStreamDriver {
         requestRecord.cacheWrite = u.cacheWriteTokens;
         requestRecord.output = u.outputTokens;
       }
+      // 0.5.0（D7）：观测预算——只告警不改行为（严格口径，cacheRead 不按 1:1 计入）。
+      this.#observeBudgetOnce(turn);
 
       // 不可重试的流错误（凭据/配置层）：fail-fast 终止回合，不进重入循环
       if (streamOutcome.finish.kind === 'error' && NON_RETRYABLE_STREAM_CODES.has(finishCode(streamOutcome.finish))) {
@@ -1702,10 +2503,32 @@ export class SingleStreamDriver {
       }
 
       const finalSeen = lastFinal !== undefined && prematureFinal === undefined && rejectedFinal === undefined;
+      // 0.5.0：标准通道才有 tf-final 收束概念；代码通道（§3.2：验收闸 否）流正常终止
+      // 且无重入事由即收束，交付物 = 最后一条 assistant 消息。
+      const expectsFinal = this.#cfg.channel === 'standard';
       // steer 在本流期间到达 → 不能带着未消费的 steer 收敛（对齐内建：插话必须被下一步看到）
       const pendingSteerCount = this.#pendingSteers.length;
       const needsReentry = issues.length > 0 || injections.blocks.length > 0 || prematureFinal !== undefined
         || pendingSteerCount > 0 || (promotedBlock !== null && !finalSeen);
+
+      if (!expectsFinal && !needsReentry && streamOutcome.finish.kind !== 'error' && streamOutcome.finish.kind !== 'aborted') {
+        // 代码通道收束：无 tf-final、无验收闸——流正常终止且无事由即完成（§3.2 能力矩阵）
+        reason = { kind: 'completed' };
+        const prose = normalizeProse(this.#streamProse);
+        if (prose !== '') {
+          try {
+            this.#ports.events?.finalAnswer?.(turn, step, prose);
+          } catch (error) {
+            this.#warn('final 答案消息写入失败', error);
+          }
+        }
+        try {
+          this.#ports.events?.stepEnd(turn, step);
+        } catch (error) {
+          this.#warn('step/end 事件写入失败', error);
+        }
+        break;
+      }
 
       if (prematureFinal !== undefined && lastFinal !== undefined) {
         // v0.3.2：计划门槛拒绝时附上计划快照——模型看不到计划内容就无法验收
@@ -1766,7 +2589,14 @@ export class SingleStreamDriver {
       //   ③ 收束期 #closeOutActive——撞墙但**有事实可交付**时不立刻砍：注入一条"停止探索、
       //      立即 tf-final"的收束指令（回合内最多 closeOutRequests 次），用尽仍无 final 则
       //      写一条明确标注未完成的兜底交付（#buildFallbackFinal，台账事实，不伪造结论）。
-      const hardCap = step >= this.#cfg.maxRequests;
+      // 0.5.0（§4.5.2）：N 上限 = maxSteps（任务指令 > 会话默认 > 档位值；0 = 无上限）。
+      // 触顶行为 = 停止探索、注入收束指令要求 tf-final（收束期）——不是直接硬杀。
+      const stepLimit = shouldStopForSteps(step, {
+        maxInputTokens: this.effectiveLimits().maxInputTokens,
+        maxSteps: this.effectiveLimits().maxSteps,
+        aggressiveness: this.#cfg.compactAggressiveness,
+      });
+      const hardCap = stepLimit.atLimit;
       const stallExhausted = this.#stallReentries >= this.#cfg.stallReentries;
       const atWall = finalOnlyGate || nudgeExhausted || hardCap || stallExhausted;
       let wallDetail = '';
@@ -1779,16 +2609,17 @@ export class SingleStreamDriver {
         wallDetail = finalOnlyGate
           ? '预算进入 final-only 档'
           : hardCap
-            ? `本回合请求数达到硬上限 ${this.#cfg.maxRequests}`
+            ? stepLimit.reason
             : stallExhausted
               ? `连续 ${this.#cfg.stallReentries} 次重入无新增产出`
               : '流终止且无 tf-final、无重入事由（提示一次后仍未收敛）';
         // 收束期只对"有事实可交付"的回合开放：零产出回合没有可交付内容，多烧一次请求
-        // 只会再得到一段 prose（真机 nudge 空转的形态）。final-only 档与硬上限一律不再
-        // 开放（预算/次数已尽，收束指令救不回来）。
+        // 只会再得到一段 prose（真机 nudge 空转的形态）。final-only 档不开放（该档自身
+        // 已带 degraded 收束注入）。0.5.0（§4.5.2）：maxSteps 触顶同样先给收束期——
+        // "触顶行为 = 停止探索，注入收束指令要求 tf-final"，closeOutRequests 限次数。
         const deliverable = this.#productiveOkCount() > 0;
         const closeOutLeft = this.#cfg.closeOutRequests - this.#closeOutRequests;
-        if (deliverable && !finalSeen && closeOutLeft > 0 && level !== 'final-only' && !hardCap) {
+        if (deliverable && !finalSeen && closeOutLeft > 0 && level !== 'final-only') {
           this.#closeOutRequests += 1;
           this.#closeOutActive = true;
           closeOut = true;
@@ -2025,6 +2856,7 @@ export class SingleStreamDriver {
         sessionId: this.#sessionId,
       });
       this.#requestCount += 1;
+      this.#taskRequestCount += 1;
       debugTrace('stream.call', {
         turn,
         step,
@@ -2242,6 +3074,18 @@ export class SingleStreamDriver {
   }
 
   #onCommand(cmd: TfCommand, turn: number, step: number): void {
+    // 0.5.0（§5.2/§5.3 让位）：代码通道下本插件不执行 tf-* 命令——
+    //  · preset 来源：完全不接管命令面（§5.3"输出解析 = 否"），任何 tf-* 标记记账丢弃；
+    //  · bridge 来源：只放行 tf-code（受限窄桥，0.4.x 行为），其余 tf-* 记账丢弃。
+    // 让位可验证：代码通道下本插件对命令的派发数为 0（preset）/ 仅 tf-code（bridge）。
+    if (this.#cfg.channel === 'code') {
+      const allowed = this.#codeSource === 'bridge' && cmd.name === 'tf-code';
+      if (!allowed) {
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'rejected', detail: 'code-channel-yield: 代码通道下本插件不执行 tf-* 命令（让位 PTC，§5.3）' });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'code-channel-yield', source: this.#codeSource ?? 'preset' });
+        return;
+      }
+    }
     // v0.3.1：回合级命令序（跨请求单调）。final 之后又发过非 final 命令 → 那条 final 过期
     //（模型写完 final 又继续干活；旧答案不能当成交付内容）。
     const order = ++this.#cmdOrder;
@@ -2353,16 +3197,33 @@ export class SingleStreamDriver {
     this.#pendingReplays.push({ cmdId: cmd.id, name: cmd.name, handle: prev.handle });
   }
 
-  /** 把待回灌的重复命令物化成注入块（仅在轮到它们进入下一次请求时调用）。 */
+  /** 把待回灌的重复命令物化成注入块（仅在轮到它们进入下一次请求时调用）。
+   *  0.5.0：回灌侧上限 readFeedbackLimit 缺省 0 = 不截断（读取侧 maxReadChars 已控住，§7.5）；
+   *  效果压缩（§5.6(1)）：被回灌命令的效果已落账、验证通过且不在最近 keepRecent 个效果内
+   *  → 折叠为 [applied pN] 一行（丢弃原始输出正文，原文按句柄 tf-peek 可取回）。 */
   #materializeReplays(): RenderMessage[] {
     if (this.#pendingReplays.length === 0) return [];
-    const limit = this.#cfg.readFeedbackLimit ?? DEFAULT_READ_FEEDBACK_LIMIT;
+    const limit = this.#cfg.readFeedbackLimit;
     const out: RenderMessage[] = [];
     for (const item of this.#pendingReplays) {
+      // 效果折叠优先：旧效果不再重发原始输出（重复付费），一行效果 + 句柄取回路径
+      const effectLine = this.#elidableEffectLineFor(item.cmdId);
+      if (effectLine !== null) {
+        const folded = `[tf-stream:replay id=${item.cmdId} name=${item.name} handle=${item.handle}]\n${effectLine}\n（原始输出已按效果压缩折叠；原文用 tf-peek handle="${item.handle}" from_line=.. to_line=.. 取回）`;
+        this.#replays += 1;
+        this.#noteFeedback('handle', folded);
+        out.push({ role: 'user', content: folded });
+        this.#record({
+          seq: ++DRIVER_SEQ, kind: 'observation',
+          handle: item.handle, key: `replay:${item.cmdId}`, infoGain: 'high', reason: 'duplicate-replay-folded',
+        });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: item.cmdId, name: item.name, status: 'duplicate-replay-folded', handle: item.handle });
+        continue;
+      }
       const content = this.#obs.peek(item.handle, 1, Number.MAX_SAFE_INTEGER);
       if (content === null || content === '') continue;
       this.#replays += 1;
-      const body = content.length <= limit
+      const body = limit <= 0 || content.length <= limit
         ? content
         : `${content.slice(0, limit)}\n……（原结果超长，已截断 ${content.length - limit} 字符；用 tf-peek handle="${item.handle}" from_line=.. to_line=.. 精确取回）`;
       const replayContent = `[tf-stream:replay id=${item.cmdId} name=${item.name} handle=${item.handle}]\n`
@@ -2410,12 +3271,17 @@ export class SingleStreamDriver {
     for (const id of digest.cmdIds) {
       const rec = this.#commands.get(id);
       if (rec === undefined) continue;
+      // 0.5.0（§5.6(1)）：效果落账后，digest 行携带 effect id（效果压缩的折叠发生在两个
+      // 合法改写点：回灌（#materializeReplays）与压缩（#maybeCompactForInputBudget）——
+      // 追加区本身只增不改，行内只标注效果地址）。
+      const effect = this.#effects.find((e) => e.cmdId === id);
       const target = rec.cmd.attrs['path'] ?? rec.cmd.attrs['cmd'] ?? rec.cmd.attrs['pattern']
         ?? rec.cmd.attrs['handle'] ?? rec.cmd.attrs['summary'] ?? '';
       const detail = rec.detail !== undefined && rec.detail !== '' ? ` · ${capText(rec.detail, 120)}` : '';
       lines.push(
         `- ${id} ${rec.cmd.name}${target !== '' ? ` ${capText(target, 120)}` : ''} → ${rec.status}`
-        + `${rec.handle !== undefined ? ` handle=${rec.handle}` : ''}${detail}`,
+        + `${rec.handle !== undefined ? ` handle=${rec.handle}` : ''}${detail}`
+        + `${effect !== undefined ? ` · effect=${effect.effectId}` : ''}`,
       );
     }
     for (const native of digest.natives) {
@@ -2457,13 +3323,17 @@ export class SingleStreamDriver {
   // ------------------------------------------------------- v0.4.3 P0-6 wire 断言
 
   /**
-   * v0.4.3（P0-6②③④）：wire 边界承诺前缀断言 + 三类成因处置。
-   * 返回 'ok'（放行——含预算内的 append-drift 一次放行）或 'fail'（fail-closed 收场，
-   * detail 供 blocked 文案与兜底交付）。比较与分类在内核 assertRequestPrefix：
-   *   - stable-drift：0 重发——稳定段被改写意味着装配被破坏，重发只会烧缓存不修根因；
-   *   - append-drift：预算内放行一次同一份 next（每回合 1 次、每会话 3 次；第 4 次降级
-   *     本路径）——转正纪律被破坏时发送仍安全（新旧内容都是真实历史），基线随本请求推进；
-   *   - shrink：0 重发——承诺前缀收缩 = 历史被销毁；段边界必须走 dropAppendHead 通道。
+   * 0.5.0（§8.3 判定表 + §8.5 配置）：前缀非单调按三类分别处置——不采用"报错/重发"二分。
+   * 返回 'ok'（放行——含预算内的受限换基）或 'fail'（fail-closed 收场，detail 供 blocked
+   * 文案与兜底交付）。比较与分类在内核 assertRequestPrefix：
+   *   - stable-drift：**始终 fail**（不受 prefixPolicy 影响，§8.5）——稳定段被改写意味着
+   *     装配被破坏，重发只会烧缓存不修根因；
+   *   - shrink（越界）：fail——承诺前缀收缩 = 历史被销毁；段边界必须走 dropAppendHead
+   *     / rebase 计划性通道；
+   *   - append-drift（可归因）：受限换基——prefixPolicy='fail' 时绝不换基（§12.4 回退）；
+     'auto'（默认）每回合 1 次/每会话 3 次内放行同一份 next（0 额外请求）；'rebase' 走
+     换基成本判据（§8.4：剩余预算 > rebase_cost × rebaseBudgetRatio）。
+   *   - planned-rebase 永不进入本断言——压缩/通道切换在发送前已重置基线（#lastRequest=null）。
    */
   #assertWirePrefix(next: readonly RenderMessage[], turn: number, step: number): { verdict: 'ok' } | { verdict: 'fail'; detail: string } {
     const baseline = this.#lastRequest;
@@ -2475,27 +3345,46 @@ export class SingleStreamDriver {
       if (!(error instanceof PrefixBrokenError)) throw error;
       const cause = error.prefixCause;
       const diag = `index=${error.index} stablePrefixLen=${error.stablePrefixLen} cause=${cause} 期望="${capText(error.expected, 80)}" 实际="${capText(error.actual, 80)}"`;
-      if (cause === 'append-drift' && this.#prefixResendsTurn < 1 && this.#prefixResendsSession < 3) {
-        // P0-6④（v0.4.3.1 用词，核查 §4.2）：断言在发送前——"放行"= 记账后照常发送同一份
-        // next，0 额外请求；显式缓存重置点（下一请求基线 = 本次发送内容）。
-        this.#prefixResendsTurn += 1;
-        this.#prefixResendsSession += 1;
-        this.#resetSeq += 1;
-        this.#resetCause = 'prefix-reset';
-        const detail = `append-drift 预算内放行一次（会话第 ${this.#prefixResendsSession} 次/上限 3，回合第 ${this.#prefixResendsTurn} 次/上限 1）：${diag}`;
-        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'prefix-reset', detail });
-        this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'prefix-reset', cause, index: error.index, stablePrefixLen: error.stablePrefixLen, turn });
-        this.#warn(`P0-6 append-drift：承诺前缀与下一请求头部不一致——放行一次同一份 next，基线随本请求推进（${diag}）`, error);
-        return { verdict: 'ok' };
+      if (cause === 'append-drift' && this.#cfg.prefixPolicy !== 'fail') {
+        const contextTokens = estimatePromptTokens(next);
+        const budgetOk = this.#rebaseAffordable(contextTokens);
+        const limitsOk = this.#prefixResendsTurn < 1 && this.#prefixResendsSession < 3;
+        if (limitsOk && (this.#cfg.prefixPolicy === 'auto' || budgetOk)) {
+          // P0-6④（v0.4.3.1 用词，核查 §4.2）：断言在发送前——"放行"= 记账后照常发送同一份
+          // next，0 额外请求；显式缓存重置点（下一请求基线 = 本次发送内容）。
+          this.#prefixResendsTurn += 1;
+          this.#prefixResendsSession += 1;
+          this.#resetSeq += 1;
+          this.#resetCause = 'prefix-reset';
+          const detail = `append-drift 受限换基（${this.#cfg.prefixPolicy}；会话第 ${this.#prefixResendsSession} 次/上限 3，回合第 ${this.#prefixResendsTurn} 次/上限 1${this.#cfg.prefixPolicy === 'rebase' ? (budgetOk ? '' : '；预算判据不满足被拒') : ''}）：${diag}`;
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'prefix-reset', detail });
+          this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'prefix-reset', cause, index: error.index, stablePrefixLen: error.stablePrefixLen, turn });
+          this.#warn(`P0-6 append-drift：承诺前缀与下一请求头部不一致——放行一次同一份 next，基线随本请求推进（${diag}）`, error);
+          return { verdict: 'ok' };
+        }
       }
       const verdict = cause === 'append-drift'
-        ? `append-drift 超出放行预算（每回合 1 次/每会话 3 次，已用 ${this.#prefixResendsSession} 次）——降级 fail-closed`
+        ? (this.#cfg.prefixPolicy === 'fail'
+          ? 'append-drift：prefixPolicy=fail 绝不换基（§12.4 回退面）'
+          : `append-drift 超出放行预算（每回合 1 次/每会话 3 次，已用 ${this.#prefixResendsSession} 次）——降级 fail-closed`)
         : cause === 'shrink'
-          ? '承诺前缀收缩（历史被销毁；段边界必须走 dropAppendHead 通道并重置基线）'
-          : 'stable-drift（稳定段被改写，0 放行）';
+          ? '承诺前缀收缩（历史被销毁；段边界必须走 dropAppendHead / rebase 计划性通道）'
+          : 'stable-drift（稳定段被改写，0 放行；stable-drift 始终 fail，不受 prefixPolicy 影响）';
       const full = this.#prefixFailClosed(error, turn, step, verdict);
       return { verdict: 'fail', detail: full };
     }
+  }
+
+  /**
+   * 0.5.0（§8.4 换基成本判据）：rebase_cost ≈ C（当前上下文 token）；
+   * 规则：剩余预算 > rebase_cost × rebaseBudgetRatio → 允许自动换基，否则 fail 保留现场。
+   * 剩余预算（token 口径）= maxInputTokens − 当前估算（maxInputTokens=0 无上限 → 恒允许）。
+   */
+  #rebaseAffordable(contextTokens: number): boolean {
+    const maxInput = this.effectiveLimits().maxInputTokens;
+    if (maxInput <= 0) return true;
+    const remaining = maxInput - contextTokens;
+    return remaining > contextTokens * this.#cfg.rebaseBudgetRatio;
   }
 
   /**
@@ -2541,12 +3430,21 @@ export class SingleStreamDriver {
     if (baseline === null) return;
     const cfg = this.#cfg.faultPrefixDrift;
     if (cfg === undefined) return;
+    const promised = [...baseline.promised];
+    let index: number;
+    if (cfg.kind === 'stable') {
+      if (baseline.stableLen < 2) return; // 没有可篡改的稳定段（system 之下）
+      index = 1;
+    } else {
+      if (promised.length <= baseline.stableLen) return; // 无转正块可篡改
+      index = baseline.stableLen;
+    }
+    // oncePerTurn 标记放在"确认可篡改"之后——否则首个无法篡改的请求会把整个回合
+    // 的探针名额消耗掉（0.5.0 修正：探针在多请求剧本里第一次到位时才生效）。
     if (cfg.oncePerTurn === true) {
       if (this.#faultDriftTurns.has(turn)) return;
       this.#faultDriftTurns.add(turn);
     }
-    const promised = [...baseline.promised];
-    let index: number;
     if (cfg.kind === 'stable') {
       if (baseline.stableLen < 2) return; // 没有可篡改的稳定段（system 之下）
       index = 1;
@@ -2734,13 +3632,18 @@ export class SingleStreamDriver {
       }
     }
 
-    // ---- tf-peek：内核 obs 直接取回（need_result 通道）----
+    // ---- tf-peek：内核 obs 直接取回（need_result 通道；0.5.0 走 span 账本 + 回合预算）----
     if (cmd.name === 'tf-peek') {
       const handle = cmd.attrs['handle'] ?? '';
       const from = Number(cmd.attrs['from_line'] ?? '1');
       const to = cmd.attrs['to_line'] === undefined ? Number.MAX_SAFE_INTEGER : Number(cmd.attrs['to_line']);
-      const content = this.#obs.peek(handle, from, to);
-      if (content === null) {
+      // 0.5.0（§5.2）：handle 支持 request:N 别名（长上下文压缩段的取回地址）
+      const handleCandidates = this.#obs.resolveHandleRef(handle);
+      const spanResult = handleCandidates.length > 0 ? this.#obs.peekWithLedger(handleCandidates[0]!, from, to, this.#requestCount) : null;
+      const content = spanResult === null
+        ? (handleCandidates.length > 1 ? handleCandidates.map((h) => this.#obs.peek(h, from, to)).find((c) => c !== null) ?? null : null)
+        : (spanResult.kind === 'unchanged' ? spanResult.line : spanResult.text);
+      if (spanResult === null && content === null) {
         // 同流乐观 peek（句柄所在命令还在执行）：延迟到流末 drain 后重试一次（上游语义
         // "信息工具先等之前的写入"的驱动器侧实现）；流末仍无此句柄才按失败注入。
         const workInFlight = [...this.#commands.values()].some(
@@ -2759,11 +3662,29 @@ export class SingleStreamDriver {
         this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
         return;
       }
+      // 0.5.0（§7.3(3)）：回合取回预算——超预算返回 [budget] 一行（不允许静默继续）。
+      if (this.#cfg.peekBudgetChars > 0 && content !== null && content.length > 0) {
+        const remaining = this.#cfg.peekBudgetChars - this.#peekBudgetUsed;
+        if (content.length > remaining) {
+          const budgetLine = `[budget] 本回合取回已达上限（${this.#cfg.peekBudgetChars} 字符，已用 ${this.#peekBudgetUsed}）。请先用 tf-grep 缩小范围，或在下回合继续。`;
+          rec.status = 'ok';
+          rec.output = budgetLine;
+          rec.detail = `peek-budget-exhausted: ${budgetLine}`;
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+          this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'peek-budget', handle, used: this.#peekBudgetUsed, cap: this.#cfg.peekBudgetChars });
+          return;
+        }
+      }
       rec.status = 'ok';
-      rec.output = content;
-      rec.detail = `${content.length} chars`;
+      rec.output = content ?? '';
+      rec.detail = `${(content ?? '').length} chars${spanResult?.kind === 'unchanged' ? '（span 命中：不重发正文）' : spanResult?.kind === 'partial' ? `（${spanResult.note}）` : ''}`;
+      if (content !== null && spanResult !== undefined && spanResult !== null && spanResult.kind !== 'unchanged') {
+        // 投递记账（span 账本）：本次正文进入上下文，登记已投递区间
+        this.#obs.recordDelivered(spanResult.handle, spanResult.from, spanResult.to, this.#requestCount);
+      }
+      if (content !== null) this.#peekBudgetUsed += content.length;
       this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', handle, detail: rec.detail });
-      this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', handle, chars: content.length });
+      this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', handle, chars: (content ?? '').length, spanKind: spanResult?.kind ?? 'content' });
       return;
     }
 
@@ -2886,6 +3807,8 @@ export class SingleStreamDriver {
       }
       // F5：tf-code 成功（有回执）→ 声明的验收项记为已验证（证据 = 命令 id + 值指纹）
       this.#markAccepts(cmd, rec.handle, contentFingerprint(valueJson));
+      // 0.5.0（§5.6(1)）：效果落账（标准通道折叠单元 = 单次工具调用）
+      this.#recordEffect(cmd, rec, valueJson);
       this.#record({
         seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok',
         handle: rec.handle, infoGain: observation.info_gain, detail: rec.detail,
@@ -3080,6 +4003,8 @@ export class SingleStreamDriver {
     }
     // F5：命令成功（有回执）→ 声明的验收项记为已验证（证据 = 命令 id + 句柄/指纹）
     this.#markAccepts(cmd, rec.handle, contentFingerprint(contentText));
+    // 0.5.0（§5.6(1)）：效果落账——效果压缩的数据源（目标、版本、diffstat、验证状态、句柄）
+    this.#recordEffect(cmd, rec, contentText);
     this.#record({
       seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok',
       handle: rec.handle, infoGain: observation.info_gain, detail: rec.detail,
@@ -3131,6 +4056,21 @@ export class SingleStreamDriver {
       isError: r.result?.isError === true,
     }));
     for (const _call of calls) this.#ports.onToolSettled?.();
+    // 0.5.0（§5.6(1)）：代码通道的效果压缩单元 = run_code 整次调用（一次 = 一条效果）。
+    // 记录来自程序的返回值声明（返回值文本长度），不来自子调用事件（§5.5：子调用不产生
+    // 模型可见事件）。
+    for (const r of results) {
+      if (r.name !== 'run_code' || r.isError || !this.#cfg.effectElision) continue;
+      this.#effectCounter += 1;
+      this.#effects.push({
+        effectId: `p${this.#effectCounter}`,
+        cmdId: r.callId,
+        action: 'run_code',
+        target: 'run_code',
+        verify: 'pass',
+        digestIndex: this.#cmdOrder,
+      });
+    }
     if (results.length === 0 || level === 'final-only') return;
 
     // 原生通道结果即需求（阻塞语义）：注入易变尾，下一请求立即可见。
@@ -3291,7 +4231,16 @@ export class SingleStreamDriver {
         this.#reportedObservations.add(obs.seq);
         let body: string;
         if (rec.cmd.name === 'tf-read') {
-          const full = this.#obs.peek(obs.handle ?? '', 1, Number.MAX_SAFE_INTEGER);
+          // 0.5.0：读取统一走 span 感知取回（一次取回一个计数——口径与 0.4.x 的"自动 peek
+          // 1 次"对齐）。spanLedger=false（回退点）时 peekWithLedger 恒 content 分支，
+          // 行为与 plain peek 逐字节一致。
+          const readHandle = obs.handle ?? '';
+          const spanView = this.#cfg.spanLedger && readHandle !== ''
+            ? this.#obs.peekWithLedger(readHandle, 1, Number.MAX_SAFE_INTEGER, this.#requestCount, { countRequest: false })
+            : null;
+          const full = spanView !== null
+            ? (spanView.kind === 'unchanged' ? null : spanView.text)
+            : this.#obs.peek(readHandle, 1, Number.MAX_SAFE_INTEGER);
           // 修复限制 1：自写回验 receipt——tf-read 命中本任务 tf-write 已写过的路径时，
           // 全文就在模型上下文里，不再重复回灌（掐断"写→读回验"循环，写批任务的主要 token 开销）。
           const selfWritten = this.#cfg.selfReadFeedback !== 'full'
@@ -3315,21 +4264,67 @@ export class SingleStreamDriver {
             highInjected = true;
             continue;
           }
-          const readLimit = this.#cfg.readFeedbackLimit ?? DEFAULT_READ_FEEDBACK_LIMIT;
-          body = readFeedbackBody(full, obs.payload.rendered, readLimit);
-          // v0.4.0（自 0.3.3 回流）单请求读注入预算：一次读多文件时不再把每个文件的全文都
-          // 塞进同一请求（真机 13 步会话 step 3：单请求 5916 个未缓存 token，占全会话未缓存
-          // 输入的 47%）。预算内给全文，超出给"头 800 字符 + 句柄"，下一请求用 tf-peek 精确
-          // 补全——把大块新内容摊平到多个请求，每个请求只新增它这一步真正要看的那份。
-          let previewed = false;
-          if (body.length > readBudget) {
-            body = readPreviewBody(full, obs.payload.rendered, READ_PREVIEW_CHARS);
-            previewed = true;
+          // 0.5.0（§7.3(2)）：span 去重的回灌面——命中已投递且未变化 → 一行 [unchanged]
+          //（跨回合工作集，§5.6(3)）；部分重叠 → 只补新增区间（spanView.text 已是新增部分）。
+          if (spanView !== null && spanView.kind === 'unchanged') {
+            const unchanged = `[tf-stream:observation handle=${obs.handle ?? ''} key=${observationKey(rec.cmd)}]\n${spanView.line}`;
+            blocks.push({ role: 'user', content: unchanged });
+            this.#noteFeedback('handle', unchanged);
+            highInjected = true;
+            continue;
           }
-          readBudget = Math.max(0, readBudget - body.length);
-          // v0.4.3（P0-7①）：与 readFeedbackBody 同分支的分类——全文 ≤ 上限且未因预算降级
-          // = full；取不到原文（骨架）、超限截断或预算降级 = handle（指针 + 句柄）。
-          feedbackClass = !previewed && full !== null && full.length <= readLimit ? 'full' : 'handle';
+          if (spanView !== null && spanView.kind === 'partial') {
+            // 部分重叠：只补新增区间（span 账本剪掉已投递部分），原文按句柄仍可取回
+            const partialBody = `${spanView.text}\n（${spanView.note}）`;
+            const partialContent = `[tf-stream:observation handle=${obs.handle ?? ''} key=${observationKey(rec.cmd)}]\n${partialBody}\n（细节用 tf-peek handle="${obs.handle}" from_line=.. to_line=.. 取回）`;
+            blocks.push({ role: 'user', content: partialContent });
+            if (obs.handle !== null) {
+              this.#obs.recordDelivered(obs.handle, spanView.from, spanView.to, this.#requestCount);
+            }
+            this.#noteFeedback('handle', partialContent);
+            highInjected = true;
+            continue;
+          }
+          // 0.5.0（§7.3(1) + §7.5 双旋钮）：读取侧超上限（maxReadChars）→ 行锚索引 +
+          // 未投递区间（D4 修复：头部截断策略本身制造取回）；peekIndex=false（回退点）→
+          // 回到 0.4.x 头部截断形态。
+          if (this.#cfg.peekIndex && full !== null && full.length > this.#cfg.maxReadChars) {
+            const spans = this.#obs.deliveredSpanList(obs.handle ?? '')
+              .map((s) => ({ from: s.from, to: s.to }));
+            const indexText = renderReadIndex(full, { delivered: spans });
+            body = `${indexText}\n（正文超过读取上限 ${this.#cfg.maxReadChars} 字符：只投索引；用 tf-peek handle="${obs.handle}" from_line=.. to_line=.. 按窗口取回）`;
+            feedbackClass = 'handle';
+          } else {
+            const readLimit = this.#cfg.readFeedbackLimit;
+            body = full !== null && readLimit > 0
+              ? readFeedbackBody(full, obs.payload.rendered, readLimit)
+              : (full ?? obs.payload.rendered);
+            // v0.4.0（自 0.3.3 回流）单请求读注入预算：一次读多文件时不再把每个文件的全文都
+            // 塞进同一请求（真机 13 步会话 step 3：单请求 5916 个未缓存 token，占全会话未缓存
+            // 输入的 47%）。预算内给全文，超出给"头 800 字符 + 句柄"，下一请求用 tf-peek 精确
+            // 补全——把大块新内容摊平到多个请求，每个请求只新增它这一步真正要看的那份。
+            let previewed = false;
+            if (body.length > readBudget) {
+              body = readPreviewBody(full, obs.payload.rendered, READ_PREVIEW_CHARS);
+              previewed = true;
+            }
+            readBudget = Math.max(0, readBudget - body.length);
+            // v0.4.3（P0-7①）：与 readFeedbackBody 同分支的分类——全文 ≤ 上限且未因预算降级
+            // = full；取不到原文（骨架）、超限截断或预算降级 = handle（指针 + 句柄）。
+            feedbackClass = !previewed && full !== null && (readLimit <= 0 || full.length <= readLimit) ? 'full' : 'handle';
+            // 投递记账（span 账本）：只登记**实际进入上下文**的行区间——预算降级（preview）
+            // 只投了头部，账本不得把整个文件记为已投递（否则未投递部分的 peek 会被误判
+            // [unchanged]）。0.4.x 截断形态（readFeedbackLimit>0 且超限）同理只记实际发送的头尾？——
+            // 头尾保留是"中段省略"，区间不连续，span 账本按区间记账不适用（不登记，回退点行为）。
+            if (full !== null && obs.handle !== null && !previewed && (readLimit <= 0 || full.length <= readLimit)) {
+              this.#obs.recordDelivered(obs.handle, 1, full.split('\n').length, this.#requestCount);
+            } else if (full !== null && obs.handle !== null && previewed) {
+              const deliveredLines = full.slice(0, READ_PREVIEW_CHARS).split('\n').length - 1;
+              if (deliveredLines > 0) {
+                this.#obs.recordDelivered(obs.handle, 1, deliveredLines, this.#requestCount);
+              }
+            }
+          }
         } else if (rec.cmd.name === 'tf-code' && rec.output !== undefined) {
           // F3：code 结果可见性——上限内的首成功/变化值完整注入（省一次 tf-peek 往返）；
           // 句柄仍然有效，需要原文行段时照常 tf-peek。仅 tf-code 显式开启时此路径可达。
@@ -3382,6 +4377,21 @@ export class SingleStreamDriver {
       }
     }
 
+    // 4.5 0.5.0（§5.6(2)）：语义状态摘要——一行 ~30 token，替代模型重读测试输出自行判断。
+    // 标准通道经回灌注入；代码通道经 S5 快照注入（runtimeStatus/stateDigestLine → systemPrompt.context）。
+    // 摘要**不构成重入事由**：只挂在已确定要重入的请求上（搭车），且内容变化才重发——
+    // 否则每请求都多一块，needsReentry 恒真，回合永远不收敛（f5 E1 回归抓到）。
+    if (this.#cfg.stateDigest && this.#cfg.enablePlan && this.#plan !== null) {
+      const digest = this.stateDigestLine();
+      if (digest !== null && blocks.length > 0 && digest !== this.#lastDigestInjected) {
+        blocks.push({ role: 'user', content: digest });
+        this.#lastDigestInjected = digest;
+      }
+      // S5 端口在位（真实宿主 systemPrompt.context）→ 变化即推送快照（替换旧快照语义）；
+      // 代码通道只走这条路（无回灌），标准通道两条都通。
+      if (digest !== null) this.#pushRuntimeContext(digest);
+    }
+
     // 5. 原生 tool_call 结果（阻塞通道回灌，任意档都注入——它们是模型的即时需求）
     blocks.push(...this.#pendingNativeBlocks);
     this.#pendingNativeBlocks = [];
@@ -3389,7 +4399,65 @@ export class SingleStreamDriver {
     return { blocks, highInjected };
   }
 
+  /**
+   * 0.5.0（§5.6(1)）：给定命令 id，若其效果已落账、验证通过、且不在最近
+   * effectElisionKeepRecent 个效果内 → 返回 [applied pN] 一行（效果压缩的折叠形态）；
+   * 否则 null（原始输出照常回灌）。
+   */
+  #elidableEffectLineFor(cmdId: string): string | null {
+    if (this.#cfg.effectElision === false) return null;
+    const index = this.#effects.findIndex((e) => e.cmdId === cmdId);
+    if (index < 0) return null;
+    return this.#effectLineIfElidable(this.#effects[index]!, index);
+  }
+
+  /**
+   * 0.5.0（§5.6(1)）：块内容级的效果折叠判定（压缩路径）——块内容含某已折叠效果的
+   * 句柄（观测块 / 回灌块 / digest 行）→ 该块折叠为 [applied pN] 一行。
+   */
+  #elidableEffectLineForBlock(content: string): string | null {
+    if (this.#cfg.effectElision === false) return null;
+    for (const [index, effect] of this.#effects.entries()) {
+      if (effect.handle === undefined) continue;
+      if (!content.includes(effect.handle)) continue;
+      const line = this.#effectLineIfElidable(effect, index);
+      if (line !== null) return line;
+    }
+    return null;
+  }
+
+  #effectLineIfElidable(effect: EffectEntry, index: number): string | null {
+    const recencyFromNewest = this.#effects.length - 1 - index;
+    if (!shouldElideEffect(effect.verify, recencyFromNewest, this.#cfg.effectElisionKeepRecent)) return null;
+    return renderEffectLine({
+      effectId: effect.effectId,
+      action: effect.action,
+      target: effect.target,
+      ...(effect.version !== undefined ? { version: effect.version } : {}),
+      verify: effect.verify,
+      ...(effect.acceptId !== undefined ? { acceptId: effect.acceptId } : {}),
+      ...(effect.handle !== undefined ? { handle: effect.handle } : {}),
+    });
+  }
+
   // ------------------------------------------------------------------ 账本
+
+  /**
+   * 0.5.0 S5 快照贡献（§2.4 接缝 5 / §5.6(2)）：systemPrompt.context 由宿主 loop 渲染成
+   * runtime-context 快照消息并 supersede 旧快照——语义自带版本替换，不造成前缀无限增长。
+   * 端口缺席（离线/宿主未接）时静默跳过（标准通道的摘要已走回灌通道）；同文本不重发。
+   */
+  #pushRuntimeContext(text: string): void {
+    if (this.#runtimeContextPort === undefined) return;
+    if (this.#lastDigestSent === text) return;
+    this.#lastDigestSent = text;
+    try {
+      this.#runtimeContextPort(text);
+      this.#ledgerWrite('plugin:tf-agent/cache', { kind: 's5-context', chars: text.length });
+    } catch (error) {
+      this.#warn('S5 runtime context 贡献失败（fail-open：标准通道回灌不受影响）', error);
+    }
+  }
 
   #record(record: DriverRecord): void {
     this.#records.push(record);
@@ -3417,6 +4485,60 @@ function safeToolLog(ports: DriverPorts, turn: number, step: number): { turn: nu
 /** 任务内路径规范化（自写回验判定用）：统一分隔符；大小写保留（不做平台猜测试）。 */
 function normalizeTaskPath(path: string): string {
   return path.replace(/\\/g, '/');
+}
+
+// ---------------------------------------------------------------------------
+// 0.5.0（§4.6）：任务级预算指令（消息首行 [tf-budget: 8steps/20k] + 结构化 source.tfBudget）
+// ---------------------------------------------------------------------------
+
+export interface TaskBudgetDirective {
+  maxSteps?: number;
+  maxInputTokens?: number;
+}
+
+/**
+ * 解析并剥离消息首行的预算指令：`[tf-budget: 8steps/20k]`。
+ *  - 8steps / 8step / 8步 → maxSteps；20k / 20000 → maxInputTokens（k = ×1000）；
+ *  - 无指令（或无法解析出任何字段）返回原文与 null——正文一字节不动；
+ *  - 有指令时返回剥离后的正文（指令行之后的内容）。
+ */
+export function parseTaskBudgetDirective(text: string): { text: string; budget: TaskBudgetDirective | null } {
+  const firstLineEnd = text.indexOf('\n');
+  const firstLine = firstLineEnd === -1 ? text : text.slice(0, firstLineEnd);
+  const m = /^\s*\[tf-budget:\s*([^\]]+)\]\s*$/.exec(firstLine);
+  if (m === null) return { text, budget: null };
+  const budget: TaskBudgetDirective = {};
+  for (const part of m[1]!.split('/')) {
+    const spec = part.trim();
+    if (spec === '') continue;
+    const steps = /^(\d+)\s*(?:steps?|步)$/i.exec(spec);
+    const tokens = /^(\d+)\s*k(?: tokens?)?$/i.exec(spec);
+    if (steps !== null) budget.maxSteps = Number(steps[1]);
+    else if (tokens !== null) budget.maxInputTokens = Number(tokens[1]) * 1000;
+  }
+  if (budget.maxSteps === undefined && budget.maxInputTokens === undefined) {
+    return { text, budget: null };
+  }
+  const rest = firstLineEnd === -1 ? '' : text.slice(firstLineEnd + 1);
+  return { text: rest, budget };
+}
+
+/** 结构化任务预算（§4.6：followup(message).source.tfBudget——followup 透传 message）。 */
+function readStructuredTaskBudget(message: unknown): TaskBudgetDirective | null {
+  if (message === null || typeof message !== 'object') return null;
+  const source = (message as { source?: unknown }).source;
+  if (source === null || typeof source !== 'object') return null;
+  const tfBudget = (source as { tfBudget?: unknown }).tfBudget;
+  if (tfBudget === null || typeof tfBudget !== 'object') return null;
+  const raw = tfBudget as { maxSteps?: unknown; maxInputTokens?: unknown };
+  const budget: TaskBudgetDirective = {};
+  if (typeof raw.maxSteps === 'number' && Number.isFinite(raw.maxSteps) && raw.maxSteps >= 0) {
+    budget.maxSteps = Math.floor(raw.maxSteps);
+  }
+  if (typeof raw.maxInputTokens === 'number' && Number.isFinite(raw.maxInputTokens) && raw.maxInputTokens >= 0) {
+    budget.maxInputTokens = Math.floor(raw.maxInputTokens);
+  }
+  return budget.maxSteps === undefined && budget.maxInputTokens === undefined ? null : budget;
 }
 
 /** 内容指纹（receipt 行）：sha256 前 16 位十六进制——够对账，不泄露内容。 */
@@ -4024,7 +5146,9 @@ export class StreamLoopAgent {
     this.#setStatus('running');
     this.#running = (async () => {
       try {
-        this.#driver.pushUserTask(next.text);
+        // 0.5.0（§4.6）：透传 message——pushUserTask 读取 message.source.tfBudget
+        //（结构化任务级预算），不再像 0.4.x 那样丢弃 message。
+        this.#driver.pushUserTask(next.text, next.message);
         await this.#driver.runTurn();
       } catch (error) {
         // fail-open：回合异常必须浮出（headless 靠 whenIdle 拒绝感知失败）；告警出口保证有日志
@@ -4609,14 +5733,67 @@ export interface LoopEntryConfig {
   maxParallelToolCalls?: number;
   maxReentries?: number;
   streamIdleTimeoutMs?: number;
+  // ---- 0.5.0 两轴（§4.2）----
+  /** 执行通道：'standard'（默认）/ 'code'。缺省读 control.json；旧 mode 值走别名映射。 */
+  channel?: string;
+  /** 上下文档位：'light' / 'standard'（默认）/ 'deep'——只改数值。旧 mode 值走别名映射。 */
+  tier?: string;
+  /** 单任务请求数上限（N 上限；缺省档位值）。0 = 无上限。 */
+  maxSteps?: number;
+  /** 单请求上下文上限（C 上限，token 估算；缺省档位值）。0 = 不压缩。装配级不可逾越上限。 */
+  maxInputTokens?: number;
+  /** 压缩强度（档位默认；可显式覆盖） */
+  compactAggressiveness?: CompactAggressiveness;
+  /** 压缩保留最近条数（档位默认） */
+  keepRecent?: number;
+  /** 摘要总长上限（字符，档位默认） */
+  maxSummaryChars?: number;
+  /** 每回合取回字符上限（档位默认；0 = 不限制） */
+  peekBudgetChars?: number;
+  /** 效果压缩（默认 true；false = 保留程序全文——§12.4 回退） */
+  effectElision?: boolean;
+  /** 最近 N 个效果不折叠（默认 3） */
+  effectElisionKeepRecent?: number;
+  /** 语义状态摘要一行注入（默认 true） */
+  stateDigest?: boolean;
+  /** surface replace 压缩总开关（默认 true；false = 不压缩——§12.4 回退） */
+  surfaceCompaction?: boolean;
+  /** 已投递 span 账本（默认 true；false = 无重复抑制——§12.4 回退） */
+  spanLedger?: boolean;
+  /** read 行锚索引（默认 true；false = 头部截断——§12.4 回退） */
+  peekIndex?: boolean;
+  /** 单次 read 返回上限（字符；缺省 32k，超出转索引） */
+  maxReadChars?: number;
+  /** 回灌侧单次 read 注入上限（字符；缺省 0 = 不截断；8000 = 0.4.x 行为） */
+  readFeedbackLimit?: number;
+  /** 前缀策略（§8.5）：'auto'（默认）/ 'rebase' / 'fail'（绝不换基——§12.4 回退） */
+  prefixPolicy?: 'auto' | 'rebase' | 'fail';
+  /** 允许自动换基的剩余预算倍率（默认 1.5） */
+  rebaseBudgetRatio?: number;
+  maxRebasesPerTurn?: number;
+  maxRebasesPerSession?: number;
+  /** 工具面策略（§6.3）：'reserved-only'（默认，第三方工具透传）/ 'profile'（0.4.x 行为，
+   *  已弃用，仅回退演练——§12.4） */
+  surfacePolicy?: string;
+  /** profile 策略下的档位（'core' | 'standard' | 'full'；'off' 已删除——D2 修复） */
+  toolSurface?: string;
+  /** loop 接管优先级（默认 100；诊断展示用） */
+  takeoverPriority?: number;
+  /** setFactory 冲突处置：'degrade'（默认，转 sidecar）/ 'refuse'（抛错） */
+  takeoverOnConflict?: 'degrade' | 'refuse';
+  /** 代码通道来源（§5.2）：'auto'（默认，按探测）/ 'preset' / 'bridge'（显式绕过探测） */
+  codeChannelSource?: 'auto' | 'preset' | 'bridge';
+  /** 任务级 token 预算（显式设置时阶梯生效——基数已修复为任务起点；缺省仅观测告警） */
   budgetTokens?: number;
+  /** 观测预算阈值（token；默认 60k；仅告警与报表——D7） */
+  observeBudgetTokens?: number;
   nativeToolSchemas?: string;
   systemPrompt?: string;
   protocolText?: string;
   /** v0.4.1 不变量段：string = 整段替换；false = 整段不注入（省 242 字符；回退点） */
   invariants?: string | false;
-  /** v0.4.1 协议档位：'full'（默认，0.4.0 原文逐字节）| 'lean'（全段压缩说明文字）|
-   *  'minimal'（语法铁律面）。显式 protocolText 压过本项。未知值归一 full 并告警。 */
+  /** v0.4.1 协议档位：'full'（默认，0.4.0 原文逐字节 + 0.5.0 peek 段）| 'lean' | 'minimal'。
+   *  显式 protocolText 压过本项。未知值归一 full 并告警。 */
   protocolLevel?: string;
   /** v0.4.1 段级增删（宽松表：未知段 id 告警丢弃，不阻断装载） */
   protocolSections?: Record<string, boolean>;
@@ -4624,9 +5801,8 @@ export interface LoopEntryConfig {
   protocolAppend?: string;
   /** 自写回验策略（修复限制 1）：'receipt'（默认）| 'full' —— 见 StreamDriverConfig.selfReadFeedback */
   selfReadFeedback?: 'receipt' | 'full';
-  /** tf-code 程序化通道（PTC 桥接）。K1（0.3.0）：**默认关闭**；显式 true 且宿主挂载
-   *  @deepseek-ai/dsh-ptc-runtime 才启用（协议文本才声明 tf-code 段）。粒度是装配/模式级，
-   *  不做会话级动态开关（协议段构造期冻结）。 */
+  /** tf-code 程序化通道（PTC 桥接）。0.5.0：由 channel='code' + 来源判定取代；
+   *  显式 true 仍强制开启（0.4.x 装配兼容）。 */
   enableCode?: boolean;
   /** K5：tf-code 配额三项硬限制（maxSubcalls / maxOutputBytes / maxWallMs；缺省 DEFAULT_CODE_QUOTA） */
   codeQuota?: CodeQuota;
@@ -4645,11 +5821,9 @@ export interface LoopEntryConfig {
   segmentMaxChars?: number;
   /** tf-code 默认超时（毫秒）；缺省 = 宿主 provider 默认 */
   codeTimeoutMs?: number;
-  /** v0.4.0 工具面档位（P1）：'core' | 'standard'（默认）| 'full' | 'off'（0.3.x 回退点） */
-  toolSurface?: string;
   /** v0.4.0 原生通道开关（默认 false——§15 默认文本；schema token 成本见 StreamDriverConfig.nativeTools） */
   nativeTools?: boolean;
-  /** v0.4.0 tf-call 通用调用通道（默认 true；toolSurface=off 强制关） */
+  /** v0.4.0 tf-call 通用调用通道（默认 true） */
   callCommand?: boolean;
   /** v0.4.0 toolSet 准入收紧（R5：beta 默认 false；P6 复跑后再默认开） */
   strictAdmission?: boolean;
@@ -4660,7 +5834,8 @@ export interface LoopEntryConfig {
   persistFallback?: boolean;
   /** 本地持久化状态根目录（缺省 env STREAM_AGENT_STATE_DIR → ~/.dsh-stream-agent） */
   stateDir?: string;
-  /** 控制栏模式（v0.2.1）：balanced / lean / compat / power；缺省读 control.json → balanced */
+  /** 旧模式值（0.5.x 别名；0.6.0 移除）：balanced/lean/compat/power → (channel, tier)。
+   *  显式 channel/tier 永远压过本字段。 */
   mode?: string;
   /** 控制栏语言：zh / en（只影响控制栏文案，不影响协议） */
   lang?: string;
@@ -4668,9 +5843,64 @@ export interface LoopEntryConfig {
   announceTakeover?: boolean;
 }
 
-/** v0.4.0：装配 config 的工具面档位归一（未知值回 standard + 告警由调用方负责；'off' = 0.3.x 回退点）。 */
+/**
+ * v0.4.0 → 0.5.0：装配 config 的工具面档位归一（未知值回 standard）。
+ * 0.5.0 D2 修复：'off' 档**已删除**——它曾把第三方工具砍到完全不可达（§4.3）；
+ * 工具面策略走 surfacePolicy（reserved-only 默认 = 透传），'off' 值由调用方告警。
+ */
 export function asSurfaceProfile(value: string | undefined): SurfaceProfile {
-  return value === 'core' || value === 'standard' || value === 'full' || value === 'off' ? value : 'standard';
+  return value === 'core' || value === 'standard' || value === 'full' ? value : 'standard';
+}
+
+/** 0.5.0：surfacePolicy 归一（'profile' 仅回退演练保留；未知值归一 reserved-only）。 */
+export function asSurfacePolicy(value: string | undefined): SurfacePolicy {
+  return value === 'profile' ? 'profile' : 'reserved-only';
+}
+
+/**
+ * 0.5.0（§5.2）：代码通道三来源探测（U3 探针）。
+ * 判定只依赖"当前作用域执行器是否为 PTC 实现"（R12 设计约束：不依赖 preset id）：
+ *  ① 显式 config.codeChannelSource 绕过探测；
+ *  ② preset 探针（U3）：duck-type 宿主 tools 服务的执行器内省面，或解析一次工具清单看
+ *     `run_code` 是否在面内（PTC preset 注册的唯一程序入口）；
+ *  ③ bridge 判定：ctx.ptcRuntime 存在且形状符合（looksLikePtcRuntime）。
+ * 返回 'preset' | 'bridge' | null（null = 代码通道不可用——拒绝进入，§5.2 第三分支）。
+ */
+export function detectCodeChannelSource(
+  tools: { resolve?(context: unknown): unknown; schemas?(scope: unknown, toolSet?: unknown): unknown; executor?: unknown; getExecutor?(scope: unknown): unknown } | undefined,
+  ptcRuntime: unknown,
+): 'preset' | 'bridge' | null {
+  // ② preset 探针：执行器内省面（duck-type；宿主若提供即直接判）
+  if (tools !== undefined && typeof tools.getExecutor === 'function') {
+    try {
+      const executor = tools.getExecutor(undefined);
+      if (looksLikePtcExecutor(executor)) return 'preset';
+    } catch { /* 内省失败 → 下一探针 */ }
+  }
+  if (looksLikePtcExecutor(tools?.executor)) return 'preset';
+  // ② preset 探针（U3 回退形态）：工具清单内出现 run_code = PTC preset 在位
+  if (tools !== undefined && typeof tools.schemas === 'function') {
+    try {
+      const schemas = tools.schemas(undefined, undefined) as { name?: unknown }[] | undefined;
+      if (Array.isArray(schemas) && schemas.some((s) => (s as { name?: unknown })?.name === 'run_code')) {
+        return 'preset';
+      }
+    } catch { /* 无 agent 作用域时解析可能失败 → 不判 preset */ }
+  }
+  // ③ bridge：ctx.ptcRuntime 服务在位且形状符合
+  if (looksLikePtcRuntime(ptcRuntime)) return 'bridge';
+  return null;
+}
+
+/** duck-type 判定"执行器实现是 PTC"（R12：不按 preset id，按实现特征）。 */
+function looksLikePtcExecutor(executor: unknown): boolean {
+  if (executor === null || executor === undefined || typeof executor !== 'object') return false;
+  const e = executor as { name?: unknown; execute?: unknown; runProgram?: unknown; kind?: unknown };
+  if (typeof e.runProgram === 'function') return true;
+  const name = typeof e.name === 'string' ? e.name.toLowerCase() : '';
+  if (name.includes('ptc')) return true;
+  const kind = typeof e.kind === 'string' ? e.kind.toLowerCase() : '';
+  return kind.includes('ptc');
 }
 
 /**
@@ -4749,30 +5979,50 @@ export default function apply(ctx: {
   const agentDefaultModel = getService<{ currentSelection?(): { provider?: string; model?: string; reasoningEffort?: string } }>(ctx, 'agentDefaultModel');
   const defaultSelection = agentDefaultModel?.currentSelection?.() ?? {};
   const stateRoot = resolveStateDir(config.stateDir);
-  // 控制栏模式（v0.2.1）：显式 config.mode > STREAM_AGENT_MODE > control.json > balanced。
-  // 模式只提供默认值，下面每个字段都用 `config.X ?? preset.X` —— 显式装配永远压过模式。
-  const control = resolveControlState({ mode: config.mode, lang: config.lang }, config.stateDir, warning);
-  // 每次新建 agent 时重算：桌面控制页可以在不重启的情况下切模式，
+  // 控制状态（0.5.0 两轴）：显式 config（channel/tier，旧 mode 走别名 + warn）
+  // > STREAM_AGENT_CHANNEL/STREAM_AGENT_TIER（旧 STREAM_AGENT_MODE 走别名）> control.json > 默认。
+  const control = resolveControlState(
+    { channel: config.channel, tier: config.tier, lang: config.lang, mode: config.mode },
+    config.stateDir,
+    warning,
+  );
+  // 每次新建 agent 时重算：桌面控制页可以在不重启的情况下切通道/档位，
   // 已有的 driver 保持创建时的参数（会话内不突变），新会话拿到新参数。
+  // 0.5.0（§4.2）：档位只提供数值默认（maxSteps/maxInputTokens/压缩/取回），不再携带
+  // 任何工具面/并行度副作用（D2/D3 的成因正是旧预设顺手改了工具面）。
   const resolveEffective = (): {
+    channel: ChannelId;
+    tier: TierId;
     selfReadFeedback: 'receipt' | 'full';
     enableCode: boolean | undefined;
     persistFallback: boolean;
     maxParallelToolCalls: number;
     maxReentries: number;
     budgetTokens: number | undefined;
-    toolSurface: ReturnType<typeof asSurfaceProfile>;
+    surfacePolicy: SurfacePolicy;
+    toolSurface: SurfaceProfile;
   } => {
-    const preset = modeConfig(control.mode);
+    const tierValues = getTier(control.tier).values;
+    const surfacePolicyRaw = config.surfacePolicy ?? 'reserved-only';
+    const surfacePolicy: SurfacePolicy = surfacePolicyRaw === 'profile' ? 'profile' : 'reserved-only';
+    if (surfacePolicyRaw !== 'reserved-only' && surfacePolicyRaw !== 'profile') {
+      warning(`[stream-loop] surfacePolicy 未知值 "${surfacePolicyRaw}"，归一 reserved-only（可用: reserved-only|profile）`);
+    }
+    if (surfacePolicy === 'profile') {
+      warning('[stream-loop] surfacePolicy=profile 是 0.4.x 过滤行为（已弃用，仅回退演练 §12.4；默认 reserved-only 对第三方工具零影响）');
+    }
     return {
-      selfReadFeedback: config.selfReadFeedback ?? preset.selfReadFeedback,
+      channel: control.channel,
+      tier: control.tier,
+      selfReadFeedback: config.selfReadFeedback ?? 'receipt',
       // 'auto' = 交给 codeExecutor 是否存在决定（保持 v0.2.0 的"宿主有 PTC 就开"语义）
-      enableCode: config.enableCode ?? (preset.enableCode === 'auto' ? undefined : preset.enableCode),
-      persistFallback: config.persistFallback ?? preset.persistFallback,
-      maxParallelToolCalls: config.maxParallelToolCalls ?? preset.maxParallelToolCalls,
-      maxReentries: config.maxReentries ?? preset.maxReentries,
-      budgetTokens: config.budgetTokens ?? preset.budgetTokens,
-    toolSurface: asSurfaceProfile(config.toolSurface ?? preset.toolSurface),
+      enableCode: config.enableCode,
+      persistFallback: config.persistFallback ?? true,
+      maxParallelToolCalls: config.maxParallelToolCalls ?? 3,
+      maxReentries: config.maxReentries ?? 12,
+      budgetTokens: config.budgetTokens,
+      surfacePolicy,
+      toolSurface: asSurfaceProfile(config.toolSurface),
     };
   };
   const effective = resolveEffective();
@@ -4782,10 +6032,31 @@ export default function apply(ctx: {
   // 形状不符或缺失 → 通道关闭（协议文本不声明 tf-code），告警不静默（红线 5）。
   // v0.2.1：ptcRuntime 是可选服务，只经 getService 探测（裸读即装载期抛错）。
   const ptcRuntime = getService<unknown>(ctx, 'ptcRuntime');
+  // 0.5.0（§5.2）：代码通道三来源探测（U3 探针；R12——只按执行器实现判定，不按 preset id）。
+  // preset 探测走 tools 内省 / run_code 工具清单；bridge 探测走 ptcRuntime 形状。
+  const codeSourceProbe = detectCodeChannelSource(tools as Parameters<typeof detectCodeChannelSource>[0], ptcRuntime);
+  if (codeSourceProbe === null) {
+    warning('[stream-loop] 代码通道来源判定 = none（未检测到 PTC 预设或 ptcRuntime）：channel=code 将被拒绝并回退标准通道（§5.2，不静默降级）');
+  } else {
+    warning(`[stream-loop] 代码通道来源判定 = ${codeSourceProbe}${codeSourceProbe === 'preset' ? '（PTC preset 在位：代码通道完全让位，§5.3）' : '（内置窄桥：受限能力，如实显示）'}`);
+  }
   // v0.4.0（P5）：当前会话驱动器引用（createDriver 闭包回填；tf-code 全绑定按面生成）。
   // v0.4.1-beta.2：同一持有者供会话日志 model source 写入时取实时 provider/model（不缓存）。
   // v0.4.2：控制页状态面经此读取运行时缓存口径（cacheStats）。
-  const currentDriverRef: { driver?: { surfaceNames(): readonly string[]; modelSource(): ModelSourceInfo; cacheStats(): { cacheHitRatio: number | null; cacheReadTokens: number; billedInput: number } } } = {};
+  // 0.5.0：控制页状态面扩到 runtimeStatus（通道/档位/换基/取回统计）。
+  const currentDriverRef: {
+    driver?: {
+      surfaceNames(): readonly string[];
+      modelSource(): ModelSourceInfo;
+      cacheStats(): { cacheHitRatio: number | null; cacheReadTokens: number; billedInput: number };
+      runtimeStatus(): ReturnType<SingleStreamDriver['runtimeStatus']>;
+      stateDigestLine(): string | null;
+      setChannel(channel: ChannelId): { ok: boolean; code?: string; detail?: string };
+      setTier(tier: TierId): { ok: boolean; code?: string };
+      setBudget(budget: { maxSteps?: number; maxInputTokens?: number }): { ok: boolean; code?: string; detail?: string };
+      setMode(mode: string): { ok: boolean; code?: string; detail?: string; aliased?: boolean };
+    };
+  } = {};
   const codeExecutor = looksLikePtcRuntime(ptcRuntime)
     ? createCodeExecutor(ptcRuntime, { executeTools: (input) => tools.execute(input as never) })
     : undefined;
@@ -4809,6 +6080,33 @@ export default function apply(ctx: {
         provider: agentOptions.provider || config.provider || defaultSelection.provider || '',
         model: agentOptions.model || config.model || defaultSelection.model || '',
         reasoningEffort: agentOptions.reasoningEffort ?? config.reasoningEffort ?? defaultSelection.reasoningEffort,
+        // ---- 0.5.0 两轴 + 数值旋钮（§4.2/§4.5）----
+        channel: live.channel,
+        tier: live.tier,
+        maxSteps: config.maxSteps,
+        maxInputTokens: config.maxInputTokens,
+        compactAggressiveness: config.compactAggressiveness,
+        keepRecent: config.keepRecent,
+        maxSummaryChars: config.maxSummaryChars,
+        peekBudgetChars: config.peekBudgetChars,
+        effectElision: config.effectElision,
+        effectElisionKeepRecent: config.effectElisionKeepRecent,
+        stateDigest: config.stateDigest,
+        surfaceCompaction: config.surfaceCompaction,
+        spanLedger: config.spanLedger,
+        peekIndex: config.peekIndex,
+        maxReadChars: config.maxReadChars,
+        readFeedbackLimit: config.readFeedbackLimit,
+        prefixPolicy: config.prefixPolicy,
+        rebaseBudgetRatio: config.rebaseBudgetRatio,
+        maxRebasesPerTurn: config.maxRebasesPerTurn,
+        maxRebasesPerSession: config.maxRebasesPerSession,
+        surfacePolicy: live.surfacePolicy,
+        // 0.5.0（§5.2）：代码通道来源判定（apply() 全局探测一次；显式配置绕过探测）
+        codeChannelSource: config.codeChannelSource,
+        ...(codeSourceProbe !== null ? { codeSource: codeSourceProbe } : {}),
+        // 观测预算（D7：只告警不改行为）
+        observeBudgetTokens: config.observeBudgetTokens,
         maxParallelToolCalls: live.maxParallelToolCalls,
         maxReentries: live.maxReentries,
         streamIdleTimeoutMs: config.streamIdleTimeoutMs,
@@ -4830,8 +6128,7 @@ export default function apply(ctx: {
         protocolLevel: resolveProtocolLevel(config.protocolLevel, warning),
         protocolSections: sanitizeProtocolSections(config.protocolSections, warning),
         protocolAppend: config.protocolAppend,
-        // v0.4.0 工具面（P1/P2）：档位缺省 standard（对等优先，§16 决议 2）；nativeTools
-        // 缺省关（§15 默认文本）；strictAdmission 缺省关（R5，P6 再收紧）
+        // v0.5.0 工具面：reserved-only 默认（第三方工具透传）；profile 仅回退演练（已弃用）
         toolSurface: live.toolSurface,
         nativeTools: config.nativeTools === true,
         callCommand: config.callCommand !== false,
@@ -4900,6 +6197,15 @@ export default function apply(ctx: {
         ? headerCwd
         : (workingDirectory?.defaultDirectory !== undefined ? workingDirectory.defaultDirectory : undefined);
       driver.setSessionCwd(resolvedCwd);
+      // 0.5.0（S5 / §2.4 接缝 5）：systemPrompt.context 快照贡献——代码通道的唯一注入通道
+      //（不接管 loop 时无法在流内插消息），宿主 loop 把贡献渲染成 runtime-context 快照并
+      // supersede 旧快照（U10 探针面；服务缺席 = 静默跳过，标准通道走回灌不受影响）。
+      const systemPromptService = getService<{ context?(contribution: unknown): unknown }>(ctx, 'systemPrompt');
+      if (systemPromptService !== undefined && typeof systemPromptService.context === 'function') {
+        driver.setRuntimeContextPort((text: string) => {
+          systemPromptService.context!({ name: 'streamAgent.state', text });
+        });
+      }
       // F6 resume 停机核对：创建/恢复会话时检查"有意图无回执"；存在即置位停机
       // （不发请求、零注入、不自动重放）。resumeIntentPolicy: 'ignore' 可跳过（回退点）。
       if (intentsEnabled && intentFile !== undefined && config.resumeIntentPolicy !== 'ignore') {
@@ -4924,34 +6230,57 @@ export default function apply(ctx: {
   if (agents === undefined || typeof agents.setFactory !== 'function') {
     throw new Error('[stream-loop] ctx.agents.setFactory 不可用：无法接管 agent 创建（需要 dsh-agent 服务在位）');
   }
-  // S3 双 loop 具名诊断（0.3.0-beta.1）：setFactory 是全局唯一槽位，内建 agent-loop 未被
-  // 停用时宿主抛裸错 "an agent factory is already registered"。转换为 E_DOUBLE_LOOP：
-  // 带 profile 标识、冲突来源与处置建议——冲突必须具名失败，不 catch 后继续、不重试、
-  // 不靠装载顺序"碰巧"获胜（C2 单 loop 权威）。
+  // 0.5.0（§6.2）：loop 接管与让位——setFactory 全局单槽，占用即抛错。
+  //   takeoverOnConflict='degrade'（默认）：不接管，转 sidecar（控制栏状态与诊断可用，
+  //   上下文治理全部关闭）；'refuse'：抛出错误明确冲突。两种处置都不静默（兼容矩阵：
+  //   "宿主 + 另一 loop 插件 → 降级为 sidecar 并报冲突，无静默覆盖"）。
   const profileName = resolveProfileName(ctx);
   let detachFactory: (() => void) | undefined;
+  let degradedSidecar = false;
   try {
     detachFactory = agents.setFactory(factory);
   } catch (error) {
-    throw doubleLoopError(error, profileName);
+    if (config.takeoverOnConflict === 'refuse') {
+      throw doubleLoopError(error, profileName);
+    }
+    // degrade：让位为 sidecar。owner = 占位者（控制栏显示"未接管：已被 <X> 接管"）。
+    degradedSidecar = true;
+    const owner = resolveFactoryOwner(error, profileName);
+    markDegrade(owner);
+    warning(
+      `[stream-loop] loop 接管失败（takeoverOnConflict=degrade）：转 sidecar 模式——`
+      + `控制栏状态与诊断可用，上下文治理（压缩/摘要/度量）全部关闭。占位者=${owner}。`
+      + `原始错误：${detailString(error)}`,
+      error,
+    );
   }
-  // 接管事实登记：控制栏据此写"接管生效"或"未接管"
-  markTakeover(control.mode);
+  if (!degradedSidecar) {
+    // 接管事实登记：控制栏据此写"接管生效"或"未接管"；owner = 本插件（0.5.0 增字段）
+    markTakeover(`${control.channel}/${control.tier}`, 'stream-agent');
+  }
 
-  // v0.2.1 桌面控制页的宿主面：只暴露"读状态 / 切模式 / 切语言"三件事。
+  // 桌面控制页的宿主面：读状态 / 切通道 / 切档位 / 切预算 / 切语言（旧 setMode 保留为别名）。
   // UI 是独立子包（ui/），经同源 HTTP 路由调用本服务；服务不存在时 UI 降级为只读诊断。
   const controlStatus = (): Record<string, unknown> => {
     const live = resolveEffective();
     const persisted = readPersistedControl(config.stateDir);
     return {
       version: VERSION,
-      takeover: true,
-      mode: control.mode,
-      modeSource: control.modeSource,
-      modeLocked: control.modeSource === 'config' || control.modeSource === 'env',
+      takeover: !degradedSidecar,
+      takeoverOwner: takeover().owner,
+      degradedSidecar,
+      channel: control.channel,
+      channelSource: control.channelSource,
+      channelLocked: control.channelSource === 'config' || control.channelSource === 'env',
+      tier: control.tier,
+      tierSource: control.tierSource,
+      tierLocked: control.tierSource === 'config' || control.tierSource === 'env',
+      aliased: control.aliased,
+      legacyMode: control.legacyMode,
       lang: control.lang,
       langSource: control.langSource,
       langLocked: control.langSource === 'config' || control.langSource === 'env',
+      codeSource: codeSourceProbe,
       effective: {
         selfReadFeedback: live.selfReadFeedback,
         enableCode: live.enableCode === undefined ? false : live.enableCode,
@@ -4959,37 +6288,88 @@ export default function apply(ctx: {
         maxParallelToolCalls: live.maxParallelToolCalls,
         maxReentries: live.maxReentries,
         budgetTokens: live.budgetTokens ?? null,
+        surfacePolicy: live.surfacePolicy,
         toolSurface: live.toolSurface,
+        ...(currentDriverRef.driver?.runtimeStatus().effective
+          ?? { maxSteps: getTier(control.tier).values.maxSteps, maxInputTokens: getTier(control.tier).values.maxInputTokens }),
       },
+      // 0.5.0：运行时状态（本任务 N / 换基 / 重复取回 / 摘要段；控制栏底部状态行同源）
+      runtime: currentDriverRef.driver?.runtimeStatus() ?? null,
       // v0.4.2：运行时缓存口径（控制页"缓存命中"行；当前会话无活动驱动器时为 null，
       // 客户端隐藏该行——离线/mock 适配器没有缓存数据，不渲染成 0%）。
       cache: currentDriverRef.driver?.cacheStats() ?? null,
-      modes: publicModeCatalog(),
+      channels: publicChannelCatalog(),
+      tiers: publicTierCatalog(),
+      legacyModes: publicLegacyModeCatalog(),
       updatedAt: persisted.updatedAt ?? null,
       stateFile: control.file,
     };
   };
-  const applyMode = (next: string): { ok: boolean; code?: string; persisted?: boolean } => {
-    if (!isModeId(next)) return { ok: false, code: 'invalid-mode' };
-    if (control.modeSource === 'config' || control.modeSource === 'env') return { ok: false, code: 'locked' };
-    control.mode = next;
-    markTakeover(next);
+  const applyChannel = (next: string): { ok: boolean; code?: string; persisted?: boolean; detail?: string } => {
+    if (!isChannelId(next)) return { ok: false, code: 'invalid-channel' };
+    if (control.channelSource === 'config' || control.channelSource === 'env') return { ok: false, code: 'locked' };
+    control.channel = next;
+    control.channelSource = 'runtime';
+    // 会话内切换走驱动器（任务边界生效 + 计划性换基记账）；落盘供新会话继承
+    const driverResult = currentDriverRef.driver?.setChannel(next) ?? { ok: true };
+    let persisted = true;
     try {
-      writePersistedControl({ mode: control.mode, lang: control.lang }, config.stateDir);
-      control.modeSource = 'file';
-      return { ok: true, persisted: true };
+      writePersistedControl({ channel: control.channel, tier: control.tier, lang: control.lang }, config.stateDir);
+      control.channelSource = 'file';
     } catch (error) {
-      control.modeSource = 'runtime';
-      warning(`控制栏模式已在本进程生效，但落盘失败（重启后会回到旧值）：${control.file}`, error);
-      return { ok: true, persisted: false };
+      persisted = false;
+      control.channelSource = 'runtime';
+      warning(`控制栏通道已在本进程生效，但落盘失败（重启后会回到旧值）：${control.file}`, error);
     }
+    if (!driverResult.ok) {
+      return { ok: false, code: driverResult.code, detail: driverResult.detail, persisted };
+    }
+    if (!degradedSidecar) markTakeover(`${control.channel}/${control.tier}`, 'stream-agent');
+    return { ok: true, persisted };
+  };
+  const applyTier = (next: string): { ok: boolean; code?: string; persisted?: boolean } => {
+    if (!isTierId(next)) return { ok: false, code: 'invalid-tier' };
+    if (control.tierSource === 'config' || control.tierSource === 'env') return { ok: false, code: 'locked' };
+    control.tier = next;
+    control.tierSource = 'runtime';
+    const driverResult = currentDriverRef.driver?.setTier(next) ?? { ok: true };
+    let persisted = true;
+    try {
+      writePersistedControl({ channel: control.channel, tier: control.tier, lang: control.lang }, config.stateDir);
+      control.tierSource = 'file';
+    } catch (error) {
+      persisted = false;
+      control.tierSource = 'runtime';
+      warning(`控制栏档位已在本进程生效，但落盘失败（重启后会回到旧值）：${control.file}`, error);
+    }
+    if (!driverResult.ok) return { ok: false, code: driverResult.code, persisted };
+    if (!degradedSidecar) markTakeover(`${control.channel}/${control.tier}`, 'stream-agent');
+    return { ok: true, persisted };
+  };
+  const applyBudget = (budget: { maxSteps?: number; maxInputTokens?: number }): { ok: boolean; code?: string; detail?: string } => {
+    return currentDriverRef.driver?.setBudget(budget)
+      ?? { ok: false, code: 'no-driver', detail: '当前没有活动会话驱动器' };
+  };
+  const applyMode = (next: string): { ok: boolean; code?: string; detail?: string; persisted?: boolean; aliased?: boolean } => {
+    // 0.5.x 别名（0.6.0 移除）：旧模式值 → (channel, tier) 两路应用 + warn。
+    if (!isLegacyModeId(next)) return { ok: false, code: 'invalid-mode' };
+    if (control.channelSource === 'config' || control.channelSource === 'env'
+      || control.tierSource === 'config' || control.tierSource === 'env') {
+      return { ok: false, code: 'locked' };
+    }
+    const mapped = resolveLegacyMode(next);
+    warning(`[stream-loop] setMode("${next}") 是旧模式值，已按别名映射为 channel=${mapped.channel}/tier=${mapped.tier}（0.5.x 保留别名，0.6.0 移除）`);
+    const channelResult = applyChannel(mapped.channel);
+    if (!channelResult.ok) return { ...channelResult, aliased: true };
+    const tierResult = applyTier(mapped.tier);
+    return { ok: tierResult.ok, ...(tierResult.ok ? {} : { code: tierResult.code }), persisted: channelResult.persisted && tierResult.persisted, aliased: true };
   };
   const applyLang = (next: string): { ok: boolean; code?: string; persisted?: boolean } => {
     if (!isLang(next)) return { ok: false, code: 'invalid-lang' };
     if (control.langSource === 'config' || control.langSource === 'env') return { ok: false, code: 'locked' };
     control.lang = next;
     try {
-      writePersistedControl({ mode: control.mode, lang: control.lang }, config.stateDir);
+      writePersistedControl({ channel: control.channel, tier: control.tier, lang: control.lang }, config.stateDir);
       control.langSource = 'file';
       return { ok: true, persisted: true };
     } catch (error) {
@@ -5004,6 +6384,10 @@ export default function apply(ctx: {
     try {
       ctx.provide('streamAgentRuntime', {
         status: controlStatus,
+        // 0.5.0：三个新方法（§4.6 会话级落点）；setMode 保留为别名（0.6.0 移除）
+        setChannel: applyChannel,
+        setTier: applyTier,
+        setBudget: applyBudget,
         setMode: applyMode,
         setLang: applyLang,
       });
@@ -5013,10 +6397,10 @@ export default function apply(ctx: {
   }
 
   if (config.announceTakeover === true) {
-    const codeState = codeExecutor === undefined
-      ? 'code=off'
-      : (resolveEffective().enableCode === true ? 'code=on(opt-in)' : 'code=off(default,K1)');
-    console.error(`[stream-loop] TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch) · mode=${control.mode} (${control.modeSource}) · ${codeState} · profile=${profileName}`);
+    const codeState = degradedSidecar
+      ? 'loop=sidecar(degraded)'
+      : `channel=${control.channel} source=${codeSourceProbe ?? '-'} tier=${control.tier}`;
+    console.error(`[stream-loop] ${degradedSidecar ? 'TAKEOVER-DEGRADED: sidecar mode（另一 loop 插件已接管）' : 'TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch)'} · ${codeState} · executor=${codeExecutor === undefined ? 'native' : 'bridge-available'} · profile=${profileName}`);
   }
 
   // 会话投影注册（桌面端硬依赖，内建 agent-loop 在 Service.init 注册——dsh-agent-loop rc.3:50110）：
@@ -5093,6 +6477,19 @@ function doubleLoopError(original: unknown, profile: string): Error {
   );
   error.name = 'E_DOUBLE_LOOP';
   return error;
+}
+
+/**
+ * 0.5.0（§6.2）：从 setFactory 冲突里解析占位者（控制栏"未接管：已被 <X> 接管"）。
+ * 宿主裸错通常不含占位者名字——按可读性降级：错误消息内提到的已知 loop 名 → 该名；
+ * 否则 profile 名；再否则 unknown。
+ */
+function resolveFactoryOwner(error: unknown, profile: string): string {
+  const text = detailString(error);
+  for (const candidate of ['dsh-agent-loop', 'agent-loop', 'dsh-stream-agent', 'stream-agent'] as const) {
+    if (text.toLowerCase().includes(candidate)) return candidate;
+  }
+  return profile !== '' && profile !== 'unknown' ? `profile:${profile}` : 'unknown';
 }
 
 /** 诊断追踪（STREAM_LOOP_DEBUG=1 时向 stderr 打里程碑；生产默认关闭，不产生噪音）。 */

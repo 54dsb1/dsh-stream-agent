@@ -6,6 +6,73 @@
 > 内容统一编号为 `0.4.0`**（本条目）。0.4.3.2 与 0.4.0 的源码等价，唯一差异是版本常量与
 > 本段说明。stable 线上一次发布是 `0.3.3`。
 
+## [0.5.0] - 2026-11-22
+
+**0.5.0：单插件双通道与正式版。** 一个插件包，一个装载形态；原设想拆两包的两部分能力
+改为同一控制栏上的两个区块（执行通道 × 上下文档位）。发布判据：架构定稿、有对照数据、
+可逐项回退（数据面见 eval/FOUR-ARM-2026-11-22.md；真机臂完成前不给出省 token 结论）。
+
+### Breaking
+
+- **配置键破坏性变更**：四档模式（balanced / lean / compat / power）删除，拆为两轴——
+  `channel`（standard | code）× `tier`（light | standard | deep）。旧 `mode` 值走
+  LEGACY_MODE_ALIAS 别名映射（读旧配置输出一行 warn），保留一个 minor，**0.6.0 移除**；
+  control.json 迁移为 {channel, tier, lang}（schema 2），旧 mode 字段按反向别名保留一个
+  minor 供回滚。
+- **`toolSurface: 'off'` 档删除**（D2 修复）：它曾把第三方工具砍到完全不可达；工具面策略
+  走 `surfacePolicy`（默认 `reserved-only` = 只管 tf-* 前缀、其余透传——对第三方工具
+  零影响）。`profile` 档（0.4.x 过滤行为）已弃用，仅回退演练保留；`CORE_TOOLS` 白名单
+  不再随默认档位生效（D3 修复）。
+- **默认值变更**：`readFeedbackLimit` 缺省 8000 → **0**（回灌侧不截断；读取侧
+  `maxReadChars` 32k 已控住，§7.5 双旋钮）。`budgetTokens` 由控制变量降为**观测项**
+  （D7：cacheRead 不再按 1:1 计入控制；预算治理走 maxSteps / maxInputTokens 双旋钮）。
+- **预算模型**：预算基数从会话累计改为**任务起点**（D1 修复：同会话第二个任务不再开局
+  即 final-only）。
+
+### Added
+
+- **单插件双通道（P2）**：执行通道 standard / code；代码通道三来源判定（preset 探针 /
+  bridge / none，只按执行器实现判定不按 preset id）；preset 来源完全让位（不注册工具、
+  协议段 0 字符、不解析输出、不拦截 final——8 项 PTC 能力逐项可验）；bridge 来源受限
+  窄桥（仅 tf-code，协议段约 200 字符）；来源皆无 → 拒绝进入并回退标准通道（不静默降级）。
+- **上下文档位（P1）**：light / standard / deep 三档只改数值（maxSteps 16/24/40、
+  maxInputTokens 12k/20k/48k、压缩强度、取回预算 12k/24k/48k、keepRecent 12/30/60、
+  摘要上限 8k/16k/32k）；控制栏两区块渲染；任务级预算指令 `[tf-budget: 8steps/20k]`
+  与结构化 source.tfBudget（装配显式上限不可逾越）。
+- **双旋钮预算（P1，§4.5）**：`maxSteps`（N 上限，触顶走收束期）+ `maxInputTokens`
+  （C 上限，触顶触发压缩）；下限保护（< 3×前缀估算拒绝启动并给出最小值，R11）；
+  运行时 `setChannel` / `setTier` / `setBudget`（`setMode` 保留为别名）。
+- **确定性压缩（P3，§7.6）**：kernel/compaction.ts（每条一行、头尾保留、keepRecent、
+  maxSummaryChars 收敛、不调模型）；`maxInputTokens` 触顶 → dropAppendHead + 摘要 +
+  原文句柄化 + `request:N` 取回别名 + 计划性换基记账。
+- **效果压缩与语义状态（P3，§5.6）**：`[applied pN]` 折叠行（回灌/压缩两个合法改写点；
+  effectElisionKeepRecent=3）；`[tf-stream:state]` 一行语义状态摘要（标准通道回灌、
+  代码通道 S5 快照）；`[unchanged]` / `[seen]` 跨回合工作集。
+- **取回策略（P5，§7.3/§7.5）**：已投递 span 账本（命中未变 → `[unchanged]` 一行；
+  部分重叠只发新增——D5 修复）；read 行锚索引（每 200 行 + 顶层符号 + 未投递区间显式
+  列出——D4 修复；索引超 2k 只给符号名，R9）；`peekBudgetChars` 回合取回预算
+  （触顶 `[budget]` 一行，不静默继续）；协议新增 peek 段（取回纪律，成本模型依据）。
+- **前缀策略（P4，§8）**：三类处置判定表——planned-rebase（正常路径，记账 + 模型可见）
+  / append-drift 受限换基（§8.4 成本判据 rebaseBudgetRatio）/ stable-drift 始终 fail；
+  `prefixPolicy` auto/rebase/fail、maxRebasesPerTurn/Session 限流；`cache-reset`
+  台账事件（cause / contextTokens / estimatedColdCost）。
+- **接管让位（§6.2）**：`takeoverOnConflict` degrade（默认，转 sidecar，owner 具名显示）
+  / refuse；takeover-registry 增 owner 字段。
+- **文档与法务（P6）**：PROTOCOL-v1.md（自有规范冻结）；docs/channel-matrix.md、
+  docs/upstream-delta.md、docs/porting-matrix.md；NOTICE（thinkflow 派生 / PTC 依赖分栏）。
+- **评测（P7）**：eval/tools/run-four-arm.mjs 四臂离线结构跑批 + eval/FOUR-ARM-2026-11-22.md
+  报表（H1/H2 结论待真机臂）。
+
+### Fixed
+
+- **D1**：预算基数改任务起点（同会话多任务不再累积误杀）。
+- **D2**：`compat` 档不再关闭 tf-call/第三方工具（档位删除，reserved-only 透传）。
+- **D3**：`lean` 档不再把工具面裁到 7 项白名单（同上）。
+- **D4**：read 截断不再取头部（行锚索引替代——头部截断策略本身制造取回）。
+- **D5**：取回不再对同一区间重复付费（span 账本去重）。
+- **D6**：readFeedbackLimit 双旋钮拆分（读取侧/回灌侧各自独立）。
+- **D7**：cacheRead 不再按 1:1 计入预算控制（缓存命中不再加速降级）。
+
 ## [0.4.0] - 2026-11-22
 
 **首个 stable 0.4 发布：在 0.4.3.2 的基础上回流 0.3.3 的三项真机修复。**
