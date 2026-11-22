@@ -1,4 +1,4 @@
-// test/host-conformance.test.ts —— v0.3.2：宿主一致性回归（历史加载失败 + UI 卡住两案）
+// test/host-conformance.test.ts —— v0.4.1-beta.2：宿主一致性回归（历史加载失败 + UI 卡住两案；与 0.3.2 同一套补丁）
 //
 // 两起真机事故同源：插件的 duck-type 面缺了宿主侧的形状/事件契约——
 // ① 会话日志：assistant/message 的 source 只写 `{kind:'model'}`，缺非空 provider/model。
@@ -14,8 +14,12 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { zstdCompressSync, zstdDecompressSync } from 'node:zlib';
+import { randomUUID } from 'node:crypto';
 
 import { SingleStreamDriver, normalizeStreamShim, createSessionEventWriter, StreamLoopAgent } from '../src/entry/loop.ts';
 import type { ToolBatchInputLike, ToolBatchResultLike, ModelSourceInfo } from '../src/entry/loop.ts';
@@ -414,5 +418,208 @@ describe('HC5. agent.inject（dsh-user-approval setPolicy 的依赖面）', () =
     const agent = new StreamLoopAgent({ id: 'hc5c-agent', session, driver, modelSelection: { provider: 'mock-provider', model: 'mock-model' } });
     await agent.dispose();
     assert.throws(() => agent.inject({ role: 'user', content: [{ type: 'text', text: 'late' }] }), /inject after dispose/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HC6–HC8（0.4.1-beta.2 升级：宿主一致性面，设计见 docs/upgrade-v0.4.1-beta-host-conformance.md）
+// ---------------------------------------------------------------------------
+
+/** 宿主 known-event 清单本地镜像（dsh-session 0.2.2-rc.1 KNOWN_SESSION_EVENT_TYPES，62 项）。 */
+const HOST_KNOWN_EVENT_TYPES = new Set([
+  'agent-preset/selected', 'agent/inbox/spliced', 'approval/asked', 'approval/decided', 'approval/policy',
+  'assistant/attempt', 'assistant/message', 'command/done', 'command/run', 'compaction/end', 'compaction/prune',
+  'compaction/start', 'compaction/summary', 'deliverables/presented', 'developer/message', 'feedback/message-delete',
+  'feedback/message-put', 'feedback/record', 'goal/change', 'hook/invoked', 'hook/result', 'image/offload',
+  'job/registered', 'job/settled', 'llm/retry', 'llm/retry-started', 'model/selection', 'permission/preset',
+  'plan/mode', 'request/context', 'request/header', 'sandbox/mode', 'schedule/change',
+  'session-log-deepseek/delivery-accepted', 'session/end-seed', 'session/title', 'session/title-llm-request',
+  'step/end', 'step/start', 'subagent/catalog', 'subagent/descriptor', 'subagent/model-selection-policy',
+  'system/message', 'team/member', 'team/message/delivered', 'team/message/queued', 'team/task', 'todo/write',
+  'tool-workflow/agent-end', 'tool-workflow/agent-start', 'tool-workflow/run-end', 'tool-workflow/run-start',
+  'tool/call', 'tool/ptc-dispatch', 'tool/ptc-dispatch-start', 'tool/result', 'turn/end', 'turn/start',
+  'user/message', 'web/deepseek-search-llm-request', 'working-directory/change', 'workspace/changes',
+]);
+
+/** 插件记录语法（dsh-session PLUGIN_RECORD_TYPE 的本地镜像；plugin record 必须 ignorable）。 */
+const PLUGIN_RECORD_TYPE = /^plugin:[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/u;
+
+/** 插件全部 ledger 记录类型（src/entry/loop.ts TfAgentRecordType + beta 新增 surface）。 */
+const PLUGIN_RECORD_TYPES = [
+  'plugin:tf-agent/command', 'plugin:tf-agent/final', 'plugin:tf-agent/fault', 'plugin:tf-agent/step',
+  'plugin:tf-agent/plan', 'plugin:tf-agent/intent', 'plugin:tf-agent/surface',
+];
+
+describe('HC6. 会话事件类型清单（未知/拼错类型 = 宿主拒整条日志）', () => {
+  it('HC6a. 驱动器写出的每类事件都在宿主 known-event 集里，plugin record 语法合法', async () => {
+    const session = createFakeSession();
+    const model = createMockModel({ scenarios: [loadScenario('5-file-basic.json')], provider: 'mock-provider' });
+    let driverRef: SingleStreamDriver | undefined;
+    const driver = new SingleStreamDriver({
+      stream: (options) => normalizeStreamShim(model.adapter.stream({ provider: options.provider, model: options.model, messages: options.messages, signal: options.signal })),
+      executeTools: createHostLikeTools(session),
+      events: createSessionEventWriter(session, () => driverRef!.modelSource()),
+      onToolSettled: () => model.notifyToolResult(),
+    }, { provider: 'mock-provider', model: 'mock-model', streamIdleTimeoutMs: 30_000 });
+    driverRef = driver;
+    driver.pushUserTask('请写五个文件：f1 到 f5。');
+    await driver.runTurn();
+    const written = new Set(session.events.map((e) => e.type));
+    assert.ok(written.size >= 6, `应覆盖生命周期全类型，实际 ${written.size} 类：${[...written].join(',')}`);
+    for (const type of written) {
+      assert.ok(HOST_KNOWN_EVENT_TYPES.has(type), `驱动器写出未知事件类型 "${type}"（宿主读取时拒整条日志）`);
+    }
+    // 消息形状规则推广到全事件流（不只 assistant 消息）
+    assertMessageEventShapes(session.events);
+    // 插件记录类型：语法必须匹配宿主 PLUGIN_RECORD_TYPE（书写错 = appendPluginRecord 拒收）
+    for (const record of PLUGIN_RECORD_TYPES) {
+      assert.ok(PLUGIN_RECORD_TYPE.test(record), `插件记录类型 "${record}" 不匹配宿主 plugin record 语法`);
+    }
+  });
+
+  it('HC6b. 类型清单自身健全：镜像不含 plugin:*（宿主 known 集只收 known-event），交集为空', () => {
+    for (const type of HOST_KNOWN_EVENT_TYPES) {
+      assert.ok(!type.startsWith('plugin:'), `宿主 known 集不应含 plugin:*（ignorable 记录走 plugin record 通道）：${type}`);
+      assert.ok(!HOST_KNOWN_EVENT_TYPES.has(type) || type.length > 0);
+      assert.match(type, /^[a-z][a-z0-9-]*(\/[a-z0-9][a-z0-9._-]*)*$/u, `镜像类型名 "${type}" 形态非法`);
+    }
+    assert.equal(HOST_KNOWN_EVENT_TYPES.size, 62, 'rc.1 known-event 清单应为 62 项（宿主升级时显式更新此镜像）');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HC7/HC8：修复脚本集成回归（fixture 驱动 CLI 全链路；脚本是用户数据写入者，必须有回归）
+// ---------------------------------------------------------------------------
+
+interface FixtureEvent {
+  type: string;
+  seq: number;
+  time: number;
+  data: Record<string, unknown>;
+  surfaceOp?: string;
+  sourceEventSeqs?: number[];
+}
+
+/** 最小完整 v4 日志（工具生命周期三段齐全），bareSource=true 时 assistant 消息缺 provider/model（0.3.2 事故形状）。 */
+function buildFixtureRows(id: string, bareSource: boolean): Array<Record<string, unknown>> {
+  const time = 1_792_000_000_000;
+  const source = bareSource ? { kind: 'model' } : { kind: 'model', provider: 'deepseek-account', model: 'deepseek-flash' };
+  const header = { type: 'session', version: 4, id, createdAt: time, cwd: '.', isSeeded: false, delegationDepth: 0, agentPreset: 'standard' };
+  const events: FixtureEvent[] = [
+    { type: 'user/message', seq: 0, time, data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'fixture task' }] }, surfaceOp: 'append' },
+    { type: 'turn/start', seq: 1, time, data: { turn: 1 } },
+    { type: 'step/start', seq: 2, time, data: { turn: 1, step: 1 } },
+    { type: 'assistant/message', seq: 3, time, data: { turn: 1, step: 1, message: { id: 'a1', role: 'assistant', content: [{ type: 'tool-call', id: 'g1', name: 'glob', arguments: '{"pattern":"**/*"}' }], source }, stream: [] }, surfaceOp: 'append' },
+    { type: 'tool/call', seq: 4, time, data: { turn: 1, step: 1, callId: 'g1', name: 'glob', arguments: '{"pattern":"**/*"}' } },
+    { type: 'tool/result', seq: 5, time, data: { turn: 1, step: 1, message: { id: 't1', role: 'tool', source: { kind: 'tool', callId: 'g1' }, toolCallId: 'g1', content: [{ type: 'text', text: 'ok' }] } }, surfaceOp: 'append', sourceEventSeqs: [4] },
+    { type: 'assistant/message', seq: 6, time, data: { turn: 1, step: 1, message: { id: 'a2', role: 'assistant', content: [{ type: 'text', text: 'done' }], source }, stream: [] }, surfaceOp: 'append' },
+    { type: 'step/end', seq: 7, time, data: { turn: 1, step: 1 } },
+    { type: 'turn/end', seq: 8, time, data: { turn: 1, reason: { kind: 'completed' } } },
+  ];
+  return [header, ...events];
+}
+
+/** 建一个临时 dsh 状态根：<root>/sessions/<project>/session-<id>/session.v4.jsonl.zstd。 */
+function createFixtureRoot(sessionId: string, bareSource: boolean): { root: string; file: string } {
+  const root = mkdtempSync(join(tmpdir(), `tf-hc7-${bareSource ? 'broken' : 'healthy'}-`));
+  const project = 'fixture-project';
+  const dir = join(root, 'sessions', project, sessionId);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(
+    buildFixtureRows(sessionId, bareSource).map((row) => JSON.stringify(row)).join('\n') + '\n',
+    'utf8',
+  )));
+  return { root, file: join(dir, 'session.v4.jsonl.zstd') };
+}
+
+function runRepair(root: string, sessionId: string, write: boolean): { status: number; stdout: string } {
+  const result = spawnSync(process.execPath, [
+    join(import.meta.dirname, '..', 'scripts', 'repair-session-logs.mjs'),
+    ...(write ? ['--write'] : []),
+    '--root', root,
+    '--session', sessionId,
+  ], {
+    encoding: 'utf8',
+    // 集成回归的契约 = 脚本本地复核（形状 + 生命周期）；宿主 v3-to-v4 关系校验要求
+    // request/header 等宿主写事件，合成 fixture 不覆盖（HC8 用 validateStoredEvents
+    // 单独走读取侧权威规则）——显式剥离 DSH_HOST_MODULES 保证测试不随宿主环境漂移。
+    env: { ...process.env, DSH_HOST_MODULES: '' },
+  });
+  return { status: result.status ?? -1, stdout: `${result.stdout ?? ''}\n${result.stderr ?? ''}` };
+}
+
+describe('HC7. 修复脚本集成回归（三类 corrupt 的写入者必须有回归）', () => {
+  it('HC7a. dry-run：报告损坏与修复条数，不落盘（原文件字节不变）', () => {
+    const { root, file } = createFixtureRoot(`session-${randomUUID()}`, true);
+    try {
+      const before = readFileSync(file);
+      const run = runRepair(root, 'session-', false);
+      assert.equal(run.status, 0, `CLI 退出码非 0：${run.stdout}`);
+      assert.match(run.stdout, /\[fix\]/, '损坏 fixture 必须被判定为需修复');
+      assert.match(run.stdout, /补齐 2 条 model source/, '两条 bare source 的 assistant/message 都要被报告');
+      assert.match(run.stdout, /dry-run 未写入/, 'dry-run 不得落盘');
+      assert.doesNotMatch(run.stdout, /\[fail\]/, 'dry-run 前的本地复核必须通过');
+      assert.deepEqual(readFileSync(file), before, 'dry-run 后原文件必须逐字节不变');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('HC7b. --write：备份出现、修复后日志过本地形状复核、完好 fixture 不被触碰', () => {
+    const broken = createFixtureRoot(`session-${randomUUID()}`, true);
+    const healthy = createFixtureRoot(`session-${randomUUID()}`, false);
+    try {
+      const healthyBefore = readFileSync(healthy.file);
+      const run = runRepair(broken.root, 'session-', true);
+      assert.equal(run.status, 0, `CLI 退出码非 0：${run.stdout}`);
+      assert.match(run.stdout, /已写入 1 个/, '损坏 fixture 必须落盘（汇总行计数）');
+      // 备份纪律：.bak-<时间戳> 必须出现在同一目录
+      const sessionDir = broken.file.slice(0, broken.file.replace(/\\/g, '/').lastIndexOf('/'));
+      const backups = readdirSync(sessionDir).filter((n) => n.startsWith('session.v4.jsonl.zstd.bak-'));
+      assert.equal(backups.length, 1, '写前必须留一个备份');
+      // 修复后形状：source 带缺省 provider/model，且过本地复核（脚本的 [fail] 不出现 = 复核过）
+      assert.doesNotMatch(run.stdout, /\[fail\]/, '修复后本地复核必须通过');
+      const repaired = zstdDecompressSync(readFileSync(broken.file)).toString('utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) as Array<{ type: string; data: { message?: { source?: { kind?: string; provider?: string; model?: string } } } }>;
+      const sources = repaired.filter((r) => r.type === 'assistant/message').map((r) => r.data.message?.source);
+      assert.ok(sources.length >= 2);
+      for (const source of sources) {
+        assert.equal(source?.kind, 'model');
+        assert.equal(source?.provider, 'deepseek-account');
+        assert.equal(source?.model, 'deepseek-flash');
+      }
+      // 完好会话一个字节不动（--write 也不改完好日志）
+      const runHealthy = runRepair(healthy.root, 'session-', true);
+      assert.equal(runHealthy.status, 0);
+      assert.match(runHealthy.stdout, /\[ok\]/, '完好 fixture 必须被判为无需修复');
+      assert.match(runHealthy.stdout, /model source 完好/, '完好 source 不覆盖');
+      assert.deepEqual(readFileSync(healthy.file), healthyBefore, '完好会话一个字节不动');
+    } finally {
+      rmSync(broken.root, { recursive: true, force: true });
+      rmSync(healthy.root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('HC8. 宿主真校验器可选通道（DSH_HOST_MODULES 在位时启用）', () => {
+  const hostModules = process.env.DSH_HOST_MODULES;
+  const hostOk = hostModules !== undefined && hostModules.trim() !== '' && existsSync(hostModules.trim());
+  const options = hostOk ? {} : { skip: 'DSH_HOST_MODULES 未设置（CI 纯离线；本地镜像已是 CI 权威，本通道为真机增强）' };
+
+  it('HC8. 修复产物过宿主 validateStoredEvents（读取侧权威规则）', { skip: hostOk ? false : 'DSH_HOST_MODULES 未设置（CI 纯离线；本地镜像已是 CI 权威，本通道为真机增强）' }, async () => {
+    const base = hostModules!.trim().replace(/\\/g, '/').replace(/\/$/, '');
+    const persistMod = await import(`file:///${base}/dsh-session-persistence/lib/index.js`) as { validateStoredEvents(meta: { id: string }, events: unknown[], location?: unknown): unknown };
+    const broken = createFixtureRoot(`session-${randomUUID()}`, true);
+    try {
+      const run = runRepair(broken.root, 'session-', true);
+      assert.equal(run.status, 0, run.stdout);
+      const rows = zstdDecompressSync(readFileSync(broken.file)).toString('utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) as Array<{ type: string; data: Record<string, unknown>; id?: string }>;
+      const header = rows[0] as unknown as { id: string };
+      // 先证伪：bare source 的事故形状必须被宿主拒绝；再证修复产物通过
+      const bare = buildFixtureRows(header.id, true).slice(1) as unknown[];
+      assert.throws(() => persistMod.validateStoredEvents({ id: header.id }, structuredClone(bare), undefined), /model source/, '宿主校验器必须拒绝事故形状');
+      persistMod.validateStoredEvents({ id: header.id }, structuredClone(rows.slice(1)), undefined);
+    } finally {
+      rmSync(broken.root, { recursive: true, force: true });
+    }
   });
 });

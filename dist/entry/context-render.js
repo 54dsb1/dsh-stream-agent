@@ -9,6 +9,10 @@
 //      逐会话断言首条消息（稳定前缀 system）逐字节不变——凡有逐请求动态字段漏进稳定前缀
 //      （O4 破坏），第二次请求必在此被拒；违反 → 内核 PrefixBrokenError 原样上抛（fail-closed，
 //      拒绝发送，宁可任务失败不烧缓存）；逐请求落 prefix 台账（08 号 prefix_hash 序列数据源）。
+//      v0.4.3（P0-6②）第二见证升级为**整条序列**：保留上一请求全文，逐请求落首差异位
+//      （firstDiffIndex）与长度收缩（shrunk）事实——只记账不 fail-closed（wire 层无法区分
+//      段边界的合法收缩与改写；强制收口在驱动器 #lastRequest 承诺前缀断言，那里有显式基线
+//      重置通道）。旧形态"只看 messages[0]"的两个盲区（升级清单 §2.7）由此补齐可观测面。
 //   2. freezeDynamics（O4）出口：内核 ContextRenderer 的动态冻结语义对非 loop 装配路径
 //      开放（volatile-tail / turn-freeze；稳定前缀结构性禁入）。
 // fail-open（红线 5）：断言器自身异常 → 放行 + ledger 记 preflight_error；
@@ -57,8 +61,8 @@ export const inject = [];
 export default function apply(ctx             , config                      = {})                      {
   const warn = makeWarn(ctx, 'context-render');
   const faults = new EntryLedger();
-  /** 会话 → 首请求快照（首条消息 = 稳定前缀 system；逐字节冻结）。 */
-  const sessions = new Map                                                    ();
+  /** 会话 → 上一请求快照（首条消息逐字节冻结；v0.4.3 起保留整条序列做第二见证）。 */
+  const sessions = new Map                                                                           ();
   const freezeRenderer = new ContextRenderer({
     system: config.system ?? '（stream-agent context-render：动态冻结载体，稳定前缀无业务内容）',
     protocol: '', toolSchemas: '', invariants: '',
@@ -68,11 +72,31 @@ export default function apply(ctx             , config                      = {}
     if (messages.length === 0) throw new PrefixBrokenError(0, '非空消息序列', '空序列', '：preflight 拒绝空请求');
     const first = messages[0];
     const state = sessions.get(sessionId);
+    // v0.4.3（P0-6②）：整条序列第二见证的事实采集——与上一请求逐条 diff，首条断言之外
+    // 的事实（首差异位 / 长度收缩）全部落台账。fail-closed 只守首条：wire 层无法区分
+    // 段边界的合法收缩（dropAppendHead 重置基线）与改写，强制收口在驱动器的
+    // #lastRequest 承诺前缀断言（那里有显式基线重置通道）；本见证的职责是"逐请求可对账的
+    // 完整 diff 事实 + 独立于驱动器的首条守卫"。
+    let firstDiffIndex = -1;
+    let shrunk = false;
+    if (state !== undefined) {
+      const n = Math.min(state.last.length, messages.length);
+      for (let i = 0; i < n; i++) {
+        const p = state.last[i] ;
+        const q = messages[i] ;
+        if (p.role !== q.role || p.content !== q.content) {
+          firstDiffIndex = i;
+          break;
+        }
+      }
+      shrunk = messages.length < state.last.length;
+    }
     if (state === undefined) {
-      sessions.set(sessionId, { first, requests: 1 });
+      sessions.set(sessionId, { first, last: [...messages], requests: 1 });
     } else {
       // O6 fail-closed：稳定前缀逐字节断言（内核校验器原样使用，不静默修复）
       assertPrefixStable([state.first], [first]);
+      state.last = [...messages];
       state.requests += 1;
     }
     const stableHash = renderHash([first]);
@@ -83,6 +107,8 @@ export default function apply(ctx             , config                      = {}
       stableHash,
       fullHash,
       messages: messages.length,
+      // v0.4.3：整条序列 diff 事实（首请求两值皆空——无上一请求可比）
+      ...(state === undefined ? {} : { firstDiffIndex, shrunk }),
     });
     return { request: state?.requests ?? 1, stableHash, fullHash };
   };

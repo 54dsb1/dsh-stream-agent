@@ -56,7 +56,7 @@ for (const file of files) {
 }
 
 // 冒烟：产物必须能作为 ESM 加载（kernel 零依赖；entry 动态 import 有 try/catch 包裹）
-for (const entry of ['dist/kernel/state.js', 'dist/kernel/obs.js', 'dist/kernel/parser.js', 'dist/kernel/gate.js', 'dist/kernel/render.js', 'dist/entry/mock-provider.js', 'dist/entry/loop.js', 'dist/entry/adapter-kit.js', 'dist/entry/state-handle.js', 'dist/entry/obs-broker.js', 'dist/entry/action-gate.js', 'dist/entry/context-render.js', 'dist/entry/eval-probe.js', 'dist/kernel/modes.js', 'dist/kernel/control-bar.js', 'dist/entry/control-state.js', 'dist/entry/control-bar.js', 'dist/entry/control-session.js', 'dist/entry/control-bar-cli.js', 'dist/version.js']) {
+for (const entry of ['dist/kernel/state.js', 'dist/kernel/obs.js', 'dist/kernel/parser.js', 'dist/kernel/gate.js', 'dist/kernel/render.js', 'dist/kernel/protocol.js', 'dist/entry/mock-provider.js', 'dist/entry/loop.js', 'dist/entry/adapter-kit.js', 'dist/entry/state-handle.js', 'dist/entry/obs-broker.js', 'dist/entry/action-gate.js', 'dist/entry/context-render.js', 'dist/entry/eval-probe.js', 'dist/kernel/modes.js', 'dist/kernel/control-bar.js', 'dist/entry/control-state.js', 'dist/entry/control-bar.js', 'dist/entry/control-session.js', 'dist/entry/control-bar-cli.js', 'dist/version.js']) {
   try {
     await import(pathToFileURL(join(pkgRoot, entry)).href);
     console.log(`[build] smoke import OK: ${entry}`);

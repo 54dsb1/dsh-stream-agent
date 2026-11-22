@@ -129,9 +129,17 @@ describe('F5：驱动器 E2E', () => {
       assert.ok(req2.includes('[a2] 生成 summary.md（未验证）'), 'a2 应标未验证');
       assert.ok(req2.includes('tf-final 过早'), '未验证的 a2 应拦截过早 final');
 
-      // 任务收敛后不再有请求 3；即使有，也不重复全量计划
+      // 任务收敛后不再有请求 3；即使有，也不重复**新注入**全量计划——
+      // v0.4.2 起 plan 块转正进追加区：请求 3 里"出现"旧计划块是转正历史（缓存读），
+      // 不是新的注入；验证差分（plan-diff）按差分语义正常出现（a2 在请求 2 验证过）。
       const req3 = h.wireRequests[2]?.contentTexts.join('\n') ?? '';
-      assert.ok(!req3.includes('[tf-stream:plan v1]'), `请求 3 不得重复全量计划：${req3.slice(0, 400)}`);
+      if (req3 !== '') {
+        assert.equal(
+          (req3.match(/\[tf-stream:plan v1\]/g) ?? []).length,
+          1,
+          `请求 3 的计划全量块只允许来自转正历史（出现一次，不重复注入）：${req3.slice(0, 400)}`,
+        );
+      }
 
       // 台账：plan 与 plan-accept 各有记录
       const records = h.driver.snapshot().records;

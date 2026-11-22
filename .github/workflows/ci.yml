@@ -22,7 +22,7 @@ jobs:
       - name: Build
         run: npm run build
 
-      # 装配一致性（R2 四项）：entry 集 / inject / 装载顺序 / README 命令表与数字
+      # 装配一致性（6 项）：entry 集 / inject / 装载顺序 / README / 命令表 ≤14 / preset↔矩阵
       - name: 装配一致性
         run: npm run check
 

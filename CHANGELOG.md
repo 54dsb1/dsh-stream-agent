@@ -2,310 +2,451 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.3.3] - 2026-11-21
+> **编号说明**：`0.4.0-beta.1 … 0.4.3.2` 是 artifacts 研发线的内部编号；**stable 线对这些
+> 内容统一编号为 `0.4.0`**（本条目）。0.4.3.2 与 0.4.0 的源码等价，唯一差异是版本常量与
+> 本段说明。stable 线上一次发布是 `0.3.3`。
 
-**畸形/通配闭合标签泄漏修复 + 缓存命中结构性修复 + 解析器容错（三批次合一发布）。**
-真机取证 2026-11-20/21 桌面端 DeepSeek-V4.1 会话；批次明细见下。
+## [0.4.0] - 2026-11-22
 
-### Fixed（协议残片泄漏进桌面端正文 + 纠错信号缺失）
+**首个 stable 0.4 发布：在 0.4.3.2 的基础上回流 0.3.3 的三项真机修复。**
+0.4.0 自 0.3.1 分叉，0.3.2/0.3.3 的收束改造、读注入预算、正文闭合容错未回流——真机
+表现与 0.3.x 同症状（13 步任务中途 blocked、桌面端只剩最后一句 prose、`</tf-*>` 漏进正文）。
+本版把三项修复语义移植进 0.4 能力面（`426+` 行 loop、`68+` 行 parser），并以 0.3.3 的
+19 个探针原样验收（`test/v040-closeout.test.ts` 10 + `test/v040-wildcard-closer.test.ts` 9）。
 
-**现象**：模型把协议通配当成闭合标签输出 `</tf-*>`——该残片原样落进 assistant 正文，
-桌面端对话区出现裸的 `</tf-*>`（同一会话内出现两次）；模型全程没有收到任何纠错信号，
-重复输出同一错形态，回合无有效命令、无 tf-final，无产出收场。
+### Added
 
-**根因（两层叠加）**：
-
-- **parser**：0.3.1 的孤立闭合标签治理只覆盖「合法闭合形态」（`</tf-[a-z0-9-]*\s*>`）与
-  「未终止的闭合前缀」两种，`probeTag` 对其余 `</tf…` 变体落到 `return 'prose'` 兜底——
-  通配 `</tf-*>`（`*` 不在闭合标签名字符集内）与带属性的 `</tf-write path="x">`
-  全数漏网，作为 prose 透传进桌面端正文。
-- **loop**：malformed 一律 fail-soft 只记台账（`plugin:tf-agent/fault`）、无注入——
-  即便残片被判 malformed，模型也拿不到纠错信号（真机两次出现同一错误即为证据）。
-
-**修复**：
-
-- `probeTag`：`</tf-` 紧跟非空白且引号感知存在 '>' 的 token 一律判 `close-tag`
-  （`scanHeaderClose` 与消费侧同函数同切片，端界构造性一致——属性值含 '>' 如
-  `</tf-write cmd="a>b">` 不会被截半再漏）。判别式带 `\S` 保住 0.3.1 既有语义：
-  正文里提到 `</tf`（后跟空白、无 '>'）仍按 prose 透传，HTML 闭合标签不受影响。
-  runaway 防线：>200 字符仍无 '>' 按 runaway 残片记账丢弃（与 DSML 同纪律），不无限缓冲。
-- `closeTagName`：名字符集纳入 `*`（通配残片台账记 `stray-close-tag:tf-*`，取证更准）。
-- `loop`：第一次 `stray-close-tag` 挂一条定向纠错注入（`malformedCloserNudge`，本回合
-  首个非 final-only 请求携带，挂块即成为重入事由）——点名残片原文、给出配对/自闭合两种
-  合法形态与 tf-final 收束方式；同会话只注入一次（token 纪律），台账逐次如实记录
-  （`malformed-closer-guidance`）。
-
-**回归基线**：既有 318 个测试语义零破坏；新增 9 个测试
-（`test/v033-wildcard-closer.test.ts`：parser 事件级 6 + 驱动器端到端 2 + 文案 1）。
-
-### Fixed（缓存命中结构性修复 + 解析器容错 —— 真机 `session-3d4caf01`/`ec100f8a`/`2079562e`，2026-11-21）
-
-**现象**：截断修复后的真机会话缓存命中仍只有 77%（目标 ≥95%）；同一任务族有一个会话
-9 步 `blocked（重入上限 8）`，任务未完成；PowerShell 命令与 tf-peek 因属性解析容错不足
-整条丢失。
-
-- **缓存命中结构性修复（77% → 95%+ 的关键）**：digest 落史时机从"下一轮循环顶部"改为
-  **流结束就地落史**——易变尾的转正发生在 render 之后（转正块落位 = 上一请求尾部的**同一
-  位置**），digest 必须在转正之后追加。旧时序（digest 先落、转正后至）会把转正块整体挤到
-  错位：每条注入块被双倍支付（尾部一次 + 移位后一次），稳态 miss = 最近两步的全部注入与
-  摘要。新时序下请求 i+1 的公共前缀覆盖请求 i 的**全部** prompt（含尾部），miss 只剩
-  真新增内容（本步 digest + 本步注入）。`test/v032-truncation.test.ts` T2 的前缀单调
-  断言（第 3 请求逐字节包含第 2 请求全部消息）即为结构证明。
-- **未知属性降级丢弃**（旧实现拒整条命令）：模型写 `lines="1-20"`（schema 是
-  from_line/to_line）被旧实现整条拒绝（`session-ec100f8a` seq 91）。现在未知属性丢弃、
-  命令保留；`lines="N-M"` 识别为 from_line/to_line 归一。
-- **属性值内嵌引号容忍扫描**：`cmd="... ("rc'+[guid]::NewGuid()) ..." ..."` 的内嵌 `"`
-  撑破简单正则 → 整条命令丢失、参数值漏进正文（`session-ec100f8a` seq 134）。闭引号
-  判定改为"`\"` 后跟下一段 `key=` 模式 / 标签结尾 / 末尾"（parseHeader 与 DSML
-  parseAttrPairs 同款；valueStart 用绝对下标——相对偏移会让 lastIndex 不前进死循环）。
-- **重入上限提升**（balanced 8→12、lean 6→8、compat 12→16、power 10→14）：语义是
-  防打转兜底不是任务步数预算（`session-2079562e`：8 步 blocked，任务未完成）。
-- **装配清单解除 `maxReentries: 8` 钉死（决定性修复）**：cordis.patch.yml / preset.yml
-  显式钉死 8——按"装配压过模式"规则，modes.ts 的上限提升从不生效（真机
-  `session-7fbfef8f`：11:57 的会话仍以"重入上限 8"硬杀，模型正重写到一半）。现在
-  上限由模式默认值决定；驱动器直构兜底值同步 8→12。缓存命中同批真机 91%
-  （`session-7fbfef8f` 26.6K tok），顺序修复生效。
-
-**回归**：新增 `test/v032-conflict.test.ts` 6 用例（W1 线消息 source / W2 nudge 进度感知 /
-W3 实体解码 / W4 DSML 内联属性混合形态 / W6 mangled name 抢救 / W7 写入尺寸如实）+
-`test/v033-wildcard-closer.test.ts` 9 用例；全量 329/329 离线通过（零 API 调用）。
-
-### Fixed（第二轮真机修复 —— 缓存 91% 后的残留截断，真机 `session-d6cd0759`/`3d4caf01`/`7fbfef8f`，2026-11-21）
-
-- **装配清单解除 `maxReentries: 8` 钉死（决定性）**：cordis.patch.yml / preset.yml 的显式
-  钉死按"装配压过模式"规则压制了上限提升——11:57 的会话仍以"重入上限 8"硬杀
-  （模型正重写到一半）。现在上限由模式默认值决定；驱动器直构兜底同步 8→12。
-- **写入类 digest 尺寸如实**：写入成功的摘要行显示 `written N chars`（N = 解析器捕获的
-  正文大小）——旧实现显示回执包装自身的长度（≈144 字符），模型误读为"文件只有 144
-  字符"→ 触发全量重写（`session-3d4caf01`，白烧 2-3 步 + 1 万思考 token）。
-- **mangled DSML name 值抢救**：`name="tf-peek handle="obs:...""`（全部属性塞进
-  name 值、引号数为奇数）——旧实现整条丢弃。三件套：scanHeaderClose 引号不成对时
-  退化通道 v2：取**第一个**满足"前驱是属性收尾引号或自闭合斜杠"的 '>'——不能取
-  最后一个（mangled 开标签后面的命令正文含 '>'，取最后一个会把正文整段吞进标签
-  再丢弃，真机 seq 104：整个 selfcheck 脚本被吞）；name 值以合法命令名开头时改写为
-  闭合形式；
-  自闭合 invoke 进块缓冲（findDsmlInvokeEnd 自闭合分支，含端点修正）。
-  `session-d6cd0759` seq 110 的整条 tf-peek 现在完整恢复（handle/from_line/to_line/id
-  全部归位）。
-
-### Fixed（截断的最后两处结构性根因：收束无兜底 + 生产性重入被硬杀；缓存对照 98% 基线，2026-11-21）
-
-**现象（桌面端）**：13 步的真实任务（读文件 → 改文件 → 跑检查）在中途结束，对话区只
-留下最后一句 prose；台账是 `blocked（重入次数达到上限 12）`，产物是半成品。会话缓存
-命中 87.8% / 82.2%，而同一插件、同一模型的对照会话是 97.9% / 97.4%。
-
-**根因（四处，叠加）**：
-
-1. **生产性重入被当打转**：`#reentryCount >= maxReentries` 把"每步都在读/写/跑命令、
-   每步都拿到新事实"的回合与"原地反复失败"的回合一视同仁——真实任务在第 12 步被砍。
-2. **收束时没有兜底交付**：无 `tf-final` 收场时回合直接 blocked，没有任何 assistant
-   交付消息 → 用户侧只剩最后一句 prose，看起来就是"输出截断"。
-3. **饥饿升格块被当成重入事由**：只要本步产生一条升格观测 `needsReentry` 即为真——
-   模型已经给出合法 `tf-final`，却被一块"补充观测"顶掉 `completed`，回合继续烧请求
-   直到撞墙。
-4. **易变尾里非 durable 块夹在 durable 块前面**：转正进历史的只有 durable 块，一旦
-   `[tf-stream:error]`/nudge 排在 `[tf-stream:observation]` 之前，转正后的历史就在那一处
-   与上一请求的 prompt 分叉——其后所有观测块（一次读注入可达上万字符）全部退化成未
-   缓存输入；再叠加"一次读五个文件全量回灌"，单请求 5916 个未缓存 token。
-
-**修复**：
-
-- **停滞预算与请求硬上限分账**：新增 `stallReentries`（连续零产出重入上限，缺省 =
-  `maxReentries`）与 `maxRequests`（回合请求硬上限，缺省 2×）。有新增 ok 命令即清零
-  停滞计数——生产性工作不再被"重入次数"硬杀；绝对闸门由请求数兜住，不会无限烧 token。
-- **收束期 + 兜底交付**：撞墙且**有事实可交付**时不立刻砍——先注入
-  `[tf-stream:closeout]`（最多 `closeOutRequests` 次，缺省 2）要求立即 `tf-final` 交付
-  结论与未验证项；用尽仍无 final → `#buildFallbackFinal` 写一条**明确标注
-  `[未完成交付]`** 的 assistant 消息（已完成命令与目标、最近一次命令输出尾部、
-  未完成/未验证项）。零产出回合不写（不伪造"已完成"）。
-- **升格块不再是重入事由**：合法 final 优先于可选补充（`promotedBlock` 只在确定要重入
-  时才真正挂块）。
-- **尾块 durable 前置**：同一请求内 durable 块（observation/peek/replay/tool-result）
-  排在瞬态指令（error/nudge/closeout）之前，转正后的历史前缀可覆盖到最后一个 durable
-  块，模型下一请求只为"新增事实 + 一句指令"付费。
-- **单请求读注入预算**（`readFeedbackBudgetPerRequest`，缺省 12000 字符）：预算内的读
-  给全文，超出转"头 800 字符 + 句柄"，下一请求用 `tf-peek` 精确补全；`0` 关闭预算
-  （回退点，行为等价 0.3.2）。
-- **正文闭合容错**：`findBodyClose` 按命令名匹配闭合，允许尾随空白与属性
-  （`</tf-write >`、`</tf-write path="x">` 都正确闭合，不再判 `truncated` 丢正文）；
-  DSML 块 flush 的尾部闭合剥离同样改为正则容错。
-
-**回归**：新增 `test/v033-closeout.test.ts` 10 用例（P1–P3 正文闭合与畸形开标签、
-C1–C4 收束与兜底交付、R1–R3 读预算与尾块排序）；全量 339/339 离线通过（零 API 调用）。
-
-**文档**：README §7.1 补单会话实测对照（同一任务、开/不开插件各一次）：总 token
-600,410 → 109,546（−81.8%），未缓存输入 14,471 → 8,840（−38.9%），缓存读取
-548,864 → 83,200，输出 37,075 → 17,506；并如实说明命中率从 97.4% 降到 90.4% 的原因
-（总量压缩一个数量级，比值分母同步缩小；成本看绝对量）。npm `@hugesb/dsh-stream-agent`
-首发 `0.3.3`。
-
-
-## [0.3.2] - 2026-11-21
-
-**宿主一致性补丁 + 会话中途截断修复（v0.3.2 发布版）。** 本条目合并三个批次的修复：
-宿主一致性两案（2026-11-18）、会话中途截断四根因（真机 `session-e4b9a89c`）、以及
-对照 GitHub 上游 `deepseek-ai/deepseek-harness` 源码后的宿主契约冲突修复
-（真机 `session-8f22c7a0`，2026-11-20——"修复后截断仍发生"的最后一层根因）。
-
-### Fixed（宿主契约冲突 —— 对照 GitHub 上游源码定位，真机 `session-8f22c7a0`）
-
-**现象**：截断修复后的会话（23:31）仍然中断：缓存命中已到 88%，1 轮 6 步、1 分 51 秒
-结束，最终答案是一句"我将重写实现文件"的意图陈述，任务没做。逐事件解码日志 + 对照
-上游 `packages/llm/llm/src/index.ts`（master）后确认四个**独立**因素叠加：
-
-- **assistant 线消息缺 `source`（崩溃主因）**：宿主 `LlmRuntime.forAdapter` 对请求里的
-  每条 assistant 消息读 `message.source.replayState`（上游 master 与 rc.1 均无防护）——
-  "正文落追加区"用 role:'assistant' 但不带 source，**正文首次落史后的下一请求必崩**
-  （TypeError: Cannot read properties of undefined (reading 'replayState')，日志 seq 121），
-  流以 error finish 收场 → 回合 blocked。现在 assistant 历史块与线消息一律携带
-  `source = {kind:'model', provider, model}`（`RenderMessage.source` / `modelSource()`；
-  replayState 可选，缺失按"无原生回放"处理——上游 `validateReplay` 契约）。
-- **nudge 一次性预算误杀生产性回合**：nudge 在"写文件步"被消耗后，任何后续无注入的
-  步骤（纯写步不产生观测注入）直接 `nudgeExhausted` → blocked——即使模型正在干活。
-  现在改为**进度感知**：nudge 后有新 ok 命令即不算提示失效（继续给机会），只有零产出的
-  连续 nudge（真打转）才收束；整体仍由 maxReentries / O5 预算兜底（C3 零产出语义不变）。
-- **XML 实体未解码**：模型带 XML 习惯写属性——`cmd="... Write-Output &quot;EXIT=1&quot;"`
-  的实体原样进 PowerShell，命令解析报错，白烧一步。属性值统一解码有界实体集
-  （lt/gt/quot/apos/amp + 数字引用；单遍替换，`&amp;quot;` 不二次展开）。
-- **DSML 内联属性 invoke 走 body 模式吞包装残片**：带内联属性的 invoke 此前走
-  `parseDsmlHeader` 进 body 模式，非正文命令把 parameter/invoke/closes 包装残片整体
-  吞到流末才以 malformed 露出（日志 seq 33-35 三条）。现在全部 invoke 统一走块缓冲
-  （内联属性与 parameter 合并，parameter 覆盖同名键）；非正文命令的恢复边界纳入 DSML
-  标签（残片立即露出，不再吞到流末）；块以命令自身配对闭合终止时剥掉尾部闭合标签。
-
-### Fixed（宿主一致性 —— 历史加载失败 + 工具调用"卡住"，真机 `session-1da5f8fc`）
-
-两案同源：插件的 duck-type 面缺了宿主侧的形状/事件契约，与 0.3.0 的"工具生命周期"案同类。
-
-- **历史加载失败（`message must have model source`）**：assistant/message 的 source 只有
-  `{kind:'model'}`，缺宿主校验器要求的非空 `provider`/`model`——日志读取时整条判 corrupt。
-  现在 source 携带实时 provider/model（无路由信息时落 'unknown' 兜底）；存量损坏日志用
-  `node scripts/repair-session-logs.mjs --write` 修复（写前备份）。
-- **回合结束后 UI 永远转圈**：`StreamLoopAgent` 从不发 `agent/status`——桌面端收不到
-  idle 转换。状态转换统一走 `#setStatus`（镜像内建 setPhase 语义），factory 从 `ctx.emit`
-  接线 `emitStatus`。
-- **改审批策略命令报 `agent.inject is not a function`**：新增 `inject(message)`（落盘 +
-  并入下一请求装配，不唤醒空闲 agent）。
-
-### Fixed（会话中途截断 —— v0.3.2 补丁，真机 `session-e4b9a89c`）
-
-**现象**：任务做到一半，模型在思考区写下 "The history is truncated. I don't see the plan
-content"，随后反复重读同一文件、用占位 final 收场；桌面端最终答案只剩
-`I'll start by inspecting the workspace. / README.md r10 / Get-ChildItem ... b902` 这类残片。
-9 步、9 次请求后回合以 `blocked（重入次数达到上限 8）` 结束，用户侧看到的就是"输出被截断、
-不完整"。
-
-**四条根因（逐条修复）**：
-
-- **请求之间没有会话记忆（主因）**：0.3.x 的追加区只放任务与句柄目录行——模型自己的
-  正文、命令、命令结果从不落历史；观测只在"易变尾"注入一次（`#reportedObservations`
-  永不重放），易变尾又每请求整块重建。于是第 3 个请求的提示只剩 system + 任务 + 句柄目录
-  （真机 step 3 `inputTokens=343`，对比 step 2 的 1613），模型如实报告"history is truncated"。
-  现在每步结束把**正文 + 命令摘要**（id/命令/目标/状态/句柄/字符数）落进追加区，已发出的
-  易变尾在下一请求装配后**转正为历史**（只允许事实类块：observation/peek/tool-result/replay；
-  nudge/degraded/error 等瞬态指令不转正）。对齐内建 `dsh-agent-loop` 的
-  `session.deriveMessages()` 语义：历史累积、只追加，前缀单调不变（新增回归断言逐条比对）。
-- **DSML 参数式调用被当噪声（正文残片的直接来源）**：模型原生调用还有一种形态——
-  `<｜｜DSML｜｜ invoke name="tf-read">` 后跟
-  `<｜｜DSML｜｜ parameter name="path">README.md</｜｜DSML｜｜ parameter>`。0.3.1 只认
-  "invoke 头部内联属性"，parameter 子标签逐条判 malformed，**标签之间的值作为 prose 漏进正文**
-  （`README.md r10` / `Get-ChildItem ... b902` 就是 path/id/cmd 的值），命令本身却没执行。
-  现在整个 invoke 块缓冲到闭合，按 parameter 归集成属性后一次性发命令；块内文本不再透传。
-  块未闭合即流终止时：非正文命令（属性已齐）照常发（能救则救），正文命令按 truncated 丢弃
-  （绝不写半截文件）。
-- **非正文命令少写 `/` 吞掉后续输出**：`<tf-read ...>` 进入 body 模式后会一直吞到流末尾，
-  0.3.1 只在流末记一条 truncated，后续命令与正文全部消失。现在遇到下一个 `<tf-` / `</tf-`
-  即视为闭合（命令照发、后续照解析），流末仍未闭合也发命令并把剩余文本归还 prose。
-- **截断没有任何续写事由**：`finish=max-tokens` / 命令体未闭合时，0.3.1 只记台账，回合
-  "安静地"结束在半截输出上。现在强制一次续写注入（`[tf-stream:truncated]`，带已生成内容
-  尾部 ≤800 字符便于从断点续写），回合级上限 `MAX_TRUNCATION_RETRIES=4`，超限如实 blocked。
-- **计划门槛拒绝时不给计划内容**：模型看不到验收项就无法补 `accepts`，final 会被永久拒绝
-  直到重入上限。现在拒绝注入附带计划快照（id + 原文 + 状态）。
-
-**涉及文件**：`src/kernel/parser.ts`（DSML 参数式块 / 非正文命令恢复）、
-`src/entry/loop.ts`（步骤摘要、易变尾转正、截断续写、计划快照）、
-`src/entry/mock-provider.ts`（剧本选择改为"最新 marker 优先"——历史持久后旧 marker 仍在，
-首匹配会让同一剧本无限重演）。
-**回归**：`test/v032-truncation.test.ts` 8 例（T1/T1b/T1c 解析器 DSML 三态、T3/T3b 非正文
-命令恢复、T2 三请求历史保留 + 前缀逐条不变、T4 max-tokens 续写落盘、T5 计划快照）；
-全量 314/314 通过。
+- **生产性重入与停滞重入分账**：`stallReentries`（连续零产出重入上限，有新增 ok 命令即清零）
+  + `maxRequests`（请求硬上限，生产性步骤也计）+ `closeOutRequests`（收束期）。
+  `maxReentries` 语义收窄为停滞预算缺省值——干活的步骤不再被"重入次数"硬杀。
+- **收束期 `[tf-stream:closeout]`**：撞墙但**有事实可交付**时不立刻砍，先注入"停止探索、
+  立即 tf-final"的收束指令（最多 `closeOutRequests` 次），用尽仍无 final 才收场。
+- **兜底交付泛化**：`#deliverFallbackFinal` 现在同时服务"收束撞墙"与"前缀 fail-closed"
+  两条路径，写一条 `[未完成交付]` 台账事实说明（零产出回合不写，不伪造完成）。
+- **单请求读注入预算** `readFeedbackBudgetPerRequest`（缺省 `12000` 字符）：一次读多文件时
+  预算内给全文、超出给"头 800 字符 + 句柄"，下一请求 `tf-peek` 补全；`0` = 关闭（回退点）。
+- **畸形闭合定向纠错** `malformedCloserNudge`：`</tf-*>` / `</tf-write 属性…>` 第一次出现时
+  挂一条纠错注入（只一次），把"猜语法"变成"照抄正确形态"。
 
 ### Fixed
 
-- **历史加载失败（`message must have model source`）**：0.3.1 及更早版本写
-  assistant/message 时 source 只有 `{kind:'model'}`，缺宿主校验器
-  （dsh-session `assertMessageEventShape` → `hasProviderModel`）要求的非空
-  `provider`/`model`——日志在读取时整条被判 corrupt，桌面端报"历史加载失败"。
-  现在 `makeAssistantMessage` 携带实时 provider/model（`createSessionEventWriter` 新增
-  `modelInfo` 写入时回调；驱动器 `modelSource()` 随 `applySelection` 运行时换模而动，
-  不缓存）；无路由信息（离线/缺省）时落 `'unknown'` 兜底，形状仍过校验，不谎报模型。
-  **存量损坏日志**：`node scripts/repair-session-logs.mjs --write`（0.3.0 修复脚本扩展：
-  新增 model source 补齐类目 + 本地消息形状复核，`--model-provider`/`--model` 可指定，
-  缺省 deepseek-account / deepseek-flash；写前备份、写后清投影缓存的纪律不变）。
+- **正文闭合容错**：`findBodyClose` 允许尾随空白/属性（`</tf-write >`、`</tf-write path="x">`）；
+  旧实现只认逐字 `</tf-write>`，模型换个写法就整段正文在流末按 truncated 丢弃（"写到一半没了"）。
+- **DSML 内嵌闭合剥离**同步改正则（块内尾部闭合带空白/属性时正文不再拖尾）。
+- **`probeTag` 畸形闭合变体**：协议命名空间内 `</tf-` 紧跟非空白即按 `close-tag` 处理，
+  `indexOf('>')` 换成引号感知扫描（`cmd="a>b"` 不再截半）；通配名 `</tf-*>` 如实进台账。
+- **升格块不再顶掉合法 final**：饥饿升格改为"先算块、后挂块"——本步有合法 final 时不挂，
+  只有确定要重入才挂。
+- **易变尾 durable 前置**：`observation/peek/replay/tool-result/plan/receipt` 前置，瞬态
+  指令（error/nudge/closeout）后置——转正后的历史前缀可覆盖到最后一个 durable 块。
+- **兜底交付与 stepEnd 顺序**：assistant/message 必须先于 step/end（v4 要求落在打开的
+  turn+step 内），两处前缀失败路径同步修正。
+
+### Tests
+
+- 407 用例：406 pass + 1 预置跳过，0 fail（零 API 调用）；`npm run check` 见下。
+- 新增 `test/v040-closeout.test.ts`（P1–P3/C1–C4/R1–R3）、`test/v040-wildcard-closer.test.ts`
+  （W1–W9）——0.3.3 的探针原样迁移，不改断言。
+
+## [0.4.3.2] - 2026-11-22
+
+**纯文档/注释收尾（不改行为；`dsh-stream-agent-待改清单-2026-11-22.md` B 组）。**
+回归计数订正、口径表正名、活文档阈值作废、"缓存读零损失"与"全文断言"两处过期表述统一。
+
+### Fixed
+
+- **B1**：0.4.3.1 条目回归计数 387→388（与 Tests 节及 `node --test` 实测一致）。
+- **B2**：`eval/METRICS.md` §8 口径表——严格二分量的被加数由 `inputTotal + output`（含缓存读，实为四分量）正名为 `inputUncached + output`。
+- **B3**：`docs/TEST-PROPOSITIONS.md` —— 全仓唯一还把 22.3% 当活阈值的文档改为「四分量 ≤ 基线 28.9%（446,410）；22.3% 已作废，禁止再作为阈值」。
+- **B4**：`loop.ts` 三处「覆盖全部 prompt（缓存读零损失）」注释加限定——无 transient 尾时零损失；有 transient（error/nudge）时该块被丢弃、前缀在该 index 断裂（bounded 一块；0.5.0 起按 transient-drop 计量，见清单 A12/C1）。
+- **B5**：`context-render.ts` ×2、`loop.ts` ×2 注释里的「全文断言」统一改为「承诺前缀断言」，与 `assertRequestPrefix(promised, …)` 实际语义一致。
+
+### Tests
+
+- 用例数不变：388（387 pass + 1 预置跳过，0 fail，零 API）；`npm run check` 6/6。版本 `0.4.3.2`（未发布 npm）。
+
+## [0.4.3.1] - 2026-11-22
+
+**对 `dsh-stream-agent-v0.4.3-清单符合性核查-2026-11-22.md` 两个阻断项的修复 + 口径回写。**
+核查结论：0.4.3 结构在位但有可复现误判（阻断项 A）与错值标签（阻断项 B）；本版只改断言内核与文档，不改协议面。
+
+### Fixed（阻断项 A：混合易变尾导致 append-drift 误判）
+
+- **根因**：0.4.3 的承诺前缀基线用 `horizon = stableLen + 转正块数` 公式，隐含假设"durable
+  尾块连续排在易变尾最前"。实际 `#buildInjections` 的压入顺序是 error（transient）在前、
+  observation（durable）在后——同一步"结构化失败 + 成功读"的尾 = `[error, observation]`；
+  `#commitDeliveredTail` 只转正 observation，下一请求该位置是 observation 而基线是 error
+  → 误报 append-drift。预算每回合 1/每会话 3，C2/R2 类任务一次会话 3 次很常见 → 第 4 次
+  fail-closed **误杀任务**——正是 P0-6 要消灭的失败模式换了个触发条件被装回来。
+- **修复（核查 §2.5）**：基线从"上一请求前 N 条"改为 **`promised` = 转正之后的
+  stableMessages() 逐字节快照**——下一请求的前 `promised.length` 条必须与它逐字节一致；
+  分类锚点 `stableLen`（转正前长度）不变。transient 尾块不转正、不在承诺里，断言与易变尾
+  块序**完全解耦**；`horizon` 概念删除。`RequestBaseline` 改为 `{ promised, stableLen }`。
+- **回归**：K6（内核：混合尾 transient 前置不进承诺，观测块转正即匹配）+ P5（驱动器：
+  核查 §2.2 的复现场景原样收编——同流 `depends_on="nope"` 失败读 + 成功读，R2 尾 =
+  [error, observation] 混合序，0 prefix-reset / 0 prefix-broken / 任务完成）；P1–P4 与
+  全量 388 用例通过（387 pass + 1 预置跳过）。
+
+### Fixed（阻断项 B：22.3% 是 cacheRead 二次计入的错值）
+
+- **三个恒等式**：446,410 + 393,728 = 840,138；129,178 + 58,112 = 187,290；187,290 / 840,138
+  = 22.29%。`M1_tokens.input` 本身就是"未缓存 + 缓存读"（W1 的 metrics.json：input=16,032
+  而逐请求 `usage.inputTokens` 之和只有 6,432）——在它之上再加一次 cacheRead 即得错值。
+  **"0.2.0 更早批次（四分量 22.3%）"不存在**：`eval/runs/` 只有 2026-11-15 与
+  2026-11-15-v02 两个完整批次，baseline 都是 446,410；v0.2.0/v0.2.1/v0.3.0 三个 tag 的
+  README 均无 840,138/187,290/22.3。
+- **正确口径**：四分量（未缓存输入+缓存读+缓存写+输出）= 446,410 → 129,178 = **28.9%**
+  （本批缓存写两臂均为 0）；严格二分量（未缓存输入+输出）= 52,682 → 71,066 = **134.9%**
+  （插件更高——请求数 +18% 与输出 28,284 > 19,654，正是 P0-2/P0-10 要压的方向）。
+- **影响面全改**（核查 §3.4 表）：README（中英）、CHANGELOG 0.4.3 条目、`eval/RESULTS.md`
+  §2、`docs/v0.4.3-thinkflow-gap-review.md`、升级清单 v3 §0.1/§0.5/P0-10——全文不再出现
+  840,138 / 187,290 / 22.3%；"0.2.0 更早批次"删除。升级清单 v3 同步回写 P0-6 措辞
+  （"全文断言"→"承诺前缀断言"、"重发"→"放行一次"、兜底交付加"有产出"限定、第二见证
+  明确为事实见证不 fail-closed）。
+- **命名澄清**：`M1_tokens.input`（= 未缓存+缓存读+缓存写）与 `summary.json`
+  `inputTokens`（= 未缓存）同名不同义是错值根因之一；`eval/METRICS.md` 定义正名
+  （`inputTotal` / `inputUncached`），历史 metrics.json 不回改。
+- **costPerPass 价格快照机制**（核查 §4.5）：`eval/METRICS.md` 新增价格快照章节 +
+  `eval/price-snapshot.json`（schema 固定，价格发布前按 DeepSeek 官网当日定价回填）；
+  未回填前七列中 costPerPass 标"待快照"，其余六列照常可复算。
+
+### Tests
+
+- 用例 385 → 388（+3：K6 混合尾内核钉、P5 真实装配漂移驱动器钉、M0 同轨迹两次 renderHash
+  序列逐字节一致——核查 §6 条目 2 的验收项）；全量 388/387 + 1 预置跳过，零 fail。版本 `0.4.3.1`（0.4.3 未发布 npm，按核查 §0 建议以 0.4.3.1 定版）。
+
+## [0.4.3] - 2026-11-22
+
+**P0-6 前缀退路（wire 承诺前缀断言 + 三类成因 + 兜底交付）+ P0-7① 七列尺子 + P1-4 口径收口。**
+升级清单 v3（`dsh-stream-agent-升级清单-2026-11-22.md` §7）的 0.4.3 阶段：先立尺子和退路——
+P0-6 把断言从 stable 扩到上一请求全文，**失败率必然上升**；没有 fallback final 就是把
+"缓存问题"升级成"任务失败"（§7 顺序理由）。行为变更（P0-1/2/3/4）按清单放 0.5.0；
+P0-9（PTC 源码迁移）与 P0-10 T0 放 0.4.4。
+
+### Added（P0-6：前缀退路——§2.7 两个盲区的修复）
+
+- **wire 边界承诺前缀断言（P0-6①②）**：`loop.ts` 增 `#lastRequest`，每请求装配后先对
+  它做**承诺前缀断言**（内核新增 `assertRequestPrefix`）——比较"上一请求收尾后的稳定段
+  （转正之后的 stableMessages()）"与本次请求的头部。旧断言（`render()` 内置 preflight）
+  只比装配时的 stable，从不覆盖两件事：①转正块与已发文本是否逐字节一致；②追加区是否
+  被代码改写。transient 尾块（nudge/error/degraded）不转正、不在承诺里。段边界
+  （`dropAppendHead`）显式重置基线——唯一合法的历史收缩通道。（0.4.3 首版用 horizon
+  公式，混合尾会误判，0.4.3.1 改 promised，见下。）
+- **三类成因分类与处置（P0-6③④）**：`PrefixBrokenError` 增 `prefixCause:
+  'stable-drift' | 'append-drift' | 'shrink'` + `stablePrefixLen`（判定式
+  `error.index < stablePrefixLen`）。处置：`stable-drift` 0 放行（稳定段被改写 = 装配
+  被破坏，放行只烧缓存不修根因）；`append-drift` 预算内放行**一次同一份 next**（断言在
+  发送前——"放行"= 记账后照常发送，0 额外请求；每回合 1 次、每会话 3 次，第 4 次降级
+  fail-closed；放行即显式缓存重置点 `prefix-reset`，基线随本请求推进）；`shrink` 0 放行
+  （文案指出"段边界必须走 `dropAppendHead`"）。
+- **有产出时才有交付（P0-6⑤，自 0.3.3 回植）**：`#buildFallbackFinal` /
+  `#deliverFallbackFinal` / `#turnOkRecords` / `#productiveOkCount` 回植到 0.4.x 线——
+  fail-closed 收场时把**台账事实**写成一条明确标注 `[未完成交付]` 的 assistant 消息，
+  不再让异常炸出 `runTurn`（旧实现：`PrefixBrokenError` 直接抛出，用户侧只剩半截输出）。
+  零产出回合不写（不伪造"已完成"），跳过事实落台账（`fallback-final-skipped`）。
+- **receipt 最小对账（P0-6⑤）**：前缀破坏收场时把 pending 写前意图整批标记 unknown
+  （`intent-log.ts` 新增 `reconcilePendingIntents`，ack 记录 note 写死语义："只解除恢复
+  锁，不重放工具，不声称回滚"——P0-8/0.5.1 再补完整三态）。对账后 `pendingIntents`
+  悬空数 = 0；IO 失败 fail-open + 告警（意图保持 pending，恢复锁不解除）。
+- **第二见证升级（P0-6②）**：`context-render.ts` 从"只看 `messages[0]`"改为**整条序列
+  见证**——保留上一请求全文，逐请求落首差异位（`firstDiffIndex`）与长度收缩（`shrunk`）
+  事实进 prefix 台账；fail-closed 仍只守首条（wire 层无法区分段边界的合法收缩与改写，
+  强制收口在驱动器 `#lastRequest` 断言——那里有显式基线重置通道）。
+
+### Added（P0-7①：七列尺子——ΣproviderInput / N / resetCount 可外部复算）
+
+- **request 记录尺子字段**：`prefixTokensEst`（Σ消息字符/4 上取整，与 O5 阶梯同启发式，
+  交叉校验用——权威值是 providerInputTokens，E9）、`providerInputTokens`（计费输入 =
+  未命中 input + cacheRead + cacheWrite；usage chunk 在流末才到，记录先建、数字后补——
+  同一对象引用，外部复算不受影响）、`cacheRead` / `cacheWrite` / `output`、
+  `resetSeq` / `resetCause`（重置纪元与成因：`segment-drop` / `prefix-reset`）、
+  `feedbackBytes{full, dedup, handle}`（反馈字节分类，按注入位点整块字节计入：全量观测
+  /peek/replay/native ≤ 上限 = full；骨架/截断/自写回执/native 句柄化 = handle；指令块
+  （nudge/error/degraded）与计划差分不计入；dedup 由 P0-4/0.5.0 引入，0.4.3 恒 0）。
+- **聚合三元组**：`cacheStats()` 增 `providerInputSum` / `requests` / `resetCount`——
+  全部可从 request 记录逐条复算（ΣproviderInput / N / 末条 resetSeq）。七列
+  （P0-10：`N / inputPerPass / outputPerPass / costPerPass / resetCount / cacheReadAbs /
+  checks`）的推导公式落 README §7.3，少一列不算结果。
+- **`cacheHitRatio` 降级为 diagnostic-only**（代码 JSDoc + README）：分母随总量压缩收缩，
+  命中率与低成本在本插件形态下必然背离（清单 §0.5），不进门禁、不进对外标题。
+
+### Changed（P1-4：口径收口）
+
+- README（中英）的口径标签修正（0.4.3 首版标反了，0.4.3.1 依符合性核查 §3 改正）：
+  **129,178/28.9% 是四分量**（未缓存输入+缓存读+缓存写+输出；本批缓存写两臂均为 0）；
+  严格二分量（未缓存输入+输出）= 52,682 → 71,066 = **134.9%**（插件更高——请求数与
+  输出都更多）；**187,290/840,138/22.3% 是 cacheRead 二次计入的错值，已作废**（首版曾
+  为它虚构"0.2.0 更早批次"，该批次不存在）。对外表格固定四列（请求数 / 二分量 / 四分量
+  / checks）；任何对外数字必须同表四列，标题不出现单一倍数或命中率主卖点（P2-2）。
+
+### Tests
+
+- 用例 368 → 385（+17）：`test/v043-prefix.test.ts`——内核断言 5 例（K1 承诺前缀放行 /
+  K2 append-drift 分类 / K3 stable-drift 分类 / K4 shrink + allowTailDrop / K5 role 变化
+  归类）+ 四类探针 4 例（P1 恰好 1 次重发任务完成 / P2 stable 漂移 0 重发 + 兜底交付 /
+  P3 每回合必漂移第 4 次不静默 / P4 最小对账悬空 0）+ 尺子回归 6 例（M1 prefixTokensEst
+  独立复算 / M2 计量回填与缺省噪声 / M3 聚合三元组 / M4 resetSeq 段边界纪元 /
+  M5 feedbackBytes 分类 / M6 无漂移零噪声）；`test/loop.test.ts` B1 更新为 P0-6⑤ 新契约
+  （blocked + prefix-broken + fallback-final，不再断言异常炸出）。全量 385/385 离线通过
+  （1 例预置跳过，零 API 调用）。
+- 版本 `0.4.3`；**未发布 npm**（G5/G6 真机项待批次；发布纪律：G5/G6 未过前不得发布）。
+  阶段对照见升级清单 v3 §7：0.4.4 = P0-9（PTC 迁源码 + 协议快照 v3）+ P0-10 T0。
+
+## [0.4.2-beta.1] - 2026-11-20
+
+**V0.4.2 独立升级：缓存经济学可观测化（Cache Economics Observable）。** 与并行 0.3.2
+的问题修复（截断/记忆蒸发，已随 0.4.1-beta.2 同源回植）**不同主题**——0.4.2 的身份是
+"把 O6 前缀单调性换来的缓存收益变成一等可观测、可对账、可配置的资产"：台账有命中率、
+预算按计费口径、控制页看得见。真机取证 `session-6b61cb4d`（2026-11-19：27.4K tok、
+缓存命中 64%、9 步被重入上限杀掉）；规划对照见 `docs/v0.4.2-plan.md`。
+
+### Added
+
+- **缓存命中可观测面（三层）**：
+  ① **台账层**——usage 镜像与记录对齐宿主 dsh-llm Usage 口径（types.d.ts:160-179：
+  `inputTokens` 只是未命中缓存的输入，`cacheReadTokens`/`cacheWriteTokens` 单列，计费
+  输入 = 三者之和），逐请求携带缓存字段（适配器未上报时不写 0 噪声）；回合台账
+  `plugin:tf-agent/step` 新增 `cacheHitRatio`。
+  ② **预算层**——O5 阶梯按**计费输入**升档：旧口径只累计未命中输入，缓存读大户会漏判
+  升档（V3 回归钉死）。
+  ③ **控制页层**——驱动器 `cacheStats()` 经运行时状态面（`controlStatus().cache`）上
+  桌面控制页"缓存命中"行（当前会话有缓存数据才显示；离线/mock 适配器隐藏该行，
+  不渲染成 0%）。
+- **计划/验收回执转正（V-b 修复，也属 0.4.2 自有升级）**：转正清单补 `plan`/`plan-diff`/
+  `receipt`——计划清单与验证差分、自写回验回执都是"发生过的事实"，随下一请求装配转正
+  进追加区，模型在任意后续请求都能看到计划与验收进度。
+
+### Fixed
+
+- **计划/验收回执跨请求蒸发（6b61cb4d 死循环的直接原因）**：计划在声明那一请求的易变尾
+  出现过一次后彻底消失，模型不知道要验收什么，premature-final 连续 6 步被拒（a2/a3 一直
+  未验证）、每步重发重复读命令，直到重入上限 blocked，任务中断（见上条转正修复）。
+- **重入上限误当任务预算**：四模式上限放宽（balanced 8→12、lean 6→8、compat 12→16、
+  power 10→14）。语义是"防打转兜底"不是"任务步数预算"——计划+实现+验收类任务 9 步不够；
+  打转根因（0.4.1-beta.2 的记忆蒸发主修 + 本版计划转正）已修，残余打转由重复命令护栏
+  （replay-capped）兜底，上限只放宽兜底余量。无重评，方向性调整（上限不是成本承诺）。
+
+### Fixed（宿主契约冲突 —— 对照 GitHub 上游源码定位，与 0.3.2 同源；真机 `session-8f22c7a0`）
+
+截断修复后的真机会话（23:31）仍中断：缓存命中已到 88%，但 6 步后结束，最终答案是一句
+"我将重写实现文件"的意图陈述。对照上游 `packages/llm/llm/src/index.ts`（master）确认四个
+**独立**因素叠加，逐一修复：
+
+- **assistant 线消息缺 `source`（崩溃主因）**：宿主 `LlmRuntime.forAdapter` 无防护读
+  `message.source.replayState`——"正文落追加区"用 role:'assistant' 但不带 source，正文
+  首次落史后的下一请求必崩（日志 seq 121 实证）。现在 `RenderMessage.source` /
+  `toWireMessages` 透传 / `commitStepDigest` 落史带 `modelSource()`（kind 固定 'model'）。
+- **nudge 进度感知护栏**：nudge 在写文件步被消耗后，任何无注入步骤直接 blocked——即使
+  模型正在干活。改为有新 ok 命令即继续，零产出的连续 nudge 才收束（C3 零产出语义不变）。
+- **XML 实体解码**：`cmd="... &quot;EXIT=1&quot;"` 的实体原样进 PowerShell，白烧一步。
+  属性值统一解码（单遍替换，`&amp;quot;` 不二次展开）。
+- **DSML 内联属性 invoke 统一块缓冲** + 非正文恢复边界纳入 DSML 标签 + 配对闭合终止时
+  剥尾部闭合（残片立即露出，不吞到流末）。
+
+### Changed
+
+- 用例 360 → 368（+8）：`test/v042-cache.test.ts`（V1 计划块跨请求可见、V2 usage 缓存
+  字段随流进台账、V3 预算阶梯按计费输入升档、V4 `cacheStats()` 控制页口径快照）+
+  `test/v032-conflict.test.ts`（W1 assistant 线消息携带 source、W2 nudge 进度感知、
+  W3 XML 实体解码、W4 DSML 内联属性混合形态）。
+- 版本 `0.4.2-beta.1`；**未发布 npm**（G5/G6 真机项待批次；缓存命中率以回合台账
+  `cacheHitRatio` + 控制页取证，真机复跑口径见 docs/v0.4.2-plan.md §3）。
+
+## [0.4.1-beta.2] - 2026-11-18
+
+**回合收束补丁：把 v0.3.1 的「任务半途截断」修复同源回植到 0.4.1。** 与 0.4.1-beta.1 相比
+只改"回合如何收尾"与"协议残片如何处理"：工具面、协议段组装、命令表（14 硬上限）、装配
+清单均零变化。
+
+### Fixed（会话中途截断 —— v0.3.2 同源补丁，未打新 tag）
+
+**现象**：任务做到一半，模型思考区出现 "The history is truncated"；最终答案只剩
+`README.md r10` / `Get-ChildItem ... b902` 这类残片，回合以 `blocked（重入上限）` 结束。
+真机取证 `session-e4b9a89c`（0.3.2 线已修，本版同源回植）：
+
+- **请求之间没有会话记忆（主因）**：追加区从不写 assistant 正文 / 命令 / 结果；观测只在
+  易变尾注入一次。第 3 个请求起模型只看到 system + 任务 + 句柄目录行。现在每步把
+  **正文 + 命令摘要**落追加区，已发出的易变尾在下一请求装配后**转正为历史**（只转正
+  observation/peek/tool-result/replay 事实类块；nudge/degraded/error 不转正），对齐内建
+  `dsh-agent-loop` 的 `session.deriveMessages()` 语义，前缀仍严格单调。
+- **DSML 参数式调用被当噪声**：`<｜｜DSML｜｜ invoke name="tf-read">` +
+  `<｜｜DSML｜｜ parameter name="path">README.md</...>` 形态下，0.4.1 只认内联属性，
+  parameter 子标签判 malformed、**标签间的值作为 prose 漏进正文**，命令却没执行。
+  现在整块缓冲到闭合后按 parameter 归集成属性并发命令；块内文本不再透传。未闭合即流终止：
+  非正文命令能救则救，正文命令按 truncated 丢弃（不写半截文件）。
+- **非正文命令少写 `/` 吞掉后续输出**：遇到下一个 `<tf-` / `</tf-` 即视为闭合（命令照发、
+  后续照解析）；流末仍未闭合也发命令并把剩余文本归还 prose。
+- **截断没有续写事由**：`finish=max-tokens` / 命令体未闭合 → 强制一次
+  `[tf-stream:truncated]` 续写注入（带已生成尾部 ≤800 字符），回合级上限 4 次。
+- **计划门槛拒绝不给计划内容**：final 被"计划有未验证项"拒绝时，注入附带计划快照
+  （id + 原文 + 状态），模型不必凭记忆猜验收项。
+
+**涉及文件**：`src/kernel/parser.ts`、`src/entry/loop.ts`、`src/entry/mock-provider.ts`
+（剧本选择改为"最新 marker 优先"——历史持久后旧 marker 仍在，首匹配会无限重演）。
+**回归**：`test/v032-truncation.test.ts` 8 例；全量 360/360 通过（1 例预置跳过）。
+
+### Fixed（与 v0.3.1 `a8b4111` 逐处等价）
+
+- **占位/过期 final 被当作交付答案**：新增内核模块 `src/kernel/final.ts`（`checkFinalSummary`
+  纯函数，判定 `empty` / `placeholder` 两种形态；`done`、`已完成` 这类短答案刻意放行）。
+  收束闸由"只查 `depends_on` 与未完成命令"扩为四类拒绝：① 依赖未满足 ② 计划有未验证项
+  ③ summary 是占位 ④ 这条 final 之后又发出过命令（答案已过期）。拒绝**同类只注入一次**
+  （`#reportedFinalRejects` 按 kind 去重），反复不改则如实 `blocked`，绝不把占位当交付。
+- **重复命令幂等但空手**：`#queueReplay` / `#materializeReplays`。模型把同一条
+  read/grep/glob/bash 再发一次时，原实现只回 `duplicate-idempotent`（内容早已不在上下文），
+  模型只能再猜再读、原地打转。现在幂等语义不变（不重复执行），但把原观测按既有上限回灌
+  一次；每回合上限 `MAX_REPLAY_INJECTIONS = 4`，超限记 `replay-capped` fault，不静默。
+- **孤立闭合标签落进正文**：`parser.ts` 新增 `close-tag` 探针与 `closeTagName()`。ground 模式
+  下出现的 `</tf-xxx>`（自闭合命令被多关一次、或流末半截残片）一律记
+  `malformed(stray-close-tag:...)` 后丢弃，不再作为 prose 落盘——桌面端正文里不再出现裸的
+  `</tf-bash>`。普通 HTML 闭合标签仍按正文透传（不过度拦截）。
+
+### Fixed（宿主一致性补丁，与 0.3.2 同一套；真机会话 `session-1da5f8fc` 取证）
+
+- **历史加载失败（`message must have model source`）**：beta.1 及更早版本写 assistant/message
+  时 source 只有 `{kind:'model'}`，缺宿主校验器（dsh-session `assertMessageEventShape` →
+  `hasProviderModel`）要求的非空 `provider`/`model`——日志读取时整条被判 corrupt。现在
+  `makeAssistantMessage` 携带实时 provider/model（`createSessionEventWriter` 新增 `modelInfo`
+  写入时回调；驱动器 `modelSource()` 随 `applySelection` 换模而动，不缓存）；无路由信息时落
+  `'unknown'` 兜底。**存量损坏日志**：`node scripts/repair-session-logs.mjs --write`（修复
+  脚本新增 model source 补齐类目 + 本地消息形状复核；写前备份、写后清投影缓存纪律不变）。
 - **回合结束后 UI 永远转圈**：`StreamLoopAgent` 从不发 `agent/status`——桌面端
-  dsh-api-session-controller 靠它转发 `api-session/status` 收起"运行中"指示，不发 =
-  回合早已结束、UI 仍在"正在分析请求"。现在状态转换统一走 `#setStatus`（镜像内建
-  dsh-agent-loop `setPhase` 语义：只在 idle↔running 真正变化时发；发射异常 fail-open
-  告警不静默），factory 从宿主事件总线（`ctx.emit`）接线 `emitStatus`。
-- **改审批策略命令报 `agent.inject is not a function`**：桌面端 approval/policy 命令路径
-  调 `agent.inject`（dsh-user-approval `setPolicy:127`），duck-type 面缺这个方法。
-  新增 `inject(message)`：落盘 user/message + 并入下一请求装配，**不唤醒空闲 agent**
-  （镜像内建 `send(input,'next-step', false)`；pendingSteers 在 runTurn 每次请求前消费，
-  含下一回合首请求，下一请求必然可见）。
+  dsh-api-session-controller 靠它转发 `api-session/status` 收起"运行中"指示。状态转换统一走
+  `#setStatus`（镜像内建 setPhase：只在真正变化时发；发射异常 fail-open 告警），factory 从
+  `ctx.emit` 接线 `emitStatus`。
+- **装配清单解除 `maxReentries: 8` 钉死（决定性修复，与 0.3.3 同源）**：cordis.patch.yml /
+  preset.yml 显式钉死 8——按"装配压过模式"规则，模式默认值的上限提升从不生效
+  （真机 session-7fbfef8f：11:57 的会话仍以"重入上限 8"硬杀）。现在上限由模式默认值
+  决定（balanced 12 / lean 8 / compat 16 / power 14），驱动器直构兜底值同步 8→12。
+  同批真机缓存命中 91%（26.6K tok）。
+- **改审批策略命令报 `agent.inject is not a function`**：新增 `inject(message)`——落盘
+  user/message + 并入下一请求装配，不唤醒空闲 agent（镜像内建 `send(input,'next-step',false)`）。
 
-### 测试
+### Changed
 
-- 新增 `test/host-conformance.test.ts`（8 用例）：宿主同款消息形状校验（整条日志逐事件
-  过 `assertMessageEventShape`/`hasProviderModel` 本地镜像）、换模实时 source、unknown
-  兜底、agent/status 转换序列精确性（不重复不遗漏）、发射异常熔断、inject 三态
-  （空闲/运行中/dispose 后）。
-- 新增 `test/v032-conflict.test.ts`（4 用例）：W1 assistant 线消息携带 source（forAdapter
-  契约，崩溃主因）、W2 nudge 后继续产出不中断（进度感知护栏）、W3 属性值 XML 实体解码
-  （`&amp;quot;` 不二次展开）、W4 DSML 内联属性 + parameter 混合形态整体缓冲。
-- 截断修复批次：`test/v032-truncation.test.ts`（8 用例，并行批次交付）。
-- 全量 318/318 通过（0 skip；离线 mock 全链路，零 API 调用）。
+- 用例 331 → 352（+21）：parser 孤立闭合标签 4 条（跨 chunk / 流末半截 / 不误伤 HTML / 配对式），
+  loop 收束闸 4 条（K1 占位拒绝、K2 过期拒绝、K3 重复命令回灌、K4 屡教不改如实 blocked），
+  宿主一致性 13 条（`test/host-conformance.test.ts`：整条日志逐事件过宿主同款消息形状校验、
+  换模实时 source、unknown 兜底、agent/status 转换序列精确性、发射异常熔断、inject 三态、
+  事件类型清单镜像（62 项 known-event + plugin record 语法）、修复脚本 fixture 集成回归
+  （dry-run 不落盘 / --write 备份与完好会话零触碰）、宿主真校验器可选通道
+  （DSH_HOST_MODULES 在位时过 validateStoredEvents；缺席如实 skip））。
+- 版本 `0.4.1-beta.2`；**未发布 npm**（G5/G6 真机项仍待批次，与 0.4.1-beta.1 的门禁结论一致）。
+
+### Notes
+
+- 与 v0.3.1 的差异只在基线：0.4.1 的 `tf-call` / `tf-ask` / `tf-skill` 与 `protocol.ts`
+  协议组件化不受影响；稳定前缀零漂移（协议金样与字符数护栏回归全绿）。
+- 宿主一致性补丁与 0.3.2 同源同修（两版本同一套 duck-type 契约缺口）；升级设计
+  （host-conformance 持续化）见 `docs/upgrade-v0.4.1-beta-host-conformance.md`。
+
+## [0.4.1-beta.1] - 2026-11-18
+
+**协议文本组件化（v0.4.1 主题：省 token + 内容可自定义 + 可删减瘦身）。** 自 0.4.0-beta.1
+分叉；命令表不动（14 硬上限）、四模式默认行为零变化、装配清单零变化。
+
+### Added
+
+- **协议组件化——`src/kernel/protocol.ts`（新内核模块）**：`DEFAULT_PROTOCOL_TEXT` 拆成 7 个
+  具名段（syntax / plan / results / selfread / timing / finalSummary / rules），由
+  `composeProtocolText({ level, sections, enablePlan })` 组装。**缺省组装与 0.4.0-beta.1
+  原文逐字节一致**——full 段文本由 v040 `src/entry/loop.ts` 程序化切分注入（不手抄），
+  `test/golden/v040-protocol.txt` 金样逐字节钉死（稳定前缀字节不漂移 = 缓存零回归）。
+- **精简档位 `protocolLevel: 'full'（默认）| 'lean' | 'minimal'`**：lean = 全 7 段压缩说明
+  文字（2,836 → 2,324 字符，省 18.1%）；minimal = 语法铁律面（selfread/timing 落选，
+  → 1,446 字符，省 49.0%）。语法行逐字保留，只砍解释性散文（harness 才是权威）。
+  字符数回归护栏进测试（C8）：改文本必须显式更新金样与断言。
+- **段级增删 `protocolSections`**：`{ plan: false }` 等逐段开关；未知段 id fail-fast 抛错
+  （装配错别字不静默）；本档未含的段可显式加回（缺专属文本时回退 full 文本）。
+- **自定义追加 `protocolAppend`**：追加在协议末尾（call 段之后）进稳定前缀——加一条
+  项目规则不用再抄 2,836 字符默认文本。**不变量段可关 `invariants: false`**（省 242 字符；
+  string 整段替换语义不变）。
+- **CLI `protocol` 子命令（预览工具）**：`dsh-stream-agent protocol --level minimal
+  --stats-only`——逐段字符数、总量对比 full、节省百分比；`--sections plan=off` /
+  `--append "…"` / `--code` / `--no-call` / `--no-plan` 可模拟装配效果；`--json` 机器可读。
+  "瘦身多少"可复算后才写进装配。
+
+### Fixed
+
+- **`enablePlan: false` 时协议仍声明「计划与验收」段**（0.4.0-beta.1 漏洞）：开关关了
+  ~285 字符的 tf-plan 引导段照发，模型被引导调用一个会被拒的命令，白烧一次错误往返。
+  现在 enablePlan=false **硬联动**去 plan 段（`sections.plan: true` 不能复活；命令级失败
+  兜底仍在驱动器——协议不声明 + 驱动器拦截，防御纵深）。
+
+### Changed
+
+- 组装顺序：`基座（protocolText 替换 或 档位+段组装）+ code 段 + call 段 + protocolAppend`；
+  优先级 `protocolText > protocolLevel/protocolSections > 缺省 full`。档位与段配置都是
+  **构造期冻结**（进稳定前缀，会话内不突变——O4 红线不变）。
+- `LoopEntryConfig` 新增 `protocolLevel`（宽松 string，未知值归一 full + 告警）、
+  `protocolSections`（宽松表，未知段告警丢弃）、`protocolAppend`、`invariants: string | false`。
+- README 数字回填实测值：331 用例 / dist 28 文件（v0.4.0-beta.1 残留的 275/25 旧数一并修正）。
+
+### 已知限制（beta 边界，如实记录）
+
+- 全部节省数字为**静态源文本字符数**（协议进稳定前缀、每请求计费，缓存命中后按
+  cache-read 计价）；没有真机四分量复算，不宣称 token 折算率——P6 三臂复跑后补。
+- `protocolLevel` 不进模式目录（四模式默认逐字节不变）；要把 lean 档绑进 lean 模式属
+  行为变更，待评审。
+- 控制页 UI 不新增协议档位控件（CLI `protocol` 子命令已覆盖预览需求；UI 改动留待
+  有真机批次时一并做）。
+
+## [0.4.0-beta.1] - 2026-11-18
+
+**能力对等 beta（G1-G3）+ 工具面真实化（P1）+ 通用调用通道（P2/G2）+ 对等装配面（P3）+ 模式切换（P4）+ PTC 对等（P5）+ 基线度量（P0）。**
+设计文档：`upgrade-plan/v0.4.0-stream-mode-design.md`（2026-11-18 评审定案，决议见 §16）。
+自 0.3.1 分叉；`check` 扩到 6 项（命令表 ≤14 + preset↔矩阵一致）。
+
+### Added
+
+- **工具面真实化（P1）——`src/entry/tool-surface.ts`（新模块）**：会话首请求从宿主
+  `ctx.tools.resolve / ctx.tools.schemas` 解析并冻结准入视图；此后只允许新增（additions-only）；
+  解析失败沿用旧面（degraded=stale 一行注入 + 台账）。降级阶梯 L0-L2（L3 装载期拒绝，0.3.0 已有）。
+  无宿主面（headless/离线）= 稳态 protocol-only（0.3.x 行为，不注行不记账——mock/评测零噪声）。
+  配置：`toolSurface: core|standard|full|off`（默认 standard，off=回退点）、
+  `nativeTools`（默认 false——schema 的每请求成本由 tf-call 逐调用成本替代）、
+  `strictAdmission`（默认 false，R5 决议：beta 不透传 toolSet，P6 复跑后再收紧）。
+- **tf-call 通用调用通道（P2/G2）**：协议命令表 11→14（=§6.4 硬上限，检查5 把关）：tf-call + tf-ask（阻塞提问，`q`/`header`/`options` 逗号标签）+ tf-skill（技能装载）。tf-call 的 body = JSON
+  参数对象透传 `ctx.tools.execute`；unknown-tool 结构化失败注入带前缀匹配建议（不回灌全表）；
+  bad-json-arguments 结构化失败；观测按宿主工具名分族（obs.ts 扩族：skill/agent/job/ask
+  高增益候选，office/goal 回执族）。协议段 533 字符（DEFAULT_CALL_PROTOCOL_SECTION，含两条专用语法）。
+- **对等装配面（P3）**：`preset/stream/cordis.patch.yml` 从 4 行扩到 16 行（与 ptc preset
+  同款全量：web/skill/goal/plan/jobs/schedule/ask/todo/present/office/subagent）；
+  workflow 不启用（§5.2 非目标，与 ptc 对齐）。检查6 把关 preset↔矩阵一致性。
+- **模式切换（P4/G3）——`src/entry/preset-router.ts`（新模块）**：空白会话三向切换
+  （standard↔ptc↔stream）；已开回合 `agent-preset/locked` 原样上抛（不自行判断、不包装）；
+  服务缺席返回 undefined（无切换面）。控制页（ui/）GET 附 preset 名册（只读展示），
+  切换本体在宿主"新建会话选择 preset"入口。控制页/状态面新增 `toolSurface` 能力档字段
+  （modes.ts：模式提供档位默认值——lean=core、compat=off、balanced/power=standard，不是第五个模式）。
+- **PTC 对等（P5）**：tf-code 绑定从固定 3 个（write/read/pwsh）扩为按会话冻结工具面生成
+  （固定三个恒在——旧程序体只增不减）；绑定并发上限 `maxParallelBindings`（默认 4，
+  对齐 ptc maxParallelSubCalls 语义）。
+- **基线度量（P0）——`eval/tools/surface-baseline.cjs`**：对等矩阵 + schema 源文本成本
+  （standard 面可提取 ≈17.4KB/27 块，真机成本待复测）+ stream 固定协议段字符数（src 导入实测）。
+  产出：`docs/capability-parity.md` + `eval/runs/surface-baseline-2026-11-18.{txt,json}`。
+
+### Changed
+
+- **`npm run check` 4 项 → 6 项**：新增检查5（协议命令表 ≤14 硬上限，G2/§6.4）与
+  检查6（preset 声明 ↔ 对等矩阵一致，R3 漂移把关）。
+- 控制页状态面（runtime + fallback）与模式目录新增能力档字段；README 命令表 12 条（上限 14）。
+- tf-code 绑定缺省面从固定三件变为"固定三件 + 会话冻结面"（无面 = 0.3.x 行为，回退点不变）。
+
+### 已知限制（beta 边界，如实记录）
+
+- 真机三臂复跑（P6/G4 token 门槛）未执行：本版为能力面交付，T1 ≤ 0.3.1×1.15 的门槛判定
+  待有 key 的实机批次（`docs/capability-parity.md` 的 schema 成本为静态近似下界）。
+- 宿主管理的 deferLoading 投放需要 request/header + developer/message 事件（E6 红线：本插件
+  不写）→ T2 由 tool-surface 自管：nativeTools 开启时 core 档白名单声明 + additions-only；
+  非 core 工具可达性走 tf-call（不声明 schema），这是省 token 的主线。
+- `exit_plan_mode` 的对等是语义等价（tf-plan + 收束判定），不是宿主 plan-mode 状态机
+  （矩阵如实标注）。
 
 ## [0.3.1] - 2026-11-18
 
-**桌面端思考过程显示修复 + 任务半途截断修复 + 第三方评审反馈修复合集。** 三部分内容并入
-同一补丁版本：评审反馈修复（只动评测产物与文档，不改运行时行为）、思考过程显示修复与
-截断修复（改运行时行为，见下）。
-
-### Fixed（任务半途截断 —— 占位 final / 过期 final / 重复命令）
-
-**现象**：任务做到一半就"收尾"，用户侧看到的最终答案是一句 `placeholder`；桌面端过程区
-里还能看到裸的 `</tf-bash>` 之类协议残片。取证实录：模型第 4 步写下
-`<tf-final id="f1" summary="placeholder"/>`，之后又继续跑了 3 步，而那条过期 final 仍是
-"最后一个 ok 的 final"，回合结束时被当作交付答案落盘。
-
-四个根因，逐一修复：
-
-- **占位 final 被照单全收**：`tf-final` 只要有 `id` 就算收敛，summary 是空串/占位词也照样
-  交付。新增 `kernel/final.ts`（纯函数、零 IO）做 summary 质量闸：空 → `empty`，
-  占位形态（`placeholder` / `占位` / `TODO` / `TBD` / `N/A` / `待补` / 纯标点 …）→
-  `placeholder`；判据刻意保守，`done`、`已完成` 这类短答案一律放行（不猜"答案够不够详细"）。
-  被拒 → 注入 `[tf-stream:error]` 结构化原因（要求写最终答案原文），同类拒绝只注入一次；
-  模型屡教不改 → 回合以 `blocked` 如实收场，绝不再把占位当交付。
-- **过期 final 仍被当答案**：新增回合级命令序（`#cmdOrder` / `#lastFinalOrder` /
-  `#lastNonFinalOrder`）——一条 final 之后又发出过任何非 final 命令，这条 final 即判
-  `stale`（答案已过期），必须在本流末尾重新声明；`tf-final` 候选同时按**回合归属**过滤，
-  上一回合的 final（含 resume 回放 `turn=0`）不得充当本回合答案。同 id 覆盖式重发会刷新
-  final 序，不再被误判过期。
-- **重复命令空手而归**：观测内容只在"易变尾"注入一次，跨请求即消失（历史里只剩句柄目录行）；
-  模型丢上下文后最自然的动作就是把同一条 read/glob 再发一次，而旧实现只回
-  `duplicate-idempotent（handle=…）`——内容拿不到，于是原地打转直到用占位 final 收场。
-  新增 `#queueReplay` / `#materializeReplays`：幂等语义不变（**不重复执行**），但把原结果
-  按既有上限回灌一次（`[tf-stream:replay]`，带 handle 与 `tf-peek` 指引），每回合上限 4 次，
-  超限记 `replay-capped` 不静默。回灌**延迟物化**——只有真正要发下一次请求时才 `peek`，
-  收敛/阻断路径直接丢弃，不占 `injected` 计数（口径仍是"确实进入模型上下文的观测负载"）。
-- **孤立闭合标签落进正文**：模型给自闭合命令又补一次闭合（或手写残片）时，`</tf-xxx>` 在
-  ground 态没有配对打开，旧 parser 判 prose 透传 → 以纯文本落进 assistant/message。
-  现在按 `malformed(stray-close-tag:<name>)` 记账后丢弃，跨 chunk 与流末尾半截同样处理；
-  `</div>` 这类普通 HTML 闭合不受影响。
-
-回归：298 用例全绿，新增 8 条——`K1` 占位 final 被拒后重发真答案、`K2` final 后又发命令判
-过期、`K3` 重复命令回灌原结果、`K4` 屡教不改不交付占位答案；解析器侧 4 条（孤立标签 / 跨
-chunk / 流末半截 / HTML 闭合不误伤）。
+**桌面端思考过程显示修复 + 第三方评审反馈修复合集。** 两部分内容并入同一补丁版本：
+评审反馈修复（只动评测产物与文档，不改运行时行为）与思考过程显示修复（改运行时行为，
+见下）。
 
 ### Fixed（思考过程显示 —— 桌面端"乱码"bug）
 

@@ -11,25 +11,25 @@
 **给 DeepSeek Harness 换一颗单流的心。** 把"模型看到什么、何时被打断"从回合制改成单流协议：
 一次请求内写完全部操作命令，边流边执行，只在真正需要信息时才发下一次请求。
 
-真连实测（10 任务、两臂同模型 `deepseek-flash`，2026-11-15-v02 批次，四分量口径由
-`summarize.cjs` 复算）：**token 用量降到原生 loop 的 28.9%，任务正确性持平**。
-历史批次的 22.3% 口径见 [eval/RESULTS.md](eval/RESULTS.md) §6 的如实说明——两批不可混用，
+真连实测（10 任务、两臂同模型 `deepseek-flash`，2026-11-15-v02 批次，口径由
+`summarize.cjs` 复算，四列同表见 §7）：**四分量（未缓存输入+缓存读+缓存写+输出）降到
+原生 loop 的 28.9%（446,410 → 129,178；本批缓存写两臂均为 0——未触发即无分量），
+任务正确性持平（checks 9/10）；代价是请求数 50 → 59（+18%）、严格二分量（未缓存
+输入+输出）134.9%（52,682 → 71,066，插件更高——这正是 P0-2/P0-10 要压的方向）**。
 R3 重跑后以同批双臂复算为准。
-
-另有一组**单会话**实测（2026-11-21，同一任务开/不开插件各一次）：总 token **600,410 →
-109,546（−81.8%）**，未缓存输入 **14,471 → 8,840（−38.9%）**。明细与命中率变化的诚实解读见
-[§7.1](#71-单会话实测开--不开插件v033)。
+对账主口径是聚合三元组 **ΣproviderInput / N / resetCount**（v0.4.3 尺子，request 记录逐条可复算，
+见 §7.3）；缓存命中率为 diagnostic-only（分母随总量压缩收缩，比值不可跨实验比较）。
 
 |       |                                                                                                                                                                    |
 | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 宿主  | DeepSeek Harness `0.2.2-rc.1`（类型锚点）/ `rc.3`（运行时实测）                                                                                                     |
 | 依赖  | 零 npm 依赖；Node ≥ 22.18（原生类型擦除）                                                                                                                           |
-| 测试  | 339 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力/会话格式/宿主一致性/截断·收束与宿主契约冲突回归）                                                                              |
+| 测试  | 388 用例全绿，零 API 调用（mock 全链路 + 20 个场景 + 装载/桌面页/新能力/会话格式/协议组件化/宿主一致性/缓存与计划持久性/前缀退路（含混合尾反例）与尺子回归）                                                              |
 | 形态  | 单 bundle 包 + **专用 profile**（`profiles/stream` 模板）；`dsh plugin remove` 整层消失、宿主 loop 原子恢复                                                          |
 | 控制栏 | `dsh-stream-agent bar`：四模式 + 中英切换 + 意图核对，装载时自动打印上手引导                                                                                       |
 | 桌面页 | 客户端左侧栏「控制栏 / Control bar」：状态 + 四模式 + 中英切换，**不改 Electron 壳**                                                                               |
-| 计量  | 四分量脚本出数 + 回放一致性对照臂 10/10 + 发布门禁 6 项                                                                                                             |
-| 发布  | GitHub [Releases](https://github.com/54dsb1/dsh-stream-agent/releases) · npm [`@hugesb/dsh-stream-agent`](https://www.npmjs.com/package/@hugesb/dsh-stream-agent)（`0.3.3` 起；安装形态仍限专用 profile，见 §2）                                                      |
+| 计量  | 七列计量（P0-10，§7.3 可外部复算）+ 四列同表 + 回放一致性对照臂 10/10 + 发布门禁 6 项                                                                                                             |
+| 发布  | GitHub [Releases](https://github.com/54dsb1/dsh-stream-agent/releases) · npm `@hugesb/dsh-stream-agent` **尚未发布**（当前唯一安装路径见 §2）                                                      |
 
 > **0.3.0 安装方式变更（重要）**：独立模式下本插件**只允许装进专用 profile**
 > （`profiles/stream` / `profiles/stream-headless`）。0.2.x 的"plugin add 进既有
@@ -108,22 +108,16 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 
 模式 → 配置对应（改模式 = 改这些值；显式配置 > 模式 > 内置默认）：
 
-| 模式 | `selfReadFeedback` | `enableCode` | `persistFallback` | 并行 | 停滞重入 | `budgetTokens` |
+| 模式 | `selfReadFeedback` | `enableCode` | `persistFallback` | 并行 | 重入 | `budgetTokens` |
 | --- | --- | --- | --- | --- | --- | --- |
-| `balanced` | `receipt` | `false` | `true` | 3 | 12 | — |
-| `lean` | `receipt` | `false` | `true` | 2 | 8 | 60,000 |
-| `compat` | `full` | `false` | `true` | 1 | 16 | — |
-| `power` | `receipt` | `true` | `true` | 3 | 14 | — |
-
-「停滞重入」= **连续没有新增产出**的重入次数上限（v0.3.3 起）。每步都在读/写/跑命令
-（拿到新事实）的重入不计入这个预算——生产性工作不会被次数硬杀；真正兜底的是回合请求
-硬上限（2×重入）与收束期。撞墙时先注入一条收束指令（最多 2 次），仍无 `tf-final`
-则写一条**明确标注未完成**的交付说明，不把半截会话丢给用户。
-
+| `balanced` | `receipt` | `false` | `true` | 3 | 8 | — |
+| `lean` | `receipt` | `false` | `true` | 2 | 6 | 60,000 |
+| `compat` | `full` | `false` | `true` | 1 | 12 | — |
+| `power` | `receipt` | `true` | `true` | 3 | 10 | — |
 
 一句话决策：**默认 `balanced`；账单敏感换 `lean`；排障对照换 `compat`；写程序处理数据换 `power`。**
 
-## 4. tf-* 协议（11 条命令）
+## 4. tf-* 协议（14 条命令，v0.4.0 硬上限）
 
 语法权威是 `src/kernel/parser.ts`；完整闭环语义见 [docs/protocol.md](docs/protocol.md)。
 
@@ -140,10 +134,39 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 | `tf-plan` | 声明/修订计划与验收项（`- [id] 描述` 行） | 状态在驱动器侧，请求只注差分 |
 | `tf-final` | 收尾（summary 必须含答案原文） | 有未验证验收项时判过早（F5） |
 | `tf-code` | 程序化工具调用（**默认关闭**；`power` 或显式开启） | 上限内值完整注入；超限骨架+句柄；失败 `kind` + 可重试结论 |
+| `tf-ask`（v0.4.0） | 阻塞式提问（`q` 必填；`header`/`options` 逗号分隔可选；映射宿主 ask_user_question） | 用户回答完整注入（ask 族 high）；复杂多问/选项描述走 tf-call body |
+| `tf-skill`（v0.4.0） | 装载技能（`name` = 技能名；映射宿主 skill） | 技能说明完整注入（skill 族 high）；装载是会话级行为 |
+| `tf-call`（v0.4.0） | 通用调用通道：`name` = 本会话工具面内的宿主工具名，body = JSON 参数对象（web/skill/job/schedule/goal/ask/todo/present/office/subagent 等全部可达） | 按宿主工具分族处理（读类注入、写类回执）；unknown-tool 注入带相近工具名建议；`toolSurface: off` 或无宿主面时关闭（协议段 0 字符） |
 
 公共属性：`id`（缺省自动编号）、`depends_on`（依赖，环会被检测并具名失败）、
 `accepts`（验收关联，F5）。两条省 token 的纪律写在协议文本里：**不要读自己刚写过的文件**
 （只回回执）、**不要用 tf-bash 做搜索**（tf-grep/tf-glob 更省且只回匹配行）。
+
+### 4.1 协议瘦身与自定义（v0.4.1-beta.1）——每请求注入成本可配
+
+协议文本已组件化（`src/kernel/protocol.ts`）：7 个具名段（syntax / plan / results / selfread /
+timing / finalSummary / rules）按档位组装；**缺省组装与 0.4.0-beta.1 原文逐字节一致**
+（金样测试钉死，缓存零回归）。省 token 的抓手：
+
+| 配置 | 作用 | 稳定前缀实测 |
+| --- | --- | --- |
+| `protocolLevel: 'full'`（默认） | 0.4.0 原文，不配置 = 行为不变 | 2,836 字符 |
+| `protocolLevel: 'lean'` | 全 7 段保留，压缩说明文字（语法表不减） | 2,324 字符（省 18.1%） |
+| `protocolLevel: 'minimal'` | 只留语法铁律面（selfread/timing 落选） | 1,446 字符（省 49.0%） |
+| `enablePlan: false` | **硬联动**去「计划与验收」段——协议不再声明一个会被拒的命令（0.4.0 的漏洞：开关关了段还在） | 再省 285 字符 |
+| `protocolSections: { timing: false, selfread: true, ... }` | 段级增删；未知段 id fail-fast；本档未含段可显式加回 | 逐段 86–901 字符 |
+| `protocolAppend: '项目规则…'` | 自定义规则**追加**在协议末尾（call 段之后）——加一条规则不用抄 2,836 字符默认文本 | 按需 |
+| `invariants: false` | 不变量段整段不注入（`string` 替换语义不变） | 再省 242 字符 |
+
+组合参考：`protocolLevel: 'minimal'` + `enablePlan: false` = **1,161 字符（full 缺省的 40.9%）**。
+预览与复算：`dsh-stream-agent protocol --level minimal --stats-only`——逐段字符数、总量对比
+full、节省百分比；`--sections plan=off` / `--append "…"` / `--code` 可模拟装配效果；
+`--json` 机器可读。口径：字符数为源文本实测（`test/v041-protocol.test.ts` 钉死）；
+协议进稳定前缀、每请求计费（缓存命中后按 cache-read 计价）——文档不写未实测的 token 折算。
+
+优先级：显式 `protocolText`（整段替换）> `protocolLevel`/`protocolSections` > 缺省 full。
+档位与段配置都是**构造期冻结**（进稳定前缀，会话内不突变——O4 红线不变）；
+`enablePlan: false` 时命令级失败兜底仍在（协议不声明 + 驱动器拦截，防御纵深）。
 
 ## 5. 计划、恢复、长会话（默认开启，各有关闭点）
 
@@ -211,7 +234,7 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 
 | 工具 | 用途 | 当前证据 |
 | --- | --- | --- |
-| `eval/tools/summarize.cjs` | M1 四分量汇总（输入/缓存读/缓存写/输出；缺失分量标"不可得"） | 2026-11-15-v02 stamp：基线 446,410 → 插件 129,178（28.9%），逐任务见 summary.json |
+| `eval/tools/summarize.cjs` | M1 四分量汇总（输入/缓存读/缓存写/输出；缺失分量标"不可得"） | 2026-11-15-v02 stamp：基线 446,410 → 插件 129,178（**四分量 28.9%**；未缓存输入 33,028→42,782、缓存读 393,728→58,112、缓存写 0→0、输出 19,654→28,284），请求数 50 → 59、checks 9/10——四列同表见下，逐任务见 summary.json |
 | `eval/tools/replay-check.cjs` | M3 回放一致性（重放树哈希 == 实跑树哈希） | 对照臂 **10/10**（修复属性序敏感与增量字段名两个根因后）；基线臂取证面受限如实标注 |
 | `eval/tools/t3-cells.cjs` | M2 T3 三格（B / A-1a / A-1b 首请求拆分归因） | 脚本 + 三臂 patch 就绪；tf-code 段实测 1,175 字符；三格数字待同批真机 |
 | `eval/tools/runner.cjs` | R3 评测矩阵（双臂 10 任务 + 哨兵） | 0.3.0 重跑待真机（新协议面） |
@@ -219,34 +242,45 @@ dsh plugin remove @hugesb/dsh-stream-agent --profile stream
 | `npm run check` | R2 装配与文档一致性（entry 集/inject/顺序/README 命令表 4 项） | 一条命令复跑 |
 | `npm run gate` | R4 发布门禁（C1/C2/C8/C9 + 装配一致 + 回退演练） | 离线项就地判定；真机项（G5/G6）如实标待复测，未过不发布 |
 
-口径纪律：单位任务 token = Σ(input + cacheRead + cacheWrite + output)（四分量，逐请求
-usage 原文留存可复算）；缓存分量缺失标"不可得"不按 0 计；标题旁路请求两臂同剔；
-二分量只能作参考并显式标注。
+**对外表格固定四列**（升级清单 P1-4；缺任一列的口径不得对外引用）：
 
-### 7.1 单会话实测：开 / 不开插件（V0.3.3）
+| 批次 | 请求数（基线 vs 插件） | 二分量：未缓存输入+输出 | 四分量：未缓存输入+缓存读+缓存写+输出 | checks |
+| --- | --- | --- | --- | --- |
+| 2026-11-15-v02（10 任务合计） | 50 vs 59（+18%） | 52,682 → 71,066（**134.9%**，插件更高——请求数与输出都更多） | 446,410 → 129,178（**28.9%**） | 9/10 |
 
-2026-11-21，桌面端真实会话，同一模型、同一任务、同一份上下文起点，两侧各跑一次
-（`deepseek-flash`，usage 取每请求原文后相加）：
+> 标注纪律（2026-11-22 复核修正，见 `dsh-stream-agent-v0.4.3-清单符合性核查-2026-11-22.md` §3）：
+> 「输入」一律指**未缓存输入**；缓存读单列、计入四分量但不计入严格二分量——同名字段
+> `M1_tokens.input`（= 未缓存+缓存读+缓存写）与 `summary.json` 的 `inputTokens`（= 未缓存）
+> 同名不同义（历史 metrics.json 不回改）；两个口径的正名与 costPerPass 价格快照机制见 `eval/METRICS.md`。
+> **22.3%（840,138 → 187,290）是 cacheRead 二次计入的错值，已作废**——历史上它被标为
+> "0.2.0 更早批次的四分量"，该批次不存在。任何只引一个百分比的标题都不合格。
+> 逐分量原文见 [eval/RESULTS.md](eval/RESULTS.md) §6.1。
+>
+> 口径纪律：单位任务 token = Σ(未缓存输入 + cacheRead + cacheWrite + output)（四分量，逐请求
+> usage 原文留存可复算）；缓存分量缺失标"不可得"不按 0 计；标题旁路请求两臂同剔；
+> 严格二分量只能作参考并显式标注。对外标题不出现单一倍数或命中率主卖点。
 
-| 指标 | 不开插件 | 开 V0.3.3 | 变化 |
-| --- | ---: | ---: | ---: |
-| **总 token 用量** | 600,410 | **109,546** | **−81.8%**（5.48×） |
-| **未缓存输入** | 14,471 | **8,840** | **−38.9%** |
-| 缓存读取 | 548,864 | 83,200 | −84.8% |
-| 输出 | 37,075 | 17,506 | −52.8% |
-| 缓存命中率 | 97.4% | 90.4% | −7.0 pt |
+### 7.3 v0.4.3 尺子：ΣproviderInput / N / resetCount（可外部复算）
 
-口径：`总 token = 未缓存输入 + 缓存读取 + 输出`（**DISJOINT**，缓存读写单列，不再重复计入
-输入）。两侧各自求和都精确等于所报总数，可逐项复算：
+request 记录（驱动器台账 `kind:'request'`）逐条携带：`prefixTokensEst`（本地估算 =
+Σ消息字符/4 上取整，交叉校验用）、`providerInputTokens`（计费输入 = 未命中 input +
+cacheRead + cacheWrite，权威值）、`cacheRead` / `cacheWrite` / `output`、`resetSeq` /
+`resetCause`（重置纪元与成因：`segment-drop` / `prefix-reset`）、`feedbackBytes{full,
+dedup, handle}`（反馈字节分类；dedup 由 P0-4/0.5.0 引入，0.4.3 恒 0）。
 
-- 不开插件：`14,471 + 548,864 + 37,075 = 600,410`
-- 开 V0.3.3：`8,840 + 83,200 + 17,506 = 109,546`
+- **ΣproviderInput** = Σ request 记录的 `providerInputTokens`（= `cacheStats().providerInputSum`）；
+- **N** = request 记录数（= `cacheStats().requests`）；
+- **resetCount** = 最后一条记录的 `resetSeq`（= `cacheStats().resetCount`）。
 
-**为什么命中率反而降了 7 个点（如实说明）**：命中率是比值。插件把请求数与注入总量压掉一个
-数量级之后，分母里的未缓存输入虽然也从 14,471 降到 8,840（−38.9%），但缓存读取降得更狠
-（548,864 → 83,200，−84.8%），比值因此从 97.4% 落到 90.4%。真正决定账单的是**未缓存输入的
-绝对量**和**总量**；把总量压小是目标，命中率只是结果之一。跨方案比较命中率时请固定任务与
-上下文规模，并同时报绝对量——只报百分比会得出相反结论。
+七列推导（P0-10，每次发布固定）：`N` = request 记录数；`inputPerPass` = ΣproviderInput /
+通过任务数；`outputPerPass` = Σoutput / 通过任务数；`costPerPass` =
+Σᵣ(uᵣ·p_u + cᵣ·p_c + wᵣ·p_w + oᵣ·p_o) / 通过任务数——**价格乘数不写死，按发布日价格
+快照（`eval/price-snapshot.json`，机制见 `eval/METRICS.md` §9）计算；快照未回填时该列
+标"待价格快照"**；`resetCount` 同上；`cacheReadAbs` = Σ`cacheRead`；`checks` 来自评测
+批次。少一列不算结果（待快照的 costPerPass 如实标注）。
+
+`cacheHitRatio` 保留为 **diagnostic-only**：分母随总量压缩而收缩，命中率与低成本在
+本插件形态下必然背离（升级清单 §0.5），不进门禁、不进对外标题。
 
 ## 8. 控制栏与桌面页
 
@@ -256,6 +290,9 @@ usage 原文留存可复算）；缓存分量缺失标"不可得"不按 0 计；
   - `bar` 交互面板：1-4 切模式、↑↓ 移动、`l` 中英切换、`?` 全模式指南、`r` 重置、`q` 退出；
   - `status` / `mode <balanced|lean|compat|power>` / `lang <zh|en>` / `--json`；
   - `intents` 列出各会话"有意图无回执"（F6 停机核对）；`intents --ack <session>` 人工确认后闭合；
+  - `protocol` 协议组装预览（v0.4.1）：逐段字符数 + 总量对比 full + 组装全文——
+    `--level <full|lean|minimal>`、`--sections plan=off,...`、`--no-plan`、`--append "…"`、
+    `--code`、`--stats-only`、`--json`；瘦身效果先预览再写进装配；
   - `help` 全模式指南。
 - **桌面页**：客户端左侧栏「控制栏 / Control bar」——接管状态、当前模式与来源、六个生效
   参数、四张模式卡（"什么时候选 / 代价" + 省 token 档位 + 可用性标注）、中英切换；
@@ -269,14 +306,14 @@ usage 原文留存可复算）；缓存分量缺失标"不可得"不按 0 计；
 ```
 dsh-stream-agent/
 ├── src/
-│   ├── kernel/            # 内核：parser / render / obs / gate / state / modes / control-bar
+│   ├── kernel/            # 内核：parser / render / obs / gate / state / modes / control-bar / protocol
 │   │                      #   （零依赖、无 IO、可独立单测）
 │   └── entry/             # Cordis 薄壳：loop（驱动器+工厂）/ ptc-bridge / intent-log /
 │                          #   json-persistence / state-handle / obs-broker / action-gate /
 │                          #   context-render / eval-probe / mock-provider / control-bar* /
 │                          #   cordis-compat / takeover-registry
 ├── ui/                    # 桌面控制页子包（独立 dsh.client；主包不得声明）
-├── dist/                  # 构建产物（25 个文件，提交入库，patch 直接引用）
+├── dist/                  # 构建产物（28 个文件，提交入库，patch 直接引用）
 ├── profiles/
 │   ├── stream/            # S1 专用 profile 模板（web 入口 + registry 默认值覆盖）
 │   └── stream-headless/   # S1 headless 入口变体
@@ -289,15 +326,15 @@ dsh-stream-agent/
 │                          #   disabled-lines-audit / v0.4.0-plan / TEST-PROPOSITIONS
 ├── scripts/               # build / check-consistency / gate / install-check / install-cycle /
 │                          #   repair-session-logs / release
-└── test/                  # 339 用例（kernel 2 套 + entry 22 套 + 20 mock 场景；零 API）
+└── test/                  # 388 用例（kernel 2 套 + entry 26 套 + 20 mock 场景；零 API）
 ```
 
 ## 10. 开发
 
 ```bash
-npm test          # 339/339，零 API 调用
-npm run build     # 产出 dist/ 25 个文件 + 全量 smoke import + 桌面页构建闸门
-npm run check     # R2：装配与文档一致性 4 项
+npm test          # 388/388，零 API 调用（1 例预置跳过）
+npm run build     # 产出 dist/ 28 个文件 + 全量 smoke import + 桌面页构建闸门
+npm run check     # R2：装配与文档一致性 6 项
 npm run gate      # R4：发布门禁 6 项（真机项如实标待复测）
 node eval/tools/f6-kill-drill.cjs --rounds 10   # F6 强杀演练（离线，零 API）
 npm run release:dry
@@ -307,7 +344,7 @@ npm run release:dry
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/protocol.md](docs/protocol.md) | 协议语法与闭环语义（11 条命令 + F5/F6/F7 语义） |
+| [docs/protocol.md](docs/protocol.md) | 协议语法与闭环语义（14 条命令 + F5/F6/F7 + tf-call 语义 + v0.4.1 组件化） |
 | [docs/limitations.md](docs/limitations.md) | 已知限制（按"你会不会踩到"排序，每条带取证） |
 | [docs/adr-001-segment-boundary.md](docs/adr-001-segment-boundary.md) | 长会话段边界 ADR（整块丢弃 vs 宿主压缩的决策） |
 | [docs/disabled-lines-audit.md](docs/disabled-lines-audit.md) | 禁用行审计表（S5：每条停用/保留的依据） |

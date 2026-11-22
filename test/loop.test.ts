@@ -314,11 +314,13 @@ describe('B. O6 preflight 前缀断言', () => {
   let harness: Harness | undefined;
   beforeEach(() => { harness?.cleanup(); harness = undefined; });
 
-  it('B1. preflight 违反 → render() 抛 PrefixBrokenError → runTurn 拒绝且不再发请求（fail-closed）', async () => {
+  it('B1. preflight 违反 → P0-6⑤ 收场：0 重发 + prefix-broken 可诊断 + 兜底交付 + blocked（不再炸出异常）', async () => {
     // 内核 render.ts 的公共 API 结构上不可能破坏前缀（append-only + truncateAppendTail
     // 显式推进基线，04 号已单测）——O6 断言防的是"装配器被 bug 绕过"。
-    // 这里用包装 renderer 模拟第二次装配时稳定段被改写，验证驱动器侧的处理：
-    // 拒绝发送、不吞错、turn 以 DRIVER_ERROR 收场。
+    // 这里用包装 renderer 模拟第二次装配时稳定段被改写，验证驱动器侧的处理（v0.4.3 P0-6③④⑤
+    // 新契约）：拒绝发送第二个请求、prefix-broken 台账可诊断、receipt 最小对账、
+    // 有 ok 命令即写兜底交付，turn 以 blocked 收场——异常只上抛开发者日志，
+    // 不再作为用户可见终态（旧实现直接炸出 runTurn，用户侧只剩半截输出）。
     const sandboxDir = mkdtempSync(join(tmpdir(), 'tf-loop-'));
     try {
       const model = createMockModel({
@@ -347,6 +349,7 @@ describe('B. O6 preflight 前缀断言', () => {
         appendHandleDelta: (d: never) => base.appendHandleDelta(d),
         setTail: (t: Array<{ role?: 'user' | 'assistant' | 'tool' | 'system'; content: string }>) => base.setTail(t),
         stableHash: () => base.stableHash(),
+        stableMessages: () => base.stableMessages(),
         render: () => {
           renders += 1;
           if (renders >= 2) throw new PrefixBrokenError(0, 'old', 'mutated', '模拟装配被改写');
@@ -362,14 +365,14 @@ describe('B. O6 preflight 前缀断言', () => {
         brokenRenderer,
       );
       driver.pushUserTask('前缀破坏演练：写一个文件。');
-      await assert.rejects(
-        () => driver.runTurn(),
-        (error: unknown) => error instanceof PrefixBrokenError,
-        'O6 preflight 必须拒绝发送（fail-closed）',
-      );
+      const reason = await driver.runTurn();
+      assert.equal(reason.kind, 'blocked', 'P0-6⑤：fail-closed 后以 blocked 收场（异常不再炸出 runTurn）');
+      assert.ok(reason.kind === 'blocked' && (reason.detail ?? '').includes('前缀校验失败'), 'blocked 文案必须可诊断（含前缀校验失败）');
       const snap = driver.snapshot();
-      assert.equal(snap.requestCount, 1, '违反前缀断言后不得发出第二个请求');
-      assert.ok(snap.records.some((r) => r.kind === 'fault' && r.fault === 'driver-error'), '驱动器异常应有 fault 记录（fail-open 不静默）');
+      assert.equal(snap.requestCount, 1, '违反前缀断言后不得发出第二个请求（0 重发）');
+      assert.ok(snap.records.some((r) => r.kind === 'fault' && r.fault === 'prefix-broken'), '前缀破坏应有可诊断 fault 记录');
+      assert.ok(snap.records.some((r) => r.kind === 'fault' && r.fault === 'fallback-final'), '有 ok 命令（tf-write ok）→ 必须写兜底交付（P0-6⑤）');
+      assert.ok(!snap.records.some((r) => r.kind === 'fault' && r.fault === 'driver-error'), '异常不上抛为 DRIVER_ERROR（只走开发者日志）');
     } finally {
       rmSync(sandboxDir, { recursive: true, force: true });
     }

@@ -16,9 +16,12 @@
 | `tf-peek` | `handle`、`from`/`to` | 从句柄取回行段 | 按需注入 |
 | `tf-final` | `id`、`summary` | 声明任务完成 | 触发收束判定；同 id 携带新 summary = 覆盖最终答案（last-wins）；**有未验证验收项时判过早（F5）** |
 | `tf-code` | `description`，可选 `timeout`（毫秒）；body = async TS 函数体（可擦除语法） | 程序化工具调用（PTC 桥接）：绑定 `tools.write/read/pwsh` 走宿主管线。**0.3.0 K1：默认关闭**（协议段 0 字符），显式 `enableCode: true` 或 `power` 模式才启用 | 成功：上限内值完整注入（F3，缺省 4000 字符），超限骨架+句柄；失败：结构化 `[kind retry 结论]`（K3 八类 + quota-exceeded）；运行受 K5 配额（64 子调用/256KiB/300s）与 K2 沙箱记账（mode/denied/enforcement，`partial` 显式可见）约束 |
+| `tf-call`（0.4.0 G2） | `name`（本会话工具面内的宿主工具名）；body = JSON 参数对象 | 透传 `ctx.tools.execute`（同一 guard/sandbox 管线）；结果按宿主工具分族（web/skill/agent/ask/job → high 候选，office/goal/todo → 回执）；unknown-tool 注入带前缀匹配建议（不回灌全表）；bad-json-arguments 结构化失败；`toolSurface: off` 或无宿主面时协议段 0 字符（回退点） |
+| `tf-ask`（0.4.0 §6.4） | `q` 必填；`header`/`options`（逗号分隔标签）可选 | 映射宿主 ask_user_question；用户回答完整注入；`id` 作为问题 id 回显 |
+| `tf-skill`（0.4.0 §6.4） | `name`（技能名） | 映射宿主 skill；技能说明完整注入（会话级行为变更） |
 | `tf-plan`（0.3.0 F5） | 无；body = `- [id] 验收项描述` 行 | 声明/修订任务计划与验收项（状态放驱动器=宿主侧；请求只注**差分**） | 命令成功时在命令上加 `accepts="<id>"` 声明回执 → 验收项记已验证；缺项/未验证 → tf-final 判过早。`enablePlan: false` 关闭（回退点） |
 
-命令可带 `depends_on` 声明依赖，`accepts` 声明验收关联（F5），驱动器据此决定派发时机与收敛判定。
+tf-call 是通用调用通道（G2：命令表净增 1，上限 14）：对等矩阵见 [docs/capability-parity.md](docs/capability-parity.md)。命令可带 `depends_on` 声明依赖，`accepts` 声明验收关联（F5），驱动器据此决定派发时机与收敛判定。
 
 ## 驱动器闭环语义
 
@@ -43,6 +46,31 @@
 ## 上下文装配
 
 一次请求的 messages 分三段：**稳定前缀**（系统提示 + 任务 + 冻结的动态段）→ **观测注入**（只放高增益）→ **易变尾**（本轮新增内容）。装配规则：
+
+- **只追加，不改写**。禁止摘要、压缩、编辑中间内容——那会直接摧毁 prefix cache。
+- **O3 目录差分**：句柄目录不整段重注，只注自上次请求以来的增量（added / changed / stale 三列）。
+- **O4 动态冻结**：时间戳、目录快照等逐请求变化的内容一律移到易变尾，稳定前缀里不允许出现。
+- **O6 前提断言**：每次发请求前算 `renderHash`，与上一次比对必须单调，否则拒绝发送（fail-closed）。宁可任务失败，也不烧缓存。
+
+### 协议文本组件化（v0.4.1-beta.1）
+
+稳定前缀里的协议文本由 `src/kernel/protocol.ts` 组装，7 个具名段按 canonical 段序以
+空行连接：`syntax → plan → results → selfread → timing → finalSummary → rules`。
+
+- **缺省 = 0.4.0-beta.1 原文逐字节**（`composeProtocolText()`，金样
+  `test/golden/v040-protocol.txt` 钉死）——不配置就是老行为，缓存零回归。
+- **档位** `protocolLevel`：`full`（缺省）/ `lean`（全段压缩说明文字，2,324 字符）/
+  `minimal`（只留 syntax/plan/results/finalSummary/rules，1,446 字符）。语法行逐字保留。
+- **段级增删** `protocolSections`：`false` 落选、`true` 加回；未知段 id 抛错（fail-fast）；
+  某段在某档没有专属文本时回退 full 文本。
+- **enablePlan 硬联动**：`enablePlan: false` 时 plan 段整段落选——协议不再声明一个会被
+  驱动器拒绝的命令（`sections.plan: true` 不能复活；命令级失败兜底仍在）。
+- **自定义**：`protocolAppend` 追加在协议末尾（call 段之后）进稳定前缀；`invariants: false`
+  不注入不变量段。优先级：显式 `protocolText` > 档位/段配置 > 缺省 full。
+- 全部档位/段配置**构造期冻结**（O4：会话内不突变）；实测字符数由
+  `test/v041-protocol.test.ts` 钉死；CLI `dsh-stream-agent protocol` 可逐段预览复算。
+
+## 预算分级（O5）
 
 - **只追加，不改写**。禁止摘要、压缩、编辑中间内容——那会直接摧毁 prefix cache。
 - **O3 目录差分**：句柄目录不整段重注，只注自上次请求以来的增量（added / changed / stale 三列）。

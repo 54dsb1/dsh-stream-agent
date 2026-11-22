@@ -15,6 +15,8 @@
 import { readPersistedControl, writePersistedControl } from '../dist/entry/control-state.js';
 import { isModeId, modeConfig, publicModeCatalog } from '../dist/kernel/modes.js';
 import { isLang } from '../dist/kernel/control-bar.js';
+// v0.4.0（P4）：预设路由（空白会话三向切换的唯一入口；locked 具名识别）
+import { createPresetRouter, isPresetLockedError } from '../dist/entry/preset-router.js';
 import { VERSION } from '../dist/version.js';
 
 export const name = 'stream-agent-ui';
@@ -58,6 +60,7 @@ function fallbackStatus() {
       maxParallelToolCalls: preset.maxParallelToolCalls,
       maxReentries: preset.maxReentries,
       budgetTokens: preset.budgetTokens ?? null,
+      toolSurface: preset.toolSurface ?? 'standard',
     },
     modes: publicModes(),
     updatedAt: persisted.updatedAt ?? null,
@@ -161,7 +164,17 @@ export async function handleControlRequest(ctx, req, res) {
   }
 
   if (req.method === 'GET') {
-    sendJson(res, 200, { ok: true, status: currentStatus(ctx) });
+    // v0.4.0（P4）：预设名册 + 默认值（只读展示）。切换面缺席（headless/旧宿主）→ presets: null。
+    const router = createPresetRouter(ctx);
+    let presets = null;
+    if (router !== undefined) {
+      try {
+        presets = { items: await router.list(), defaultId: router.defaultId ?? null };
+      } catch (error) {
+        presets = { error: String(error?.message ?? error) };
+      }
+    }
+    sendJson(res, 200, { ok: true, status: currentStatus(ctx), presets });
     return;
   }
 

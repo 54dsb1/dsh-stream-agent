@@ -27,8 +27,10 @@
                         
                                                                    
                                                                                           
+                                                                                             
                                                                    
                                                                                        
+                                                                                             
                                                           // 未识别工具：默认按 low（默认不回灌）
 
                                                
@@ -63,15 +65,16 @@
 
 const HIGH_GAIN_FAMILIES                          = new Set([
   'read', 'grep', 'glob', 'web', 'test', 'build', 'code',
+  'skill', 'agent', 'job', 'ask',
 ]);
 const LOW_RECEIPT_FAMILIES                          = new Set([
-  'write', 'append', 'mkdir', 'bash',
+  'write', 'append', 'mkdir', 'bash', 'office', 'goal',
 ]);
 
 /** 工具名 → 工具族。tf-* 命令名与其同族名一一对应；未知工具归 other。 */
 export function classifyTool(tool        )             {
   const t = tool.toLowerCase();
-  if (t === 'tf-read' || t === 'read' || t === 'read_file' || t === 'cat') return 'read';
+  if (t === 'tf-read' || t === 'read' || t === 'read_file' || t === 'cat' || t === 'read_image') return 'read';
   if (t === 'tf-write' || t === 'write' || t === 'write_file' || t === 'edit' || t === 'tf-edit' || t === 'apply_patch') return 'write';
   if (t === 'tf-peek' || t === 'peek') return 'read';
   if (t === 'tf-bash' || t === 'bash' || t === 'shell') return 'bash';
@@ -81,6 +84,18 @@ export function classifyTool(tool        )             {
   if (t === 'tf-grep' || t === 'grep' || t === 'search' || t === 'grep_search') return 'grep';
   if (t === 'tf-glob' || t === 'glob' || t === 'list' || t === 'ls') return 'glob';
   if (t.startsWith('web') || t === 'fetch' || t === 'http') return 'web';
+  // v0.4.0：tf-call 透传的宿主工具名归类（standard/ptc 面的对等工具）。familyHint 优先级
+  // 高于前缀猜测：ask_user_question 是阻塞交互，回答必须可见（high）；skill 装载改变会话
+  // 行为；subagent 的产出就是报告本体；job/schedule 的 listing/output 是内容型。
+  if (t === 'ask_user_question' || t.startsWith('ask')) return 'ask';
+  if (t === 'skill' || t.endsWith('_skill')) return 'skill';
+  if (t === 'subagent' || t === 'subagent_fork' || t === 'workflow' || t === 'task' || t === 'agent') return 'agent';
+  if (t.startsWith('job_')) return 'job';
+  if (t.startsWith('schedule_')) return 'job';
+  if (t.startsWith('office_') || t === 'present') return 'office';
+  if (t.startsWith('goal') || t.endsWith('_goal')) return 'goal';
+  if (t === 'todo_write') return 'write';
+  if (t === 'exit_plan_mode') return 'ask';
   if (t === 'test' || t === 'run_tests') return 'test';
   if (t === 'build' || t === 'compile') return 'build';
   return 'other';

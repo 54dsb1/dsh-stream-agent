@@ -88,8 +88,8 @@ test('模式只映射既有配置项：默认模式与 0.3.0 出厂默认等价�
   assert.equal(balanced.enableCode, false, 'K1（0.3.0）：balanced 不再自动开 tf-code，协议段默认 0 字符');
   assert.equal(balanced.persistFallback, true);
   assert.equal(balanced.maxParallelToolCalls, 3);
-  // v0.3.2：8 → 12。语义是防打转兜底不是任务步数预算——计划+实现+验收类任务 9 步不够
-  // （真机 session-2079562e：8 步 blocked，任务未完成）。
+  // v0.4.2：8 → 12。语义是'防打转兜底'不是'任务步数预算'——真机（session-6b61cb4d）证明
+  // 计划+实现+验收的任务 9 步不够；失忆修复后残余打转由重复命令护栏兜底，上限只放宽兜底。
   assert.equal(balanced.maxReentries, 12);
   assert.equal(balanced.budgetTokens, undefined);
 

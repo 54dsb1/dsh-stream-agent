@@ -126,3 +126,30 @@ prefix_hit (M4):
   逐字节相等判定 + 差值 == tf-code 段长度判定）；三臂 patch：`eval-stream.yml`（B，
   v0.2.1 tag 产物）/ `eval-stream-code-on.yml`（A-1a）/ `eval-stream-code-off.yml`（A-1b）。
   三格必须同批跑，禁止拼历史数字。
+
+## 8. 输入字段正名（2026-11-22 符合性核查 §3.2；历史数据文件不回改）
+
+同名不同义是 22.3% 错值的根因之一，两个口径从此钉死：
+
+| 正名 | 含义 | 历史别名 |
+|---|---|---|
+| `inputUncached` | 未缓存输入（dsh-llm Usage 的 `inputTokens`；`summary.json` 同名） | — |
+| `inputTotal` | 未缓存输入 + 缓存读 + 缓存写（`metrics.json` 的 `M1_tokens.input`） | `M1_tokens.input` |
+| `inputUncached + output` | 二分量（严格口径：不含缓存读单列） | 旧文档「输入+输出」 |
+| `inputUncached + cacheRead + cacheWrite + output` | **四分量（对外权威口径）** | 旧文档「全量合计」 |
+
+对外表格一律用四分量；严格二分量只能作参考并显式标注（134.9% 高于基线是真实成本结构，不是错值）。
+**已作废**：22.3%（840,138 → 187,290）= 四分量 + cacheRead 二次计入（446,410+393,728、
+129,178+58,112），它被解释成的"0.2.0 更早批次"不存在。
+
+## 9. costPerPass 价格快照（P0-10 七列之一；核查 §4.5）
+
+`costPerPass = Σᵣ(uᵣ·p_u + cᵣ·p_c + wᵣ·p_w + oᵣ·p_o) / 通过任务数`，四个单价**不写死在
+代码或文档里**——按发布日从 DeepSeek 官网定价页取当日值，填入 `eval/price-snapshot.json`
+（schema 固定：`{ snapshotDate, currency, pricePerMtok: { uncachedInput, cachedRead, cacheWrite, output }, source }`）。
+
+- 未回填时：七列中 `costPerPass` 标 **"待价格快照"**，其余六列（N / inputPerPass /
+  outputPerPass / resetCount / cacheReadAbs / checks）照常可复算；
+- 回填后：任何外部复核用快照价可把 costPerPass 复算到个位（uᵣ/cᵣ/wᵣ/oᵣ 来自 request
+  记录的 providerInputTokens/cacheRead/cacheWrite/output，P0-7①）；
+- 快照文件随发布提交入库，跨发布不可比（价格变化必须换新快照并留痕）。

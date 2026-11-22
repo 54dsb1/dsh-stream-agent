@@ -26,12 +26,9 @@ import { createHash } from 'node:crypto';
 
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
 
-/** v0.3.2：assistant 消息的宿主来源元数据。宿主 LlmRuntime.forAdapter（dsh-llm
- *  lib/index.js:2277；GitHub master packages/llm/llm/src/index.ts 同源无防护）对请求里的
- *  每条 assistant 消息读 `message.source.replayState`——source 缺失 = TypeError
- *  "Cannot read properties of undefined (reading 'replayState')"，流以 error finish 收场，
- *  回合中断（真机 session-8f22c7a0 seq 121 实证：正文首次落追加区后的下一请求必崩）。
- *  replayState 本身可选（dsh-llm types.d.ts:15），缺失时宿主按"无原生回放"处理。 */
+/** v0.4.2：assistant 消息的宿主来源元数据（宿主 LlmRuntime.forAdapter 无防护读
+ *  message.source.replayState——缺失 = TypeError → 流 error → 回合中断；
+ *  真机 session-8f22c7a0 seq 121 实证；GitHub master 同源）。replayState 可选。 */
 export interface RenderMessageSource {
   kind: 'model';
   provider: string;
@@ -80,11 +77,26 @@ export interface RenderClock {
 // 错误类型
 // ---------------------------------------------------------------------------
 
+/** v0.4.3（P0-6③）：前缀破坏的三类成因。判定式：error.index < error.stablePrefixLen
+ *  → 'stable-drift'（稳定段漂移——装配被改写，最严重）；否则 'append-drift'
+ *  （追加区/转正块漂移——转正纪律被破坏）；长度收缩不匹配时为 'shrink'
+ *  （历史被销毁且未走段边界通道）。 */
+export type PrefixBrokenCause = 'stable-drift' | 'append-drift' | 'shrink';
+
 export class PrefixBrokenError extends Error {
   readonly index: number;
   readonly expected: string;
   readonly actual: string;
-  constructor(index: number, expected: string, actual: string, why: string) {
+  /** v0.4.3（P0-6③）：成因分类与上一请求稳定段长度（判定依据；缺省按稳定漂移处理）。 */
+  readonly prefixCause: PrefixBrokenCause;
+  readonly stablePrefixLen: number;
+  constructor(
+    index: number,
+    expected: string,
+    actual: string,
+    why: string,
+    opts: { prefixCause?: PrefixBrokenCause; stablePrefixLen?: number } = {},
+  ) {
     super(
       `前缀校验失败（fail-closed，拒绝发送不做静默修复）：第 ${index} 条消息${why}。` +
         ` 期望: ${truncate(expected)} 实际: ${truncate(actual)}`,
@@ -93,6 +105,8 @@ export class PrefixBrokenError extends Error {
     this.index = index;
     this.expected = expected;
     this.actual = actual;
+    this.prefixCause = opts.prefixCause ?? 'stable-drift';
+    this.stablePrefixLen = opts.stablePrefixLen ?? index;
   }
 }
 
@@ -140,6 +154,8 @@ export function assertPrefixStable(
         `${p.role}: ${p.content}`,
         `${q.role}: ${q.content}`,
         p.role !== q.role ? 'role 不一致' : '内容逐字节不一致',
+        // v0.4.3：稳定段断言的比较范围全部在稳定段内——任何断点都是 stable-drift
+        { prefixCause: 'stable-drift', stablePrefixLen: prev.length },
       );
     }
   }
@@ -150,11 +166,78 @@ export function assertPrefixStable(
         `共 ${prev.length} 条`,
         `只剩 ${next.length} 条`,
         '：稳定段收缩（尾部被丢弃但未声明 allowTailDrop）',
+        { prefixCause: 'shrink', stablePrefixLen: prev.length },
       );
     }
     // allowTailDrop：走到这里说明前 n 条逐字节相等，即只发生了整块尾部丢弃
   }
   return { prefixLength: next.length };
+}
+
+// ---------------------------------------------------------------------------
+// v0.4.3（P0-6①②）：wire 边界承诺前缀断言（上一请求收尾后的 stable vs 本次请求）
+// ---------------------------------------------------------------------------
+
+/** wire 断言的基线（v0.4.3.1 修正，核查 §2.5）：
+ *  - promised：**上一请求收尾后的稳定段**（#commitDeliveredTail 转正之后的 stableMessages()
+ *    逐字节快照）——转正纪律保证它必须逐字节出现在下一请求头部；transient 尾块
+ *    （nudge/error/degraded）不转正、不在承诺里，与易变尾的块序完全解耦。
+ *  - stableLen：上一请求**装配时**的稳定段长度（转正前）——分类锚点。 */
+export interface RequestBaseline {
+  promised: readonly RenderMessage[];
+  stableLen: number;
+}
+
+/**
+ * v0.4.3（P0-6②）：wire 边界承诺前缀断言——修复旧断言的两个盲区（升级清单 §2.7）：
+ *  ① 转正块与已发文本是否逐字节一致（旧断言只比 stable，从不覆盖）；
+ *  ② 追加区被代码改写（旧断言只保护它被调用那一刻的 stable，不保护"上一请求"这个外部事实）。
+ * 比较"next 的前 promised.length 条"与 promised；按断点位置分类（P0-6③）：
+ *  - index < stableLen → 'stable-drift'（稳定段被改写——0 重发，fail-closed）；
+ *  - stableLen ≤ index < promised.length → 'append-drift'（转正块/追加区漂移——预算内放行一次）；
+ *  - next 比 promised 短 → 'shrink'（承诺前缀收缩；仅 allowTailDrop 且 next 是 promised 的
+ *    严格字节前缀时合法——段边界必须走 dropAppendHead 通道并重置基线，不走本断言）。
+ * v0.4.3.1：基线从"上一请求前 N 条（horizon）"改为"转正后的 stable"。旧 horizon 公式
+ * 隐含"durable 尾块连续排在易变尾最前"——混合尾（error 在 observation 前，核查 §2 的
+ * 反例）会误报 append-drift；promised 与尾序解耦后该误判不可能发生。
+ */
+export function assertRequestPrefix(
+  prev: RequestBaseline,
+  next: readonly RenderMessage[],
+  opts: { allowTailDrop?: boolean } = {},
+): { prefixLength: number } {
+  const stableLen = Math.min(prev.stableLen, prev.promised.length);
+  const n = Math.min(prev.promised.length, next.length);
+  for (let i = 0; i < n; i++) {
+    const p = prev.promised[i]!;
+    const q = next[i]!;
+    if (p.role !== q.role || !bytesEqual(p.content, q.content)) {
+      throw new PrefixBrokenError(
+        i,
+        `${p.role}: ${p.content}`,
+        `${q.role}: ${q.content}`,
+        p.role !== q.role ? 'role 不一致' : '内容逐字节不一致',
+        {
+          prefixCause: i < stableLen ? 'stable-drift' : 'append-drift',
+          stablePrefixLen: stableLen,
+        },
+      );
+    }
+  }
+  if (next.length < prev.promised.length) {
+    if (opts.allowTailDrop === true) {
+      // 允许整块尾部丢弃：必须逐字节证明 next 是 promised 的严格前缀（前 n 条已相等）
+      return { prefixLength: next.length };
+    }
+    throw new PrefixBrokenError(
+      next.length,
+      `共 ${prev.promised.length} 条（承诺前缀）`,
+      `只剩 ${next.length} 条`,
+      '：承诺前缀收缩（历史被销毁；段边界必须走 dropAppendHead 通道并重置基线）',
+      { prefixCause: 'shrink', stablePrefixLen: stableLen },
+    );
+  }
+  return { prefixLength: prev.promised.length };
 }
 
 /** 确定性哈希：同一组消息永远得到同一 hash（供实测对账 / prefix_hash 序列）。 */
@@ -175,7 +258,7 @@ interface AppendBlock {
   kind: AppendBlockKind;
   role: MessageRole;
   content: string;
-  /** v0.3.2：assistant 追加块携带宿主来源（stableMessages 装配时透传进请求）。 */
+  /** v0.4.2：assistant 追加块携带宿主来源（stableMessages 装配时透传进请求）。 */
   source?: RenderMessageSource;
 }
 
@@ -257,7 +340,7 @@ export class ContextRenderer {
     if (msg.role === 'system') {
       throw new Error('appendHistory 不接受 system 消息：system 属于稳定前缀');
     }
-    // v0.3.2：source 必须保留（assistant 块不带 source = 请求在宿主 forAdapter 崩溃）。
+    // v0.4.2：source 必须保留（assistant 块不带 source = 请求在宿主 forAdapter 崩溃）。
     this.#appendBlocks.push({ kind: 'history', role: msg.role, content: msg.content, ...(msg.source === undefined ? {} : { source: msg.source }) });
   }
 
@@ -334,7 +417,7 @@ export class ContextRenderer {
 
   // ------------------------------------------------------------------- 装配
 
-  /** 稳定段 = 稳定前缀 ++ 追加区（不含易变尾）。v0.3.2：assistant 块的 source 随装配
+  /** 稳定段 = 稳定前缀 ++ 追加区（不含易变尾）。v0.4.2：assistant 块的 source 随装配
    *  透传（宿主 forAdapter 读 assistant 消息的 source.replayState，缺失即崩）。 */
   stableMessages(): RenderMessage[] {
     return [

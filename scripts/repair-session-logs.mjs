@@ -1,4 +1,4 @@
-// scripts/repair-session-logs.mjs —— 存量会话日志的 v4 形状修复（0.3.0 广告缺失 / 0.3.2 model source）
+// scripts/repair-session-logs.mjs —— 存量会话日志的 v4 形状修复（0.3.0 广告缺失 / 0.4.1-beta.2 model source，与 0.3.2 同一套）
 //
 // 背景：0.3.0 及更早版本的插件在派发 tf-* 命令时只让宿主管线落 `tool/call` +
 // `tool/result`，从未写 v4 格式要求的 `assistant/message`（content 带 `tool-call` 块）。
@@ -6,7 +6,7 @@
 // corrupt——桌面端表现为"历史加载失败"。本脚本为存量日志补入缺失的广告事件，并重排
 // seq 与全部 seq 引用；写入前先备份，写入后用本地复核规则再验一遍。
 //
-// 0.3.2 新增第三类 corrupt（model source 缺失）：0.3.1 及更早版本写 assistant/message
+// 0.4.1-beta.2 新增第三类 corrupt（model source 缺失，移植自 0.3.2）：beta.1 及更早版本写 assistant/message
 // 时 source 只有 `{kind:'model'}`，缺 `provider`/`model` 非空字符串——宿主校验器
 // （dsh-session assertMessageEventShape → hasProviderModel）读取时抛
 // `message must have model source`，整条会话同样被判 corrupt。本脚本按命令行指定的
@@ -43,7 +43,7 @@ const valueOf = (name, fallback) => {
 const WRITE = has('--write');
 const STATE_ROOT = resolve(valueOf('--root', join(homedir(), '.dsh')));
 const ONLY_SESSION = valueOf('--session', undefined);
-// model source 补齐值（0.3.2）：缺省 = 本机桌面端默认路由（与实测健康日志一致）。
+// model source 补齐值（0.4.1-beta.2）：缺省 = 本机桌面端默认路由（与实测健康日志一致）。
 const MODEL_PROVIDER = valueOf('--model-provider', 'deepseek-account');
 const MODEL_NAME = valueOf('--model', 'deepseek-flash');
 const SESSIONS_ROOT = join(STATE_ROOT, 'sessions');

@@ -119,3 +119,24 @@ export function pendingIntents(records: readonly IntentLogRecord[]): PendingInte
   }
   return out;
 }
+
+/**
+ * v0.4.3（P0-6⑤）：最小对账——把 pending 意图整批 ack 标记 unknown。
+ * 语义写死（与 0.5.1 P0-8 的完整三态一致）：**只解除恢复锁，不重放工具，不声称回滚**——
+ * "写入可能已发生"这个事实由 note 如实携带，0.4.3 不做状态判定。
+ * seqState 由调用方持有（与会话其余意图记录共用单调 seq）；返回 ack 的意图数。
+ */
+export function reconcilePendingIntents(file: string, cause: string, seqState: { seq: number }): number {
+  const { records } = loadIntentRecords(file);
+  const pending = pendingIntents(records).filter((p) => p.state === 'pending');
+  if (pending.length === 0) return 0;
+  seqState.seq += 1;
+  appendIntentRecord(file, {
+    type: 'ack',
+    seq: seqState.seq,
+    at: new Date().toISOString(),
+    intentSeqs: pending.map((p) => p.intent.seq),
+    note: `${cause}：最小对账把 pending 意图标记 unknown——只解除恢复锁，不重放工具，不声称回滚（P0-8/0.5.1 补完整三态）`,
+  });
+  return pending.length;
+}

@@ -1,0 +1,80 @@
+## tf-* 单流协议（本回合唯一工具语法）
+
+<tf-write path="相对/绝对路径" id="w1" depends_on="r1">
+文件正文原文（原样输出，直到闭合标签）
+</tf-write>
+<tf-read path="相对/绝对路径" id="r1" depends_on="w1,w2" offset="100" limit="50"/>
+<tf-edit path="src/app.ts" id="e1" depends_on="r1">
+<<<<<<< OLD
+被替换的原文（精确字面量，全文唯一；不做模糊匹配）
+=======
+替换后的新文
+>>>>>>> NEW
+</tf-edit>
+<tf-append path="notes.md" id="a1" anchor="锚点原文（可选；缺省=追加到文件末尾）">
+追加正文（原样输出，直到闭合标签；不改既有内容）
+</tf-append>
+<tf-grep pattern="正则" path="src" include="*.ts" id="g1"/>
+<tf-glob pattern="**/*.md" id="gl1"/>
+<tf-bash cmd="命令行" id="b1"/>
+<tf-peek handle="obs:read:c3@v1" from_line="10" to_line="20" id="p1"/>
+<tf-final id="f1" summary="一句话完成说明"/>
+
+（改既有文件用 tf-edit（精确替换）或 tf-append（只追加），不要整文件重写；
+找内容用 tf-grep（回匹配行）/tf-glob（回路径），不要用 tf-bash 调 shell 搜索，
+也不要把搜索当"读文件"用——grep 结果超长会截断并提示 tf-peek。）
+
+（tf-read 可选 offset/limit：1 基行号起点与行数，大文件按行段取，省 token。）
+
+（收尾纪律：命令全部闭合后，本流必须以 tf-final 结束；写完文件、执行完命令不等于任务结束。）
+
+## 计划与验收（复合任务推荐）
+<tf-plan id="p1">
+- [a1] 验收项描述
+- [a2] 验收项描述
+</tf-plan>
+- 计划只声明一次；修订时重发 tf-plan（新计划整体替换旧计划，请求里只注差分）。
+- 完成某验收项对应的命令时，在该命令上加 accepts 属性，如 <tf-write path="out.md" id="w1" accepts="a1">...</tf-write>。
+- 全部验收项都有命令成功回执后 tf-final 才会通过；缺项/未验证会被判为过早并注入提示——
+  模型自述"已完成"不构成验收证据。
+
+## 结果获取（关键）
+tf-read 首次/内容变化的结果会完整注入下一请求（超长文件截断为中段省略，用 tf-peek 精确取回）；
+tf-bash / tf-write / tf-edit / tf-append 成功只记台账（回执），不回灌输出。
+失败一律以 [tf-stream:error] 注入，没有错误注入就是成功了。
+因此：要看命令输出或计算结果时，用 tf-peek 按句柄取回——handle 从 [tf-stream:observation]
+与句柄目录增量中取。答案依赖命令输出时，先 peek 再收尾。
+
+## 回验纪律（省 token 的关键）
+- 你 tf-write 的正文全文就在你的上下文里：不要为了"确认写成功"而 tf-read 自己刚写过的
+  路径——那只会得到回执（行数 + 内容指纹，[tf-stream:receipt]），不会重复回灌全文。
+  写失败一定会有 [tf-stream:error] 注入；没有错误注入就是写成功了。
+- tf-read 留给"读不是你写的文件"（任务要求读的既有文件、命令产出的文件）。
+- 确需局部比对自写文件时，用 tf-peek 按行段取回，不要全文重读。
+
+## 时序与重发规则
+- 同 id 同内容重复声明 = 幂等：直接返回原回执（含句柄），不重复执行；同 id 不同内容会被
+  拒绝（换新 id）；被拒绝（无副作用）的命令可用原 id 修正后重发。
+- 同流内后续命令自动等待先闭合的 tf-write 完成（写序保证：先写后读不会读到旧内容）。
+- tf-peek 的句柄由命令产出——同流内提前 peek 会被自动延迟到命令完成后重试，仍无此句柄才报错；
+  要么给 peek 加 depends_on 挂到产出命令上（如 <tf-peek ... depends_on="r1"/>），
+  要么等下一请求（句柄会出现在句柄目录增量里）再 peek。
+- tf-bash 的命令在 Windows 宿主以 PowerShell（pwsh）执行：python3 通常不存在，优先 node -e 或
+  PowerShell 原生命令（Select-String / Get-Content）。
+
+tf-final 的 summary 必须包含任务要求的最终答案原文（数字、行内容、路径、结论），
+不得写"已完成/占位"式描述；还没拿到答案就不要输出 tf-final。
+
+规则：
+1. 写文件一律用 tf-write（正文在标签体内原样输出）；不要用原生工具写文件。
+2. id 建议显式给出且全任务唯一；depends_on 是逗号分隔的依赖 id 列表，可省略。
+   依赖只能指向本任务里已出现或将要出现的命令 id。
+3. 命令闭合即开始执行（独立命令并行，上限 3 个），不必等流结束再发后续命令。
+4. tf-read 首次/变化结果完整注入下一请求；其余成功产出只句柄化（见"结果获取"）。
+   需要某句柄的细节时发 tf-peek（handle 用句柄目录里的值，行段 1-based 闭区间）。
+   tf-edit 匹配失败（原文不唯一/不存在）会以结构化错误注入：核对后修正 OLD 段重发，
+   不要扩大替换范围改全文。tf-grep/tf-glob 只回匹配行/路径，超长会截断并提示 tf-peek。
+5. 上一请求若报告 [tf-stream:error]，先修复或改道该命令（换路径/换命令），再继续其余任务。
+6. 全部命令成功且无需更多信息时输出 tf-final；收到 tf-final 后本任务收敛，不再有下一请求。
+7. 调用工具只允许上表的 tf-* 标记：不要输出 <｜｜DSML｜｜…>、<think> 包裹、JSON tool_call
+   等任何原生调用格式——它们不会被解析成命令，只会浪费输出 token 并在界面显示为乱码。

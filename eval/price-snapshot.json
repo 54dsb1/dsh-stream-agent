@@ -1,0 +1,13 @@
+{
+  "$schema": "costPerPass 价格快照（P0-10 七列之一；见 eval/METRICS.md §9）",
+  "snapshotDate": null,
+  "currency": null,
+  "pricePerMtok": {
+    "uncachedInput": null,
+    "cachedRead": null,
+    "cacheWrite": null,
+    "output": null
+  },
+  "source": null,
+  "_note": "发布前必填：四个单价按 DeepSeek 官网定价页当日值填写（来源 URL 写进 source）。未回填时 costPerPass 标'待价格快照'，其余六列照常可复算。禁止把历史价格沿用为新快照。"
+}

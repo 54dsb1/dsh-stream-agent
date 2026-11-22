@@ -24,6 +24,9 @@
  *   <tf-bash cmd="npm test" id="b1"/>
  *   <tf-peek handle="obs:read:c3@v1" from_line="10" to_line="20" id="p1"/>
  *   <tf-final id="f1" summary="任务完成说明"/>
+ *   <tf-call name="web_search" id="c1" depends_on="w1">{"query":"..."}</tf-call>
+ *   <tf-ask q="选择哪种方案？" id="a1" options="方案A,方案B"/>
+ *   <tf-skill name="skill-name" id="s1"/>
  *
  * 规则：
  * - 有正文的命令：tf-write / tf-edit / tf-append / tf-code；其余自闭合（`/>`）
@@ -46,11 +49,6 @@
  *   典型是模型把自闭合命令又"关闭"了一次）一律按 malformed(stray-close-tag) 记账后丢弃，
  *   绝不作 prose 透传——0.3.1 真机证据：这类残片会以纯文本落进 assistant/message，
  *   桌面端正文里出现裸的 `</tf-bash>`。
- * - 畸形闭合变体（v0.3.3）：`</tf-` 紧跟非空白且引号感知存在 '>' 的 token（通配
- *   `</tf-*>`、带属性 `</tf-write path="x">`）同样是协议闭合尝试——判 close-tag 记账丢弃
- *   （loop 首次出现时注入定向纠错）。判别式带 `\S` 是为了保住"正文里提到 </tf"的透传语义
- *   （`</tf 不在标签位` 无 '>' 且 tf 后是空白 → 仍按 prose）。真机证据 2026-11-20：
- *   `</tf-*>` 两度作为 prose 落进桌面端正文，模型重复犯错且会话无产出收场。
  * - DSML 参数式调用（v0.3.2 截断修复）：模型原生调用格式还有"父标签 + parameter 子标签"
  *   形态（真机取证 session-e4b9a89c 第 6/9 步）：
  *     <｜｜DSML｜｜ invoke name="tf-read">
@@ -76,7 +74,8 @@
 
 export type TfCommandName =
   | 'tf-write' | 'tf-read' | 'tf-edit' | 'tf-append' | 'tf-grep' | 'tf-glob'
-  | 'tf-bash' | 'tf-peek' | 'tf-final' | 'tf-code' | 'tf-plan';
+  | 'tf-bash' | 'tf-peek' | 'tf-final' | 'tf-code' | 'tf-plan'
+  | 'tf-call' | 'tf-ask' | 'tf-skill';
 
 interface CommandSchema {
   required: readonly string[];
@@ -107,10 +106,19 @@ const COMMAND_SCHEMAS: Readonly<Record<TfCommandName, CommandSchema>> = {
   'tf-plan': { required: [], optional: [], hasBody: true },
   // 程序体 = PTC 的 async TS 函数体（可擦除语法）；description 只进台账，timeout 为毫秒数
   'tf-code': { required: [], optional: ['timeout', 'description'], hasBody: true },
+  // v0.4.0 通用调用通道（G2：净增 1）：name = 本会话冻结工具面内的宿主工具名；
+  // body = JSON 对象（参数原样透传给 ctx.tools.execute）。parser 只做 schema 校验，
+  // 工具名/JSON 的语义校验在驱动器（unknown-tool / bad-json-arguments 结构化失败）。
+  'tf-call': { required: ['name'], optional: [], hasBody: true },
+  // v0.4.0 高频例外（§6.4，命令表 12→14）：阻塞式提问与技能装载值一条专用语法——
+  // tf-ask 的回答要作为问句语义在流内可见（familyHint=ask）；tf-skill 是会话级状态变更。
+  // 参数刻意极简（JSON 免转义）；复杂形状（多问题/选项描述）走 tf-call body。
+  'tf-ask': { required: ['q'], optional: ['header', 'options'], hasBody: false },
+  'tf-skill': { required: ['name'], optional: [], hasBody: false },
 };
 
 const COMMAND_NAMES: readonly TfCommandName[] =
-  ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan'];
+  ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan', 'tf-call', 'tf-ask', 'tf-skill'];
 
 export interface TfCommand {
   name: TfCommandName;
@@ -301,9 +309,9 @@ export class TfStreamParser {
     if (probe === 'close-tag') {
       // v0.3.1：孤立闭合标签——前面没有配对打开（自闭合命令被多关一次、或模型手写了
       // 残片）。按协议违规记账后丢弃，绝不作为 prose 落进正文。
-      // v0.3.3：token 端界用引号感知扫描——畸形闭合可能带属性，属性值里可含 '>'
-      // （如 `</tf-write cmd="a>b">`），裸 indexOf 会把 token 截半，剩余半截再次漏进正文。
-      // probe 与消费用同一 scanHeaderClose（同 buf 同切片），端界构造性一致。
+      // v0.4.0（自 0.3.3 回流）：token 端界用引号感知扫描——畸形闭合可能带属性，属性值里
+      // 可含 '>'（如 `</tf-write cmd="a>b">`），裸 indexOf 会把 token 截半，剩余半截再次
+      // 漏进正文。probe 与消费用同一 scanHeaderClose（同 buf 同切片），端界构造性一致。
       const close = scanHeaderClose(this.buf.slice(lt));
       const gt = close === null ? -1 : lt + close.end;
       const raw = gt === -1 ? this.buf.slice(lt) : this.buf.slice(lt, gt + 1);
@@ -338,15 +346,15 @@ export class TfStreamParser {
       // v0.3.2：参数式 invoke → 进入块缓冲，按 parameter 归集属性。
       // 0.3.1 只认内联属性形态，parameter 子标签之间的值会作为 prose 泄漏（真机残片
       // `README.md r10` / `Get-ChildItem ... b902` 均由此产生）。
-      // v0.3.2 补充：带内联属性的 invoke 同样缓冲（parseDsmlBlock 本就合并内联属性与
+      // v0.4.2 补充：带内联属性的 invoke 同样缓冲（parseDsmlBlock 本就合并内联属性与
       // parameter——parameter 覆盖同名内联键）。此前内联属性走 parseDsmlHeader 进 body
       // 模式，非正文命令的 DSML 包装残片会被吞到流末才以 malformed 露出
       // （真机 session-8f22c7a0 step 2：三条闭合标签残片）。
       const dsml = parseDsmlTag(raw, close.selfClosing);
-      // v0.3.3：自闭合 invoke（`.../>`）同样走缓冲——mangled name 抢救后属性齐全的
-      // 自闭合调用照常发命令（parseDsmlBlock 的 selfClosing 分支立即 flush）。
       if (
         dsml !== null
+        // v0.4.2：自闭合 invoke（`.../>`）同样走缓冲——mangled name 抢救后属性齐全的
+        // 自闭合调用照常发命令（parseDsmlBlock 的 selfClosing 分支立即 flush）。
         && dsml.name === 'invoke'
         && !dsml.closing
         && dsml.commandName !== null
@@ -407,11 +415,14 @@ export class TfStreamParser {
     const name = this.bodyName!;
     const schema = COMMAND_SCHEMAS[name];
     const closeTag = `</${name}>`;
+    // v0.4.0（自 0.3.3 回流）：闭合标签允许空白/属性——旧实现只认逐字 `</tf-write>`，
+    // 模型写成 `</tf-write >` 或 `</tf-write path="x">` 时永远找不到闭合，整段正文缓冲到
+    // 流末按 truncated 丢弃（用户侧就是"写到一半没了"，真机 session-d6cd0759）。
     const close = findBodyClose(name, this.buf);
     const closeIdx = close === null ? -1 : close.index;
     // v0.3.2：非正文命令的配对开标签（少写 '/'）不得吞掉后续输出——遇到下一个
     // `<tf-` / `</tf-` 即视为本命令结束，命令照常派发，剩余文本回到 ground 继续解析。
-    // v0.3.2 补充：DSML 标签同样是边界（包装残片立即露出，不吞到流末）。
+    // v0.4.2 补充：DSML 标签同样是边界（包装残片立即露出，不吞到流末）。
     if (!schema.hasBody) {
       const boundary = findNonBodyBoundaryWithDsml(this.buf);
       if (boundary !== -1 && (closeIdx === -1 || boundary < closeIdx)) {
@@ -436,16 +447,16 @@ export class TfStreamParser {
       }
     }
     if (close === null) {
-      // 闭合标签可能被拆在 chunk 边界上：扣留末尾至多 closeTag.length-1 个字符。
-      // v0.3.3：闭合标签允许空白/属性（</tf-write > / </tf-write path="x">），
+      // 闭合标签可能被拆在 chunk 边界上：扣留末尾若干字符。
+      // v0.4.0（自 0.3.3 回流）：闭合标签允许空白/属性（</tf-write > / </tf-write path="x">），
       // 扣留窗口取 64 字符，避免跨 chunk 的带属性闭合被截断后整条正文按 truncated 丢弃。
       const keep = Math.min(Math.max(closeTag.length - 1, 64), this.buf.length);
       this.bodyBuf += this.buf.slice(0, this.buf.length - keep);
       this.buf = this.buf.slice(this.buf.length - keep);
       return false;
     }
-    const body = this.bodyBuf + this.buf.slice(0, closeIdx);
-    const raw = this.bodyRawOpen + body + this.buf.slice(closeIdx, close.end);
+    const body = this.bodyBuf + this.buf.slice(0, close.index);
+    const raw = this.bodyRawOpen + body + this.buf.slice(close.index, close.end);
     this.buf = this.buf.slice(close.end);
     this.mode = 'ground';
     const attrs = this.bodyAttrs!;
@@ -485,10 +496,7 @@ export class TfStreamParser {
     this.dsmlBuf = '';
     this.dsmlName = null;
     this.mode = 'ground';
-    // v0.3.3：块以自身配对闭合（</tf-write>）结束时，外层 DSML 包装的收尾标签
-    // （</｜｜DSML｜｜ invoke> / </calls> / parameter）还在 rest 开头。它们属于刚消费的
-    // 块，不是新协议尝试——一并吃掉，避免每步刷三条无意义的 malformed 台账。
-    this.buf = consumeDsmlClosingWrappers(rest);
+    this.buf = rest;
     const parsed = parseDsmlBlock(block, expected, { allowIncompleteBody: true });
     for (const bad of parsed.malformed) {
       events.push({ type: 'malformed', raw: bad.raw, reason: bad.reason });
@@ -581,13 +589,13 @@ function scanHeaderClose(buf: string): { end: number; selfClosing: boolean } | n
       return { end: i, selfClosing: buf[i - 1] === '/' };
     }
   }
-  // v0.3.3：引号不成对（mangled DSML name 值，奇数个引号——真机 session-d6cd0759
-  // seq 110：`name="tf-peek handle="obs:...`）时严格扫描永不闭合，header 模式等死，
-  // 整条命令在流末按 malformed 丢弃。退化通道：取**第一个**满足"前驱是 `\"`（属性
-  // 收尾）或 `/\"`（自闭合）"的 '>' 作为标签端界——不能取最后一个 '>'：mangled 开标签
-  // 后面跟着命令正文（Python 代码含 '>'），取最后一个会把正文整段吞进标签再丢弃
-  // （真机 seq 104：整个 selfcheck 脚本被吞）。残片形态（无端界）仍返回 null 等更多
-  // 数据；正常标签引号成对，严格扫描先行命中，退化通道不触发。
+  // v0.4.2：引号不成对（mangled DSML name 值，奇数个引号——真机 session-d6cd0759
+  // seq 110）时严格扫描永不闭合，header 模式等死，整条命令在流末按 malformed 丢弃。
+  // 退化通道：取**第一个**满足"前驱是 ""（属性收尾）或 /"（自闭合）"的 '>' 作为
+  // 标签端界——不能取最后一个 '>'：mangled 开标签后面跟着命令正文（Python 代码含
+  // '>'），取最后一个会把正文整段吞进标签再丢弃（真机 seq 104：整个 selfcheck 脚本
+  // 被吞）。残片形态（无端界）仍返回 null 等更多数据；正常标签引号成对，严格扫描
+  // 先行命中，退化通道不触发。
   for (let i = 1; i < buf.length; i++) {
     if (buf[i] !== '>') continue;
     const prev = buf[i - 1];
@@ -599,14 +607,16 @@ function scanHeaderClose(buf: string): { end: number; selfClosing: boolean } | n
 }
 
 /**
- * v0.3.3：正文命令的闭合标签查找（允许空白与属性）。
+ * v0.4.0（自 0.3.3 回流）：正文/命令闭合标签查找（允许空白与属性）。
  *
- * 旧实现只认逐字 `</tf-write>`：模型写成 `</tf-write >` 或 `</tf-write path="x">`
- * 时永远找不到闭合，整段正文缓冲到流末按 truncated 丢弃——用户侧就是"写到一半没了"。
+ * 旧实现只认逐字 `</tf-write>`：模型写成 `</tf-write >` 或 `</tf-write path="x">` 时
+ * 永远找不到闭合，整段正文缓冲到流末按 truncated 丢弃——用户侧就是"写到一半没了"。
  * 这里按标签名找起点，再用与 header 同一个引号感知扫描取端界：
  *   - 名字后必须是空白 / `>` / `/`（`</tf-writex>` 不算）；
  *   - 属性值里含 `>` 也不会截半；
  *   - 跨 chunk 未闭合返回 null（调用方扣留尾部继续等）。
+ *
+ * 返回 end = 闭合标签之后的切片终点（`</tf-write>` → index+11）。
  */
 function findBodyClose(name: string, buf: string): { index: number; end: number } | null {
   const needle = `</${name}`;
@@ -624,23 +634,6 @@ function findBodyClose(name: string, buf: string): { index: number; end: number 
   }
 }
 
-/**
- * v0.3.3：吃掉 DSML 块自身的收尾包装标签。
- *
- * 模型常写成 `invoke … <tf-write>正文</tf-write> </｜｜DSML｜｜ invoke>`。
- * 块以 `</tf-write>` 结束时，外层 `</invoke>` / `</calls>` / `</parameter>` 会落在
- * ground 里被逐条判 malformed（每步刷三条台账），既不是新命令也不是正文。
- * 只消费紧邻的已知收尾标签，遇见其它内容立即停手。
- */
-function consumeDsmlClosingWrappers(text: string): string {
-  let rest = text;
-  for (;;) {
-    const m = /^\s*<\/\s*｜+DSML｜*\s*(?:invoke|calls|parameter)\s*>/i.exec(rest);
-    if (m === null) return rest;
-    rest = rest.slice(m[0].length);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // DSML 噪声归一化（v0.3.1）
 // ---------------------------------------------------------------------------
@@ -654,7 +647,8 @@ function isDsmlTag(raw: string): boolean {
   return DSML_TAG_RE.test(raw);
 }
 
-/** 从孤立闭合标签原文取命令名（`</tf-bash>` → `tf-bash`；通配 `</tf-*>` → `tf-*`；半截标签 → `?`）。 */
+/** 从孤立闭合标签原文取命令名（`</tf-bash>` → `tf-bash`；通配 `</tf-*>` → `tf-*`；
+ *  半截标签 → `?`）。v0.4.0：名字字符集含 `*`——通配闭合也要如实进台账。 */
 function closeTagName(raw: string): string {
   const m = /^<\/\s*(tf-[a-z0-9*-]*)/.exec(raw);
   return m === null ? '?' : m[1]!;
@@ -706,8 +700,8 @@ function parseDsmlTag(raw: string, selfClosing: boolean): DsmlTag | null {
   const m = inner.match(/^｜+DSML｜*\s*([a-zA-Z][a-zA-Z0-9_-]*)([\s\S]*)$/);
   if (m === null) return null;
   const name = m[1]!;
-  // v0.3.3：mangled name 值抢救——模型把全部属性塞进了 name 值且忘了闭引号
-  // （真机 session-d6cd0759 seq 110：`name="tf-peek handle="obs:bash:b2@v1"
+  // v0.4.2：mangled name 值抢救——模型把全部属性塞进了 name 值且忘了闭引号
+  // （真机 session-d6cd0759 seq 110：`name="tf-peek handle="obs:bash:b3@v1"
   //  from_line="1" to_line="30" id="p3"/>`——整条 peek 丢失）。name 值以合法
   //  tf-* 命令名开头且带空格时，把 "name=\"tf-xxx " 改写为 "name=\"tf-xxx\" "，
   //  余段还原为正常属性对（引号结构本就完好）。
@@ -723,10 +717,10 @@ function parseDsmlTag(raw: string, selfClosing: boolean): DsmlTag | null {
   return { name, closing, selfClosing, attrs, commandName };
 }
 
-/** v0.3.2：属性值的 XML 实体解码。模型带 XML 习惯输出属性（真机 session-8f22c7a0
- *  step 5：`command="... Write-Output &quot;EXIT=$LASTEXITCODE&quot;"`——实体原样进了
+/** v0.4.2：属性值的 XML 实体解码。模型带 XML 习惯输出属性（真机 session-8f22c7a0
+ *  step 5：`cmd="... Write-Output &quot;EXIT=$LASTEXITCODE&quot;"`——实体原样进了
  *  PowerShell，命令解析报错，白白烧一步）。只解码有界实体集 + 数字引用；`&` 本身
- *  不在实体里的原样保留（不猜）。 */
+ *  不在实体里的原样保留（不猜）。单遍替换：&amp;quot; 还原为 &quot; 不二次展开。 */
 function decodeXmlEntities(value: string): string {
   return value
     .replace(/&(lt|gt|quot|apos|amp);/g, (_, name: string) => (
@@ -742,9 +736,9 @@ function parseAttrPairs(segment: string): Record<string, string> {
   const re = /([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*"/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(segment)) !== null) {
-    // v0.3.2：与 parseHeader 同款的内嵌引号容忍扫描（闭引号 = `"` 后跟下一属性、
-    // 标签结尾或末尾）。valueStart 是**绝对**下标（m.index + m[0].length）——
-    // 用相对偏移会把搜索起点挪回段首，re.lastIndex 不前进 = 零进度死循环。
+    // v0.4.2：与 parseHeader 同款的内嵌引号容忍扫描。valueStart 是**绝对**下标
+    // （m.index + m[0].length）——用相对偏移会把搜索起点挪回段首，re.lastIndex
+    // 不前进 = 零进度死循环。
     const valueStart = m.index + m[0].length;
     let value = '';
     let next = valueStart;
@@ -781,7 +775,7 @@ function findNonBodyBoundary(buf: string): number {
 }
 
 /**
- * v0.3.2：body 模式的扩展边界（tf 标签 + DSML 标签）。只在 stepBody 的非正文分支
+ * v0.4.2：body 模式的扩展边界（tf 标签 + DSML 标签）。只在 stepBody 的非正文分支
  * 使用——真机（session-8f22c7a0 step 2）里 DSML invoke 走完内联路径后，parameter/
  * invoke/closes 包装残片被 body 模式整体吞掉、到流末才以 malformed 露出；DSML 标签
  * 出现即视为本命令结束（残片按既有 malformed 纪律处理，绝不作为 prose 透传）。
@@ -800,7 +794,7 @@ function findNonBodyBoundaryWithDsml(buf: string): number {
 
 /** DSML 段结束位置（含结束标签本身）：`</invoke>` / `</tf-name>` / （非正文）下一个 tf 标签。 */
 function findDsmlInvokeEnd(buf: string, name: TfCommandName | null): { end: number } | null {
-  // v0.3.3：缓冲分支现也接收**自闭合** invoke（mangled name 抢救后的形态）——开标签
+  // v0.4.2：缓冲分支现也接收**自闭合** invoke（mangled name 抢救后的形态）——开标签
   // 自身以 `/>` 结束时它就是块尾。end 约定 = 切片**含端点**（+1 跨过 `>` 本身，
   // 与 invokeClose/tagClose 分支的"一次过闭合标签"约定一致）。
   const selfEnd = scanHeaderClose(buf);
@@ -812,7 +806,7 @@ function findDsmlInvokeEnd(buf: string, name: TfCommandName | null): { end: numb
   const m = invokeClose.exec(buf);
   if (m !== null) end = m.index + m[0].length;
   if (name !== null) {
-    // v0.3.3：命令自身的闭合标签允许空白/属性（与 body 模式同一 findBodyClose）。
+    // v0.4.0（自 0.3.3 回流）：闭合标签允许空白/属性（`</tf-write >` / `</tf-write path="x">`）。
     const tagClose = findBodyClose(name, buf);
     if (tagClose !== null && (end === -1 || tagClose.end < end)) {
       end = tagClose.end;
@@ -922,18 +916,13 @@ function parseDsmlBlock(
     }
     let body: string | undefined;
     if (schema.hasBody) {
-      // v0.3.2：块以命令自身的配对闭合（</name>）终止时，闭合标签会被 tokenizer 当作
+      // v0.4.2：块以命令自身的配对闭合（</name>）终止时，闭合标签会被 tokenizer 当作
       // 块内文本累积——剥掉尾部闭合，正文才干净（与 body 模式的消费语义一致）。
+      // v0.4.0（自 0.3.3 回流）：闭合允许空白/属性（`</tf-write >` / `</tf-write path="x">`）。
       let text = item.text;
       if (bodyFromParam === undefined) {
-        // v0.3.3：闭合标签允许空白/属性（`</tf-write >` / `</tf-write path="x">`）。
-        // 只剥末尾同一行的闭合形态，避免误删正文里提到的同名标签。
-        const idx = text.lastIndexOf(`</${name}`);
-        if (idx !== -1) {
-          const tail = text.slice(idx);
-          const closeRe = new RegExp(`^</${name}\\b[^\\n]*>\\s*$`);
-          if (closeRe.test(tail)) text = text.slice(0, idx);
-        }
+        const tailClose = new RegExp(`<\\/${name}\\s*(\\s[^>]*)?>\\s*$`).exec(text);
+        if (tailClose !== null) text = text.slice(0, tailClose.index);
       }
       body = bodyFromParam ?? text.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
     } else if (bodyFromParam !== undefined || item.text.trim() !== '') {
@@ -1023,17 +1012,17 @@ function trimParamValue(value: string): string {
   return value.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
 }
 
-/** 属性 schema 校验（parseHeader 与 DSML 块共用；校验失败返回结构化 error）。
- *  v0.3.2：未知属性**降级丢弃**而不是拒整条命令——真机（session-ec100f8a seq 91）：
- *  模型写 `lines="1-20"`（schema 是 from_line/to_line），旧实现把整条 tf-peek 拒掉，
- *  模型只能重试烧一步。`lines="N-M"` 识别为 from_line/to_line 的习惯写法并归一；
- *  其余未知属性原样丢弃（不猜语义）。必需属性缺失仍然拒（缺 path 的 write 不能猜）。 */
+/** 属性 schema 校验（parseHeader 与 DSML 块共用；校验失败返回结构化 error）。 */
 function validateCommandAttrs(
   name: TfCommandName,
   attrs: Record<string, string>,
 ): { attrs: Record<string, string>; dependsOn: readonly string[] } | { error: string } {
   const schema = COMMAND_SCHEMAS[name];
   const allowed = new Set([...COMMON_ATTRS, ...schema.required, ...schema.optional]);
+  // v0.4.2：未知属性**降级丢弃**而不是拒整条命令（真机 session-ec100f8a seq 91：
+  // 模型写 `lines="1-20"`（schema 是 from_line/to_line），旧实现把整条 tf-peek 拒掉）。
+  // `lines="N-M"` 识别为 from_line/to_line 的习惯写法并归一；其余未知属性原样丢弃。
+  // 必需属性缺失仍然拒（缺 path 的 write 不能猜）。
   const kept: Record<string, string> = {};
   for (const key of Object.keys(attrs)) {
     if (!allowed.has(key)) continue;
@@ -1101,11 +1090,9 @@ function parseHeader(raw: string): HeaderParse {
       continue;
     }
     if (rest === '') break;
-    // v0.3.2：属性值容忍内嵌引号。简单正则 `([^"]*)` 在值含 `"` 时撑破
-    // （真机 session-ec100f8a seq 134：PowerShell cmd 内嵌引号 → 整条命令丢失，
-    // 参数值漏进正文）。闭引号判定：`"` 后面跟（下一段 `key="` 模式 | 标签结尾
-    // `>`/`/>` | inner 末尾）；否则视为值的一部分继续扫。
-    // 找不到合法闭引号 = 照旧报 bad-attribute-syntax。
+    // v0.4.2：属性值容忍内嵌引号。简单正则 `([^"]*)` 在值含 `"` 时撑破
+    // （真机 session-ec100f8a seq 134：PowerShell cmd 内嵌引号 → 整条命令丢失）。
+    // 闭引号判定：`"` 后面跟（下一段 `key="` 模式 | 标签结尾 `>`/`/>` | inner 末尾）。
     const attr = rest.match(/^([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*"/);
     if (!attr) return { error: `bad-attribute-syntax:${rest.slice(0, 20)}` };
     const valueStart = attr[0].length;
@@ -1150,11 +1137,11 @@ function probeTag(s: string): TagProbe {
   if (s.startsWith('</')) {
     if ('</tf-'.startsWith(s)) return 'need-more'; // '</' / '</t' / '</tf' / '</tf-'：闭合标签开头
     if (/^<\/tf-[a-z0-9-]*\s*>/.test(s)) return 'close-tag';
-    // v0.3.3：畸形闭合变体（协议命名空间内）——通配 `</tf-*>`、带属性
+    // v0.4.0（自 0.3.3 回流）：畸形闭合变体（协议命名空间内）——通配 `</tf-*>`、带属性
     // `</tf-write path="x">` 等。判别式：`</tf-` 紧跟非空白（与"正文里提到 </tf"区分，
     // 如 `</tf 不在标签位` 仍是 prose），且引号感知地存在 '>'（闭合尝试成形）。
     // 真机证据 2026-11-20（桌面端会话）：`</tf-*>` 两度作为 prose 落进 assistant 正文
-    // ——0.3.1 治理只覆盖「合法闭合形态」，畸形变体全数漏网，且模型拿不到纠错信号
+    // ——0.3.1 治理只覆盖「合法闭合形态」，畸形变体全数漏网，且模型拿不到纠错信号，
     // 同一会话内重复犯错。引号感知 '>' 的存在使 `cmd="a>b"` 这类属性值不会被误判成
     // token 端界。>200 字符仍无 '>'：按 runaway 残片记账丢弃（与 DSML 同纪律），不无限缓冲。
     if (/^<\/tf-\S/.test(s)) {

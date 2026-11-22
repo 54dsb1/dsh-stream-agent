@@ -27,8 +27,8 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { TfStreamParser, splitEditBody } from '../kernel/parser.ts';
 import type { TfCommand, ParserEvent } from '../kernel/parser.ts';
-import { ContextRenderer, renderHash } from '../kernel/render.ts';
-import type { RenderMessage } from '../kernel/render.ts';
+import { ContextRenderer, assertRequestPrefix, PrefixBrokenError, renderHash } from '../kernel/render.ts';
+import type { RenderMessage, RequestBaseline } from '../kernel/render.ts';
 import { ObservationLedger } from '../kernel/obs.ts';
 import type { ObservationResult } from '../kernel/obs.ts';
 import { checkFinalSummary } from '../kernel/final.ts';
@@ -46,10 +46,14 @@ import type { CodeExecutor, CodeQuota, SandboxFacts } from './ptc-bridge.ts';
 import { asPluginEffect, getService } from './cordis-compat.ts';
 import { readPersistedControl, resolveControlState, writePersistedControl } from './control-state.ts';
 import type { ControlStateWithSource } from './control-state.ts';
-import { appendIntentRecord, intentFileOf, loadIntentRecords, pendingIntents } from './intent-log.ts';
+import { appendIntentRecord, intentFileOf, loadIntentRecords, pendingIntents, reconcilePendingIntents } from './intent-log.ts';
 import { clearTakeover, markTakeover } from './takeover-registry.ts';
+import { ToolSurfaceHolder, degradedLine } from './tool-surface.ts';
+import type { SurfaceProfile, ToolSurface, ToolsServiceLike } from './tool-surface.ts';
 import { isModeId, modeConfig, publicModeCatalog } from '../kernel/modes.ts';
 import { isLang } from '../kernel/control-bar.ts';
+import { composeProtocolText, asProtocolLevel, PROTOCOL_SECTION_IDS } from '../kernel/protocol.ts';
+import type { ProtocolLevel, ProtocolSectionId } from '../kernel/protocol.ts';
 import { VERSION } from '../version.ts';
 
 // ---------------------------------------------------------------------------
@@ -87,16 +91,6 @@ export function finishMessage(finish: FinishReasonLike): string {
   return finish.kind;
 }
 
-/** v0.3.3：宿主 TokenUsage（cache 字段可选；inputTokens 是**未缓存**输入，见
- *  dsh-llm types.d.ts:160——“billed input = input + cacheRead + cacheWrite”）。 */
-export interface TokenUsageLike {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens?: number;
-  cacheWriteTokens?: number;
-  totalTokens?: number;
-}
-
 /** 镜像 types.d.ts:458-488 StreamChunk（本驱动消费的全部变体） */
 export type StreamChunkLike =
   | { type: 'block-start'; index: number; blockType: string }
@@ -104,13 +98,10 @@ export type StreamChunkLike =
   | { type: 'reasoning-delta'; index: number; text: string }
   | { type: 'tool-call-delta'; index: number; id: string; name?: string; argumentsDelta: string }
   | { type: 'block-end'; index: number; block: { type: string; text?: string; id?: string; name?: string; arguments?: string } }
-  | { type: 'usage'; usage: TokenUsageLike }
+  | { type: 'usage'; usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number } }
   | { type: 'finish'; reason: FinishReasonLike };
 
-/** 镜像 types.d.ts:538-580 GenerateOptions（驱动器发出的请求形状）。
- *  v0.3.2：assistant 消息的 messages 项带可选 source（宿主 forAdapter 读
- *  `message.source.replayState`，缺失即 TypeError → 流 error → 回合中断；
- *  类型镜像 dsh-llm typert.host.js AssistantProviderMetadata）。 */
+/** 镜像 types.d.ts:538-580 GenerateOptions（驱动器发出的请求形状） */
 export interface StreamRequestOptions {
   provider: string;
   model: string;
@@ -120,6 +111,9 @@ export interface StreamRequestOptions {
     content: readonly { type: 'text'; text: string }[];
     source?: { kind: 'model'; provider: string; model: string; replayState?: unknown };
   }[];
+  /** v0.4.0 原生通道（P1）：nativeTools 开启时携带冻结工具面的 schema（GenerateOptions.tools 直通）。
+   *  默认关闭（§15：默认文本）——可达性走 tf-call，不为 schema 付每请求 token。 */
+  tools?: readonly { name: string; description: string; parameters: Record<string, unknown> }[];
   signal?: AbortSignal;
   sessionId?: string;
 }
@@ -229,6 +223,27 @@ export const DEFAULT_TOOL_MAPPING: ToolMapping = {
             description: `tf-bash: ${(cmd.attrs['cmd'] ?? '').slice(0, 80)}`,
           },
         };
+      case 'tf-skill': {
+        // v0.4.0（§6.4 高频例外）：技能装载专用语法 → 宿主 skill（{name} 单必填）。
+        return { name: 'skill', arguments: { name: cmd.attrs['name'] ?? '' } };
+      }
+      case 'tf-ask': {
+        // v0.4.0（§6.4）：阻塞式提问专用语法 → 宿主 ask_user_question。
+        // {questions:[{id,question,header?,options?:[{label}]}]}；选项逗号分隔取标签
+        // （带描述的复杂选项走 tf-call body JSON）。options="A,B" → [{label:'A'},{label:'B'}]。
+        const options = (cmd.attrs['options'] ?? '')
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s !== '')
+          .map((label) => ({ label }));
+        const question: Record<string, unknown> = {
+          id: cmd.id,
+          question: cmd.attrs['q'] ?? '',
+        };
+        if (cmd.attrs['header'] !== undefined && cmd.attrs['header'] !== '') question['header'] = cmd.attrs['header'];
+        if (options.length > 0) question['options'] = options;
+        return { name: 'ask_user_question', arguments: { questions: [question] } };
+      }
       default:
         return null; // tf-peek / tf-final / tf-code 由驱动器内部处理（tf-code 走 executeCode 端口）
     }
@@ -241,18 +256,19 @@ export interface StreamDriverConfig {
   reasoningEffort?: string;
   /** 独立命令并行度上限（可配，默认 3 —— 分派 06 硬性要求 1） */
   maxParallelToolCalls?: number;
-  /** 最大重入次数（防震荡护栏；生产性重入不再计数——见 stallReentries） */
+  /** 最大重入次数（防震荡护栏；超出 → turn 以 blocked 终止并如实记录）。
+   *  v0.4.0：语义收窄为"停滞重入预算"的缺省值——生产性重入不再计数（见 stallReentries）。 */
   maxReentries?: number;
-  /** v0.3.3：连续零产出重入上限（真正的停滞预算）。缺省 = maxReentries。
+  /** v0.4.0（自 0.3.3 回流）：连续零产出重入上限（真正的停滞预算）。缺省 = maxReentries。
    *  失败的写、被拒的 final、纯 prose 步都算零产出；只读/只 peek 但拿到新信息算产出。 */
   stallReentries?: number;
-  /** v0.3.3：回合请求硬上限（含生产性重入）。达到后进入兜底交付，绝不无限烧请求。
-   *  缺省 = max(4, maxReentries * 2)。 */
+  /** v0.4.0（自 0.3.3 回流）：回合请求硬上限（含生产性重入）。达到后进入兜底交付，
+   *  绝不无限烧请求。缺省 = max(4, maxReentries * 2)。 */
   maxRequests?: number;
-  /** v0.3.3：收束期最多再给几次请求（首次到达 maxReentries 后）。缺省 2。 */
+  /** v0.4.0（自 0.3.3 回流）：收束期最多再给几次请求（到达停滞/硬上限后）。缺省 2。 */
   closeOutRequests?: number;
-  /** v0.3.3：单请求 tf-read 完整正文注入预算（字符）。超出部分转"预览 + 句柄"，
-   *  下一请求再按需补全——把新内容摊平，避免一次读五个文件造成缓存大块 miss。
+  /** v0.4.0（自 0.3.3 回流）：单请求 tf-read 完整正文注入预算（字符）。超出部分转"预览 +
+   *  句柄"，下一请求再按需补全——把新内容摊平，避免一次读五个文件造成缓存大块 miss。
    *  0/负数 = 关闭（回退点）；缺省 DEFAULT_READ_FEEDBACK_BUDGET_PER_REQUEST。 */
   readFeedbackBudgetPerRequest?: number;
   /** 流空闲看门狗：流在此时长内无任何 chunk → abort（fault-timeout 路径） */
@@ -266,7 +282,17 @@ export interface StreamDriverConfig {
   /** 系统提示 / 协议文本 / 不变量覆盖（测试注入用；生产用默认） */
   systemPrompt?: string;
   protocolText?: string;
-  invariants?: string;
+  /** v0.4.1 不变量段：string = 整段替换；false = 整段不注入（省 242 字符；回退点）。 */
+  invariants?: string | false;
+  /** v0.4.1 协议档位（缺省 full = 0.4.0-beta.1 原文逐字节）：lean = 全段压缩说明文字；
+   *  minimal = 语法铁律面（selfread/timing 落选）。显式 protocolText 压过本项。 */
+  protocolLevel?: ProtocolLevel;
+  /** v0.4.1 段级增删（与 protocolLevel 叠加）：false = 落选，true = 本档未含的段加回。
+   *  未知段 id 抛错（fail-fast，装配错别字不静默）。 */
+  protocolSections?: Partial<Record<ProtocolSectionId, boolean>>;
+  /** v0.4.1 自定义追加（内容可自定义的主入口）：追加在协议末尾（call 段之后），
+   *  不用抄默认文本；进稳定前缀（构造期冻结）。 */
+  protocolAppend?: string;
   toolMapping?: ToolMapping;
   /** 自写回验策略（修复限制 1：写批任务 token 偏重）。'receipt'（默认）=
    *  tf-read 命中本任务 tf-write 已写过的路径时只注入回执（行数 + 内容指纹），
@@ -281,6 +307,20 @@ export interface StreamDriverConfig {
   codeTimeoutMs?: number;
   /** tf-code 协议段覆盖（缺省 DEFAULT_CODE_PROTOCOL_SECTION；仅通道启用时追加） */
   codeProtocolText?: string;
+  /** v0.4.0 工具面档位（P1）：'core' | 'standard'（默认）| 'full' | 'off'（0.3.x 回退点）。
+   *  只影响原生 tools 声明面与降级语义；tf-call 可达性始终是冻结面的全量。 */
+  toolSurface?: SurfaceProfile;
+  /** v0.4.0 原生通道（P1）：请求携带 tools schema。默认 false（§15 默认文本）——
+   *  schema 的每请求 token 成本 > tf-call 的逐调用成本；开启场景 = 模型对原生
+   *  tool_call 的结构化收益优先（provider 原生并行/错误形状）。 */
+  nativeTools?: boolean;
+  /** v0.4.0 tf-call 通用调用通道（G2：命令表净增 1）。默认 true；toolSurface=off 强制关。 */
+  callCommand?: boolean;
+  /** v0.4.0 tf-call 协议段覆盖（缺省 DEFAULT_CALL_PROTOCOL_SECTION；仅通道启用时追加） */
+  callProtocolText?: string;
+  /** v0.4.0 toolSet 准入（R5：beta 缺省 false——toolSet 只用于 schemas 视图，不传 execute）。
+   *  true = execute 带 toolSet（when 门控收紧，P6 复跑后再默认开）。 */
+  strictAdmission?: boolean;
   /** K5：tf-code 配额三项硬限制（子调用次数 / 输出字节 / 墙钟毫秒）；缺省 DEFAULT_CODE_QUOTA。 */
   codeQuota?: CodeQuota;
   /** F3：tf-code 首成功/变化结果的完整注入上限（字符）；≤ 上限整值注入，超限转骨架 + 句柄。
@@ -295,6 +335,13 @@ export interface StreamDriverConfig {
   /** F7 长会话段边界：追加区超过该字符数时，在新回合开始处整块丢弃旧段（保留当前任务块起
    *  的所有块），被丢弃原文句柄化可回取。0/负数 = 关闭（回退点）。缺省 DEFAULT_SEGMENT_MAX_CHARS。 */
   segmentMaxChars?: number;
+  /** v0.4.3（P0-6 探针，**离线测试专用——生产不得设置**）：在 wire 承诺前缀断言前篡改上一请求
+   *  基线的一个字节，模拟"历史被改写"（真实世界里这只因未来装配回归而发生）。kind='stable'
+   *  篡改稳定段（index < stableLen → stable-drift）；kind='append' 篡改承诺前缀内的尾部
+   *  durable 块（index ≥ stableLen → append-drift；基线无 durable 尾块时该请求跳过）。
+   *  oncePerTurn=true 时每回合只注入一次（跨回合探针用）。探针结果走 prefix-broken /
+   *  prefix-reset 台账，与真实漂移同一条处置路径。 */
+  faultPrefixDrift?: { kind: 'append' | 'stable'; oncePerTurn?: boolean };
 }
 
 export interface DriverPorts {
@@ -315,10 +362,17 @@ export interface DriverPorts {
   onIntent?: (intent: { cmdId: string; op: 'write' | 'edit' | 'append'; path: string; fingerprint: string }) => void;
   /** F6 写后回执：变更类命令落定（成功或失败）即调用；与 onIntent 按 cmdId 关联。 */
   onIntentReceipt?: (receipt: { cmdId: string; ok: boolean; detail?: string }) => void;
+  /** v0.4.3（P0-6⑤）：最小对账——前缀破坏收场时把 pending 意图整批标记 unknown
+   *  （ack 语义：只解除恢复锁，不重放工具、不声称回滚；实现在装配层，持有意图日志文件；
+   *  完整三态在 P0-8/0.5.1）。缺省 = 无意图日志（no-op）。 */
+  reconcilePendingIntents?: (cause: string) => { acked: number };
   /** v0.3.1 思考过程实时帧：向宿主事件总线发 agent/assistant-stream 帧（桌面端
    *  思考过程 live 显示的数据源；真实宿主 = ctx.emit）。缺省 = 不发（headless/离线），
    *  桌面端只看落盘消息（0.3.0 行为）。发射异常由驱动器捕获并熔断（fail-open）。 */
   emitHostEvent?: (event: string, payload: unknown) => void;
+  /** v0.4.0 工具面（P1）：宿主 tools 服务的完整面（resolve/schemas/execute）。
+   *  缺省 = 无宿主面 → ToolSurfaceHolder 返回 undefined（L2 protocol-only，0.3.x 行为）。 */
+  toolsService?: ToolsServiceLike;
   /** 驱动器自身异常/账本落盘失败的告警出口（红线 5：不许静默） */
   onWarning?: (message: string, detail?: unknown) => void;
 }
@@ -340,7 +394,9 @@ export interface TurnEventWriter {
    *  无落盘（写入失败/无会话）返回 undefined —— 驱动器按 abandoned 收束实时帧。 */
   assistantMessage(turn: number, step: number, text: string, info: {
     finish: FinishReasonLike;
-    usage?: TokenUsageLike;
+    /** v0.4.2：口径对齐 dsh-llm Usage——inputTokens 是未命中缓存的输入，缓存读/写单列
+     *  （可选；适配器未上报时缺省）。随 assistant/message 落盘，桌面端/回放可对账。 */
+    usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number };
     /** v0.3.1：模型思考过程（reasoning delta 拼接）。非空时随本条消息落成
      *  `{type:'reasoning', text}` 内容块（块序 = assistant 消息首位，镜像内建
      *  BlockAssembler 输出序），桌面端据此渲染思考过程行。 */
@@ -387,9 +443,46 @@ export type TurnEndReason =
 // ledger 记录（探针 C 定案：tf-* 协议状态落 plugin:tf-agent/<record> 私有记录）
 // ---------------------------------------------------------------------------
 
+/**
+ * v0.4.3（P0-7①）：request 事件的尺子字段。聚合三元组 **ΣproviderInput / N / resetCount**
+ * 全部可从 request 记录外部复算：
+ *  - ΣproviderInput = Σ providerInputTokens（计费输入 = 未命中 input + cacheRead + cacheWrite，
+ *    口径对齐 dsh-llm Usage；适配器未上报的请求该字段缺省——不写 0 噪声）；
+ *  - N = kind==='request' 的记录数（= requestCount）；
+ *  - resetCount = 记录序列里 resetSeq 相对上一条递增的次数（= 最后一条的 resetSeq）。
+ * 命名映射：cacheRead = dsh-llm Usage.cacheReadTokens；cacheWrite = cacheWriteTokens；
+ * output = outputTokens；providerInputTokens = inputTokens + cacheRead + cacheWrite。
+ * prefixTokensEst 是本地估算（Σcontent 字符 / 4 上取整，与 #injectedChars 同一启发式），
+ * 只做交叉校验——权威值是 providerInputTokens（E9：估算与 provider 回报差 10-20%）。
+ * feedbackBytes：本请求注入的**反馈类**字节（full=全量回灌 / dedup=字节级去重（P0-4 前恒 0）/
+ * handle=句柄+骨架/回执）；指令类块（nudge/error/degraded/truncated）与计划差分不计入。
+ * resetSeq/resetCause：当前重置纪元与最近一次成因（'segment-drop' | 'prefix-reset'；
+ * 纪元 0 无 cause）。cacheHitRatio 是 diagnostic-only（分母随总量压缩收缩，比值不可跨实验比较）。
+ */
+export interface RequestRecord {
+  seq: number;
+  kind: 'request';
+  turn: number;
+  step: number;
+  provider: string;
+  model: string;
+  level: BudgetLevel;
+  stableHash: string;
+  renderHash: string;
+  injectionBlocks: number;
+  prefixTokensEst?: number;
+  providerInputTokens?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  output?: number;
+  resetSeq?: number;
+  resetCause?: string;
+  feedbackBytes?: { full: number; dedup: number; handle: number };
+}
+
 export type DriverRecord =
-  | { seq: number; kind: 'request'; turn: number; step: number; provider: string; model: string; level: BudgetLevel; stableHash: string; renderHash: string; injectionBlocks: number }
-  | { seq: number; kind: 'usage'; turn: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }
+  | RequestRecord
+  | { seq: number; kind: 'usage'; turn: number; inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
   | { seq: number; kind: 'command'; id: string; name: string; status: 'pending' | 'dispatched' | 'ok' | 'failed' | 'rejected'; detail?: string; handle?: string; infoGain?: string }
   | { seq: number; kind: 'malformed'; raw: string; reason: string }
   | { seq: number; kind: 'truncated'; raw: string; reason: string }
@@ -406,7 +499,7 @@ export type DriverRecord =
   | { seq: number; kind: 'turn-end'; reason: TurnEndReason };
 
 /** plugin record 通道（真实宿主）。类型语法 plugin:tf-agent/<record>（dsh-session types.d.ts:527）。 */
-export type TfAgentRecordType = 'plugin:tf-agent/command' | 'plugin:tf-agent/final' | 'plugin:tf-agent/fault' | 'plugin:tf-agent/step' | 'plugin:tf-agent/plan' | 'plugin:tf-agent/intent';
+export type TfAgentRecordType = 'plugin:tf-agent/command' | 'plugin:tf-agent/final' | 'plugin:tf-agent/fault' | 'plugin:tf-agent/step' | 'plugin:tf-agent/plan' | 'plugin:tf-agent/intent' | 'plugin:tf-agent/surface';
 
 export interface LedgerSink {
   record(type: TfAgentRecordType, data: unknown): void;
@@ -428,86 +521,13 @@ const NON_RETRYABLE_STREAM_CODES: ReadonlySet<string> = new Set([
 
 export const DEFAULT_SYSTEM_PROMPT = '你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回复流中完成任务：先简短思考，然后连续输出全部 tf-* 命令，最后输出 tf-final。';
 
-export const DEFAULT_PROTOCOL_TEXT = `## tf-* 单流协议（本回合唯一工具语法）
+export const DEFAULT_PROTOCOL_TEXT = composeProtocolText();
 
-<tf-write path="相对/绝对路径" id="w1" depends_on="r1">
-文件正文原文（原样输出，直到闭合标签）
-</tf-write>
-<tf-read path="相对/绝对路径" id="r1" depends_on="w1,w2" offset="100" limit="50"/>
-<tf-edit path="src/app.ts" id="e1" depends_on="r1">
-<<<<<<< OLD
-被替换的原文（精确字面量，全文唯一；不做模糊匹配）
-=======
-替换后的新文
->>>>>>> NEW
-</tf-edit>
-<tf-append path="notes.md" id="a1" anchor="锚点原文（可选；缺省=追加到文件末尾）">
-追加正文（原样输出，直到闭合标签；不改既有内容）
-</tf-append>
-<tf-grep pattern="正则" path="src" include="*.ts" id="g1"/>
-<tf-glob pattern="**/*.md" id="gl1"/>
-<tf-bash cmd="命令行" id="b1"/>
-<tf-peek handle="obs:read:c3@v1" from_line="10" to_line="20" id="p1"/>
-<tf-final id="f1" summary="一句话完成说明"/>
-
-（改既有文件用 tf-edit（精确替换）或 tf-append（只追加），不要整文件重写；
-找内容用 tf-grep（回匹配行）/tf-glob（回路径），不要用 tf-bash 调 shell 搜索，
-也不要把搜索当"读文件"用——grep 结果超长会截断并提示 tf-peek。）
-
-（tf-read 可选 offset/limit：1 基行号起点与行数，大文件按行段取，省 token。）
-
-（收尾纪律：命令全部闭合后，本流必须以 tf-final 结束；写完文件、执行完命令不等于任务结束。）
-
-## 计划与验收（复合任务推荐）
-<tf-plan id="p1">
-- [a1] 验收项描述
-- [a2] 验收项描述
-</tf-plan>
-- 计划只声明一次；修订时重发 tf-plan（新计划整体替换旧计划，请求里只注差分）。
-- 完成某验收项对应的命令时，在该命令上加 accepts 属性，如 <tf-write path="out.md" id="w1" accepts="a1">...</tf-write>。
-- 全部验收项都有命令成功回执后 tf-final 才会通过；缺项/未验证会被判为过早并注入提示——
-  模型自述"已完成"不构成验收证据。
-
-## 结果获取（关键）
-tf-read 首次/内容变化的结果会完整注入下一请求（超长文件截断为中段省略，用 tf-peek 精确取回）；
-tf-bash / tf-write / tf-edit / tf-append 成功只记台账（回执），不回灌输出。
-失败一律以 [tf-stream:error] 注入，没有错误注入就是成功了。
-因此：要看命令输出或计算结果时，用 tf-peek 按句柄取回——handle 从 [tf-stream:observation]
-与句柄目录增量中取。答案依赖命令输出时，先 peek 再收尾。
-
-## 回验纪律（省 token 的关键）
-- 你 tf-write 的正文全文就在你的上下文里：不要为了"确认写成功"而 tf-read 自己刚写过的
-  路径——那只会得到回执（行数 + 内容指纹，[tf-stream:receipt]），不会重复回灌全文。
-  写失败一定会有 [tf-stream:error] 注入；没有错误注入就是写成功了。
-- tf-read 留给"读不是你写的文件"（任务要求读的既有文件、命令产出的文件）。
-- 确需局部比对自写文件时，用 tf-peek 按行段取回，不要全文重读。
-
-## 时序与重发规则
-- 同 id 同内容重复声明 = 幂等：直接返回原回执（含句柄），不重复执行；同 id 不同内容会被
-  拒绝（换新 id）；被拒绝（无副作用）的命令可用原 id 修正后重发。
-- 同流内后续命令自动等待先闭合的 tf-write 完成（写序保证：先写后读不会读到旧内容）。
-- tf-peek 的句柄由命令产出——同流内提前 peek 会被自动延迟到命令完成后重试，仍无此句柄才报错；
-  要么给 peek 加 depends_on 挂到产出命令上（如 <tf-peek ... depends_on="r1"/>），
-  要么等下一请求（句柄会出现在句柄目录增量里）再 peek。
-- tf-bash 的命令在 Windows 宿主以 PowerShell（pwsh）执行：python3 通常不存在，优先 node -e 或
-  PowerShell 原生命令（Select-String / Get-Content）。
-
-tf-final 的 summary 必须包含任务要求的最终答案原文（数字、行内容、路径、结论），
-不得写"已完成/占位"式描述；还没拿到答案就不要输出 tf-final。
-
-规则：
-1. 写文件一律用 tf-write（正文在标签体内原样输出）；不要用原生工具写文件。
-2. id 建议显式给出且全任务唯一；depends_on 是逗号分隔的依赖 id 列表，可省略。
-   依赖只能指向本任务里已出现或将要出现的命令 id。
-3. 命令闭合即开始执行（独立命令并行，上限 3 个），不必等流结束再发后续命令。
-4. tf-read 首次/变化结果完整注入下一请求；其余成功产出只句柄化（见"结果获取"）。
-   需要某句柄的细节时发 tf-peek（handle 用句柄目录里的值，行段 1-based 闭区间）。
-   tf-edit 匹配失败（原文不唯一/不存在）会以结构化错误注入：核对后修正 OLD 段重发，
-   不要扩大替换范围改全文。tf-grep/tf-glob 只回匹配行/路径，超长会截断并提示 tf-peek。
-5. 上一请求若报告 [tf-stream:error]，先修复或改道该命令（换路径/换命令），再继续其余任务。
-6. 全部命令成功且无需更多信息时输出 tf-final；收到 tf-final 后本任务收敛，不再有下一请求。
-7. 调用工具只允许上表的 tf-* 标记：不要输出 <｜｜DSML｜｜…>、<think> 包裹、JSON tool_call
-   等任何原生调用格式——它们不会被解析成命令，只会浪费输出 token 并在界面显示为乱码。`;
+/**
+ * v0.4.1：缺省协议文本改为由 kernel/protocol.ts 组装（composeProtocolText()）。
+ * 与 0.4.0-beta.1 的原文字面量**逐字节一致**（金样测试 test/golden/v040-protocol.txt 钉死），
+ * 段级拆分/档位/增删见 kernel/protocol.ts 头注；protocolText 显式替换仍压过本默认。
+ */
 
 export const DEFAULT_INVARIANTS = '不变量：历史消息只增不改（任何"压缩/摘要历史"的请求都会被拒绝）；写文件成功不会有结果回灌（只记台账），失败一定会以 [tf-stream:error] 注入下一请求；tf-read 自己刚写过的文件只会得到回执（[tf-stream:receipt]，行数+指纹），不会回灌全文；不要用原生 tool_call 写文件。回合必须以 <tf-final .../> 收尾：所有命令输出完毕后立即输出 tf-final，不带 tf-final 的回合视为未完成——即使全部工作已做完。';
 
@@ -537,6 +557,20 @@ return { total: lines.length, errorCount: errors.length, samples: errors.slice(0
 - 每次运行的子调用次数、输出字节、墙钟有插件级配额（超限结构化终止 kind: quota-exceeded）；
   沙箱事实（mode/enforcement）逐次记账，enforcement=partial 只覆盖文件效果、不是隔离。`;
 
+/** v0.4.0（G2/P2）：tf-call 通用调用通道的协议段——命令表净增 1 的全部协议成本（§6.2 方案 C）。
+ *  规则刻意短：一条语法 + 一条判断规则 + 一条失败处置；不逐工具展开说明（工具描述由宿主
+ *  面给出，unknown-tool 的建议注入里带前缀匹配，不回灌全表）。 */
+export const DEFAULT_CALL_PROTOCOL_SECTION = `## tf-call 通用调用（映射面之外的一切宿主工具）
+<tf-call name="工具名" id="c1" depends_on="w1">{"参数名": "值"}</tf-call>
+- body 是一个 JSON 对象（参数原样透传）；name 必须是本会话工具面里的工具名，写错会收到
+  unknown-tool 注入（附相近工具名建议），核对后换新 id 重发。
+- 两条高频专用语法（不走 JSON）：提问 <tf-ask q="问题" id="a1" header="标题" options="选项1,选项2"/>；
+  装载技能 <tf-skill name="skill-name" id="s1"/>。
+- 何时用：要用的工具不在上表 tf-* 里时（搜网页、查后台任务、委派子代理、写任务清单、office/present 等）。
+  tf-* 覆盖到的操作继续用 tf-*（更短）；两者可混用，depends_on/accepts 语义一致。
+- 结果按工具类型分族处理（读类结果注入、写类只记回执），与 tf-* 同一套规则；JSON 引号
+  转义错误会收到 bad-json-arguments 注入，修正 body 重发即可。`;
+
 /** F3：tf-code 首成功/变化结果完整注入的默认上限（字符）。4000 ≈ 2k tokens：
  *  上限内值直接可见（省一次 tf-peek 往返），超限转骨架 + 句柄（中间结果不回灌的红线不破）。 */
 export const DEFAULT_CODE_VALUE_INJECT_LIMIT = 4000;
@@ -557,15 +591,22 @@ export const STEP_PROSE_COMMIT_LIMIT = 4000;
  *  不无限重试（真机 max-tokens 截断的恢复路径需要重发完整命令，次数有界）。 */
 export const MAX_TRUNCATION_RETRIES = 4;
 
-/** v0.3.2：可转正进追加区的易变尾前缀（事实类）。瞬态指令（nudge/degraded/error）不转正。 */
+/** v0.4.2：可转正进追加区的易变尾前缀（事实类）。瞬态指令（nudge/degraded/error）不转正。
+ *  v0.4.2 新增 plan / plan-diff / receipt：计划清单与验证回执都是"发生过的事实"，
+ *  必须跨请求可见——真机取证（session-6b61cb4d）：计划只在创建那一步出现一次，随后
+ *  彻底消失，模型丢上下文后反复 premature-final（连续 6 步被拒）直到重入上限，任务中断；
+ *  同时每请求重看计划区全是 cache miss（命中率被压到 ~64%）。 */
 const DURABLE_TAIL_PREFIXES: readonly string[] = [
   '[tf-stream:observation',
   '[tf-stream:peek',
   '[tf-stream:tool-result',
   '[tf-stream:replay',
+  '[tf-stream:plan',
+  '[tf-stream:receipt',
 ];
 
-/** v0.3.3：尾块是否会在下一请求转正进追加区（同 DURABLE_TAIL_PREFIXES 判定，单点定义）。 */
+/** v0.4.0：尾块是否会在下一请求转正进追加区（同 DURABLE_TAIL_PREFIXES 判定，单点定义）。
+ *  转正集合与排序集合必须是同一个谓词——否则排序后仍会有 transient 块被"夹"在中间。 */
 function isDurableBlock(block: { content: string }): boolean {
   return DURABLE_TAIL_PREFIXES.some((prefix) => block.content.startsWith(prefix));
 }
@@ -573,6 +614,39 @@ function isDurableBlock(block: { content: string }): boolean {
 /** v0.3.2：正文归一化（连续空行压成一个；去首尾空白）——避免 "\n\n\n\n" 的空消息污染正文。 */
 export function normalizeProse(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
+ * v0.4.3（P0-7①）：prompt token 本地估算——Σ 消息 content 字符数 / 4 上取整。
+ * 与 #injectedChars 折算（Math.ceil(chars/4)，budgetLevel O5 阶梯）同一启发式，确定性好
+ * （同输入同字节）；只做交叉校验，权威值是 providerInputTokens（升级清单 E9：估算与
+ * provider 回报差 10-20%，跨 provider 不可比）。
+ */
+export function estimatePromptTokens(messages: readonly RenderMessage[]): number {
+  let chars = 0;
+  for (const m of messages) chars += m.content.length;
+  return Math.ceil(chars / 4);
+}
+
+/**
+ * v0.4.0（自 0.3.3 回流）：畸形/通配闭合标签的定向纠错注入。
+ *
+ * 真机形态：模型把协议通配当闭合标签输出 `</tf-*>`，或给闭合标签加属性
+ * `</tf-write path="x">`。parser 已把它们判 malformed(stray-close-tag) 丢弃（不进 prose），
+ * 但 fail-soft 只记台账时模型全程不知道错在哪，同一会话重复犯错、无产出收场。
+ * 一次注入讲清合法语法的两种形态 + 收尾方式，把"猜语法"变成"照抄正确形态"。
+ */
+export function malformedCloserNudge(raw: string): string {
+  const shown = raw.length <= 40 ? raw : `${raw.slice(0, 40)}…`;
+  return [
+    `[tf-stream:error cmd=protocol] 检测到无效的协议闭合标签 \`${shown}\`——已丢弃：不执行、不进入对话正文。`,
+    'tf-* 协议没有通配或独立的闭合标签形态（`</tf-*>`、`</tf-命令名 属性…>` 都不是合法语法）：',
+    '- 有正文的命令（tf-write/tf-edit/tf-append/tf-code/tf-plan）用配对闭合，闭合标签必须与命令名逐字一致：',
+    '  `<tf-write path="a.txt" id="w1">正文</tf-write>`；',
+    '- 其余命令一律自闭合：`<tf-read path="a.txt" id="r1"/>`；',
+    '- 任务收束用 `<tf-final id="f1" summary="最终答案原文"/>`——不存在 `</tf-*>` 这样的流级闭合。',
+    '请继续用正确的 tf-* 命令完成剩余工作，最后以 tf-final 收尾。',
+  ].join('\n');
 }
 
 /** 截断到上限（保留尾部标记，便于台账核对）。 */
@@ -598,26 +672,6 @@ function truncationNudge(truncation: { reason: string; raw: string }): string {
     '然后继续未完成的工作；任务确实已完成则输出 tf-final（summary 写最终答案原文）。',
     tail !== '' ? `已生成部分的尾部（供续写定位）：\n${tail}` : '',
   ].filter((line) => line !== '').join('\n');
-}
-
-/**
- * v0.3.3：畸形/孤立闭合标签的定向纠错注入。真机取证（2026-11-20 桌面端会话，
- * DeepSeek-V4.1）：模型把协议通配当成闭合标签输出（`</tf-*>`），同一会话内重复两次——
- * 因为畸形闭合此前只记台账无注入（fail-soft），模型拿不到任何纠错信号，会话无产出收场。
- * 文本点名残片原文、给出两种合法命令形态与收束方式。该残片已被 parser 丢弃（不进正文、
- * 不显示、不执行），本注入只负责"教会一次"。
- */
-export function malformedCloserNudge(raw: string): string {
-  const shown = raw.length <= 40 ? raw : `${raw.slice(0, 40)}…`;
-  return [
-    `[tf-stream:error cmd=protocol] 检测到无效的协议闭合标签 \`${shown}\`——已丢弃：不执行、不进入对话正文。`,
-    'tf-* 协议没有通配或独立的闭合标签形态（`</tf-*>`、`</tf-命令名 属性…>` 都不是合法语法）：',
-    '- 有正文的命令（tf-write/tf-edit/tf-append/tf-code/tf-plan）用配对闭合，闭合标签必须与命令名逐字一致：',
-    '  `<tf-write path="a.txt" id="w1">正文</tf-write>`；',
-    '- 其余命令一律自闭合：`<tf-read path="a.txt" id="r1"/>`；',
-    '- 任务收束用 `<tf-final id="f1" summary="最终答案原文"/>`——不存在 `</tf-*>` 这样的流级闭合。',
-    '请继续用正确的 tf-* 命令完成剩余工作，最后以 tf-final 收尾。',
-  ].join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +731,7 @@ interface NativeCallAccumulator {
 export interface DriverSnapshot {
   records: readonly DriverRecord[];
   counters: () => { injected: number; produced: number; peeked: number; injectedRatio: number };
-  usage: TokenUsageLike;
+  usage: { inputTokens: number; outputTokens: number };
   requestCount: number;
   stableHashes: readonly string[];
 }
@@ -692,13 +746,13 @@ export class SingleStreamDriver {
     reasoningEffort?: string;
     maxParallelToolCalls: number;
     maxReentries: number;
-    /** v0.3.3：连续零产出重入上限（默认 = maxReentries） */
+    /** v0.4.0：连续零产出重入上限（默认 = maxReentries） */
     stallReentries: number;
-    /** v0.3.3：请求硬上限（默认 max(4, maxReentries*2)） */
+    /** v0.4.0：请求硬上限（默认 max(4, maxReentries*2)） */
     maxRequests: number;
-    /** v0.3.3：收束期额外请求数（默认 2） */
+    /** v0.4.0：收束期额外请求数（默认 2） */
     closeOutRequests: number;
-    /** v0.3.3：单请求 tf-read 完整正文注入预算（字符；≤0 关闭） */
+    /** v0.4.0：单请求 tf-read 完整正文注入预算（字符；≤0 关闭） */
     readFeedbackBudgetPerRequest: number;
     streamIdleTimeoutMs: number;
     budgetTokens?: number;
@@ -723,9 +777,28 @@ export class SingleStreamDriver {
   /** F7：段边界阈值（追加区字符数；≤0 = 关闭） */
   segmentMaxChars: number;
   toolMapping: ToolMapping;
+  /** v0.4.0 工具面档位（§16 决议 2：缺省 standard）。'off' = 0.3.x 行为（无宿主面，
+   *  tf-call 关闭——回退点）。 */
+  toolSurface: SurfaceProfile;
+  /** v0.4.0 原生通道开关（§15：默认文本 false）。开启时请求携带冻结面 schema
+   *  （core 档白名单 / standard-full 全量），可达性同时保留 tf-call。 */
+  nativeTools: boolean;
+  /** v0.4.0 tf-call 通用通道开关（G2）。toolSurface=off 时强制关。 */
+  callCommand: boolean;
+  /** v0.4.0 toolSet 准入（R5 决议 3：beta 缺省 false——toolSet 只用于 schemas 视图，
+   *  不传 execute；P6 复跑后再收紧）。 */
+  strictAdmission: boolean;
+  /** v0.4.3（P0-6 探针，离线测试专用）：见 StreamDriverConfig.faultPrefixDrift。 */
+  faultPrefixDrift?: { kind: 'append' | 'stable'; oncePerTurn?: boolean };
   };
   readonly #renderer: ContextRenderer;
   readonly #obs: ObservationLedger;
+  /** v0.4.0 工具面（P1）：会话首请求冻结；tf-call 校验面 + nativeTools 声明面。 */
+  readonly #surface: ToolSurfaceHolder;
+  /** 本请求冻结的工具面快照（undefined = L2 protocol-only / toolSurface=off）。 */
+  #currentSurface: ToolSurface | undefined = undefined;
+  /** 上一次注入的降级级别（同级别不重复注入；级别变化或恢复时重新注入）。 */
+  #lastSurfaceDegraded: 'stale' | 'core' | 'protocol-only' | 'ok' = 'ok';
   readonly #records: DriverRecord[] = [];
   readonly #commands = new Map<string, CommandRecord>();
   readonly #inFlight = new Set<Promise<void>>();
@@ -751,22 +824,23 @@ export class SingleStreamDriver {
   #turnController: AbortController | null = null;
   #requestCount = 0;
   #reentryCount = 0;
-  /** v0.3.3：连续零产出重入数（看到新 ok 命令即清零）——真正的打转护栏。 */
-  #stallReentries = 0;
-  /** v0.3.3：本回合已见的最大生产性 ok 命令数（进度基准）。 */
-  #progressOkMark = 0;
-  /** v0.3.3：收束期状态（到达 maxReentries 后不再硬杀，给有限次"立即交付"机会）。 */
-  #closeOutActive = false;
-  #closeOutRequests = 0;
-  /** v0.3.3：本回合解析到的命令 id（兜底交付只列本回合事实；命令表跨回合保留）。 */
-  readonly #turnCommandIds = new Set<string>();
-  /** v0.3.3：兜底交付只写一次（避免关闭期重复 assistant 消息）。 */
-  #fallbackFinalDelivered = false;
   #finalNudges = 0;
-  /** v0.3.2：上次 nudge 时的 ok 命令数（进度感知护栏的基准点；null = 本回合尚未 nudge）。 */
+  /** v0.4.2：上次 nudge 时的 ok 命令数（进度感知护栏的基准点；null = 本回合尚未 nudge）。 */
   #nudgeMark: number | null = null;
+  // ---- v0.4.0（自 0.3.3 回流的收束改造）：停滞预算 / 请求硬上限 / 收束期 ----
+  /** 连续零产出重入数（本步没有新增生产性 ok 命令 → +1；有产出 → 清零）。 */
+  #stallReentries = 0;
+  /** 产出水位基准（#productiveOkCount 的历史最高值）。 */
+  #progressOkMark = 0;
+  /** 收束期是否已开启（撞墙后先给"立即交付"指令，而不是直接砍）。 */
+  #closeOutActive = false;
+  /** 本回合已用掉的收束请求数。 */
+  #closeOutRequests = 0;
   #finalOnlyRequests = 0;
   #deltaCursor = 0; // O3 directoryDelta 游标（obs seq 空间）
+  /** v0.4.2：口径对齐宿主 dsh-llm Usage（types.d.ts:160-179）——inputTokens 只是**未命中缓存的
+   *  输入**；cacheRead/cacheWrite 单列（计费输入 = 三者之和）。缺省 0 = 适配器未上报缓存字段
+   *  （离线 mock / 旧宿主），此时行为与旧版完全一致。 */
   #usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
   #injectedChars = 0;
   #stableHashes: string[] = [];
@@ -823,9 +897,33 @@ export class SingleStreamDriver {
   } | null = null;
   /** 已随请求发出、尚未转正进追加区的易变尾（含 step 归属，跨回合不转正）。 */
   #deliveredTail: { turn: number; step: number; blocks: RenderMessage[] } | null = null;
+  // ---- v0.4.3 P0-6：wire 边界承诺前缀断言（升级清单 §2.7 两个盲区的修复）----
+  /** 上一请求收尾后的稳定段基线（承诺前缀快照 + stableLen 分类锚点）。
+   *  render() 内置 preflight 只守装配时的 stable；本基线把守卫延伸到"上一请求收尾后的
+   *  stable"——转正块逐字节一致性与追加区不被改写由此断言兜底，且与易变尾块序完全
+   *  解耦（v0.4.3.1：混合尾 error 前置不再误报 append-drift，核查 §2）。
+   *  段边界（dropAppendHead）显式重置为 null（唯一合法的历史收缩通道）。 */
+  #lastRequest: RequestBaseline | null = null;
+  /** P0-6④：append-drift 一次放行预算——每回合 1 次、每会话 3 次；超限降级 stable-drift 处置。
+   *  （断言在发送前，"放行"= 记账后照常发送同一份 next，0 额外请求——核查 §4.2 用词。） */
+  #prefixResendsTurn = 0;
+  #prefixResendsSession = 0;
+  /** P0-6⑤：兜底交付一次性标记（同回合只写一次；零产出回合不写——不伪造"已完成"）。 */
+  #fallbackFinalDelivered = false;
+  /** P0-6⑤：本回合命令 id 集（兜底交付的"台账事实"清单来源；回合开始清零）。 */
+  readonly #turnCommandIds = new Set<string>();
+  // ---- v0.4.3 P0-7①：尺子（request 记录的 resetSeq/resetCause/feedbackBytes）----
+  /** 重置纪元（显式缓存重置点的单调计数）；resetCause = 最近一次成因。 */
+  #resetSeq = 0;
+  #resetCause: string | undefined = undefined;
+  /** 本请求的反馈字节分类累计（注入位点累计；request 记录写入时快照并清零）。 */
+  #feedbackBytes = { full: 0, dedup: 0, handle: 0 };
+  /** 探针（faultPrefixDrift）已注入的回合集（oncePerTurn 语义）。 */
+  readonly #faultDriftTurns = new Set<number>();
   /** 本步被截断的事实（parser truncated 事件 / finish=max-tokens）；非空即强制续写一次。 */
   #truncation: { reason: string; raw: string } | null = null;
-  /** v0.3.3：畸形闭合标签（stray-close-tag）的定向纠错注入（一次性；见 malformedCloserNudge）。 */
+  /** v0.4.0（自 0.3.3 回流）：畸形闭合标签（stray-close-tag）的定向纠错注入（一次性；
+   *  见 malformedCloserNudge）。只注入一次：同一会话重复犯错不重复烧注入。 */
   #strayCloseNudge: string | null = null;
   #strayCloseGuided = false;
   #truncationRetries = 0;
@@ -916,16 +1014,17 @@ export class SingleStreamDriver {
       model: config.model,
       reasoningEffort: config.reasoningEffort,
       maxParallelToolCalls: config.maxParallelToolCalls ?? 3,
-      // v0.3.3：兜底值与 balanced 模式默认一致（12）——此前硬编码 8，直构驱动器的调用方
-      // （离线评测/测试）会拿到与桌面装配不一致的旧上限。
+      // v0.4.2：兜底值与 balanced 模式默认一致（12）——直构驱动器的调用方
+      // （离线评测/测试）与桌面装配保持一致上限。
       maxReentries: config.maxReentries ?? 12,
-      // v0.3.3：生产性重入与停滞重入分账——旧实现把"继续干活"和"原地打转"都算进
-      // maxReentries，13 步的真实任务（读文件/改文件/跑检查）会在干到一半时被硬杀，
-      // 桌面端只剩最后一句 prose（真机 session-6bb805db / 27876fd9）。
+      // v0.4.0（自 0.3.3 回流）：生产性重入与停滞重入分账——旧实现把"继续干活"和"原地
+      // 打转"都算进 maxReentries，13 步的真实任务（读文件/改文件/跑检查）会在干到一半时
+      // 被硬杀，桌面端只剩最后一句 prose（真机 session-6bb805db / 27876fd9）。
       stallReentries: config.stallReentries ?? config.maxReentries ?? 12,
       maxRequests: config.maxRequests ?? Math.max(4, (config.maxReentries ?? 12) * 2),
       closeOutRequests: Math.max(0, config.closeOutRequests ?? 2),
-      readFeedbackBudgetPerRequest: config.readFeedbackBudgetPerRequest ?? DEFAULT_READ_FEEDBACK_BUDGET_PER_REQUEST,
+      readFeedbackBudgetPerRequest: config.readFeedbackBudgetPerRequest
+        ?? DEFAULT_READ_FEEDBACK_BUDGET_PER_REQUEST,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? 30_000,
       budgetTokens: config.budgetTokens,
       selfReadFeedback: config.selfReadFeedback ?? 'receipt',
@@ -940,15 +1039,43 @@ export class SingleStreamDriver {
       enablePlan: config.enablePlan ?? true,
       segmentMaxChars: config.segmentMaxChars ?? DEFAULT_SEGMENT_MAX_CHARS,
       toolMapping: config.toolMapping ?? DEFAULT_TOOL_MAPPING,
+      // v0.4.0 工具面（P1）：'off' 档 = 0.3.x 行为回退点；无宿主服务面（headless/离线）
+      // 时 tf-call 段不声明（协议文本与 0.3.x 一致，mock 剧本匹配不受影响）
+      toolSurface: config.toolSurface ?? 'standard',
+      nativeTools: config.nativeTools === true,
+      callCommand: (config.toolSurface ?? 'standard') !== 'off'
+        && config.callCommand !== false
+        && ports.toolsService !== undefined,
+      strictAdmission: config.strictAdmission === true,
+      // v0.4.3（P0-6 探针）：离线探针专用（生产不得设置）；undefined = 关闭，零开销。
+      ...(config.faultPrefixDrift === undefined ? {} : { faultPrefixDrift: config.faultPrefixDrift }),
     };
     // tf-code 协议段只在实际可执行时声明（稳定前缀构造期冻结：通道不存在就不会被模型幻觉调用）
-    const protocolText = (config.protocolText ?? DEFAULT_PROTOCOL_TEXT)
-      + (this.#cfg.codeEnabled ? `\n\n${config.codeProtocolText ?? DEFAULT_CODE_PROTOCOL_SECTION}` : '');
+    // v0.4.0：tf-call 协议段同理（callCommand 决定声明与否；'off' 档不声明，0.3.x 回退点）
+    // v0.4.1：基座协议由 kernel/protocol.ts 组件化组装（档位/段增删/enablePlan 硬联动）；
+    //   显式 protocolText 仍整段替换（压过档位与段配置）；protocolAppend 追加在末尾（构造期冻结）。
+    const baseProtocol = config.protocolText
+      ?? composeProtocolText({
+        level: config.protocolLevel ?? 'full',
+        sections: config.protocolSections,
+        enablePlan: this.#cfg.enablePlan,
+      });
+    const protocolText = baseProtocol
+      + (this.#cfg.codeEnabled ? `\n\n${config.codeProtocolText ?? DEFAULT_CODE_PROTOCOL_SECTION}` : '')
+      + (this.#cfg.callCommand ? `\n\n${config.callProtocolText ?? DEFAULT_CALL_PROTOCOL_SECTION}` : '')
+      + (config.protocolAppend ? `\n\n${config.protocolAppend}` : '');
     this.#renderer = renderer ?? new ContextRenderer({
       system: config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
       protocol: protocolText,
-      toolSchemas: config.nativeToolSchemas ?? '（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）',
-      invariants: config.invariants ?? DEFAULT_INVARIANTS,
+      toolSchemas: config.nativeToolSchemas ?? (this.#cfg.nativeTools
+        ? '（本请求的原生工具 schema 见 tools 字段；未列出的宿主工具一律走 tf-call）'
+        : '（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）'),
+      invariants: config.invariants === false ? '' : config.invariants ?? DEFAULT_INVARIANTS,
+    });
+    this.#surface = new ToolSurfaceHolder(ports.toolsService, {
+      profile: this.#cfg.toolSurface,
+      nativeTools: this.#cfg.nativeTools,
+      callCommand: this.#cfg.callCommand,
     });
     this.#obs = obs ?? new ObservationLedger({ starvationThreshold: config.starvationThreshold });
     this.#warn = ports.onWarning ?? (() => {});
@@ -967,11 +1094,56 @@ export class SingleStreamDriver {
     if (selection.reasoningEffort !== undefined) this.#cfg.reasoningEffort = selection.reasoningEffort;
   }
 
-  /** v0.3.2：assistant 消息宿主来源的实时值（写入时取，不缓存；applySelection 后随动）。
+  /** v0.4.2：assistant 消息宿主来源的实时值（写入时取，不缓存；applySelection 后随动）。
    *  会话日志与请求装配共用；kind 固定 'model'。空串由 makeAssistantMessage 兜底为
    *  'unknown'（宿主校验拒绝空字符串）。 */
   modelSource(): ModelSourceInfo {
     return { kind: 'model', provider: this.#cfg.provider, model: this.#cfg.model };
+  }
+
+  /** v0.4.2：运行时缓存口径快照（控制页/对账用）。口径与 dsh-llm Usage 一致：
+   *  计费输入 = 未命中输入 + 缓存读 + 缓存写。适配器从未上报缓存字段（离线 mock /
+   *  旧宿主）时 cacheHitRatio 为 null——不把缺数据渲染成 0%。
+   *  v0.4.3（P0-7①）：cacheHitRatio 是 **diagnostic-only**（分母随总量压缩收缩，比值
+   *  不可跨实验比较——升级清单 §0.5）；对账主口径是聚合三元组 providerInputSum / requests /
+   *  resetCount，全部可从 request 记录外部复算（providerInputSum = Σ providerInputTokens，
+   *  requests = request 记录数，resetCount = 最后一条记录的 resetSeq）。 */
+  cacheStats(): {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    billedInput: number;
+    cacheHitRatio: number | null;
+    /** v0.4.3 聚合三元组（可外部复算）：ΣproviderInputTokens / request 记录数 / 重置纪元。 */
+    providerInputSum: number;
+    requests: number;
+    resetCount: number;
+  } {
+    const billedInput = this.#usage.inputTokens + this.#usage.cacheReadTokens + this.#usage.cacheWriteTokens;
+    const cacheHitRatio = this.#usage.cacheReadTokens > 0 && billedInput > 0
+      ? Math.round((this.#usage.cacheReadTokens / billedInput) * 100) / 100
+      : null;
+    let providerInputSum = 0;
+    let requests = 0;
+    let resetCount = 0;
+    for (const rec of this.#records) {
+      if (rec.kind !== 'request') continue;
+      requests += 1;
+      providerInputSum += rec.providerInputTokens ?? 0;
+      resetCount = Math.max(resetCount, rec.resetSeq ?? 0);
+    }
+    return {
+      inputTokens: this.#usage.inputTokens,
+      outputTokens: this.#usage.outputTokens,
+      cacheReadTokens: this.#usage.cacheReadTokens,
+      cacheWriteTokens: this.#usage.cacheWriteTokens,
+      billedInput,
+      cacheHitRatio,
+      providerInputSum,
+      requests,
+      resetCount,
+    };
   }
 
   /** Agent 层接线：会话 id（请求路由 stamp）与任务 id（gate 凭据绑定）。 */
@@ -1004,6 +1176,11 @@ export class SingleStreamDriver {
    *  只读通道，不进上下文——供排障/回取与评测断言使用。 */
   peekHandle(handle: string, fromLine = 1, toLine = Number.MAX_SAFE_INTEGER): string | null {
     return this.#obs.peek(handle, fromLine, toLine);
+  }
+
+  /** v0.4.0（P5）：当前冻结工具面的工具名（tf-code 全绑定生成用）。无面 = 空数组（0.3.x 行为）。 */
+  surfaceNames(): readonly string[] {
+    return this.#currentSurface?.names ?? [];
   }
 
   /**
@@ -1075,24 +1252,17 @@ export class SingleStreamDriver {
 
   // ------------------------------------------------------------------ O5 阶梯
 
-  /** 任务级 token 预算阶梯（README O5：<70% normal；70-90% high-only；>90% final-only）。
-   *  v0.3.3：计费口径对齐宿主（METRICS E3）——inputTokens 是未缓存输入，缓存读/写单列，
-   *  只加 inputTokens 会系统性低估支出，预算档迟迟不升级。 */
+  /** 任务级 token 预算阶梯（README O5：<70% normal；70-90% high-only；>90% final-only）。 */
   budgetLevel(): BudgetLevel {
     const budget = this.#cfg.budgetTokens;
     if (budget === undefined || budget <= 0) return 'normal';
-    const spent = this.#usage.inputTokens + this.#usage.cacheReadTokens + this.#usage.cacheWriteTokens
-      + this.#usage.outputTokens + Math.ceil(this.#injectedChars / 4);
+    // v0.4.2：计费输入 = 未命中输入 + 缓存读 + 缓存写（口径对齐 dsh-llm Usage；三者互斥相加）。
+    // 适配器不上报缓存字段时 cacheRead/cacheWrite 为 0，行为与旧版逐字节一致。
+    const billedInput = this.#usage.inputTokens + this.#usage.cacheReadTokens + this.#usage.cacheWriteTokens;
+    const spent = billedInput + this.#usage.outputTokens + Math.ceil(this.#injectedChars / 4);
     if (spent >= budget * 0.9) return 'final-only';
     if (spent >= budget * 0.7) return 'high-only';
     return 'normal';
-  }
-
-  /** v0.3.3：缓存命中率（cacheRead / (cacheRead + 未缓存输入)；无请求时为 0）。
-   *  只进台账/评测，不参与控制流——命中率是结果，不是开关。 */
-  #cacheHitRate(): number {
-    const denom = this.#usage.cacheReadTokens + this.#usage.inputTokens;
-    return denom === 0 ? 0 : this.#usage.cacheReadTokens / denom;
   }
 
   // ------------------------------------------------------------------ 任务入口
@@ -1197,6 +1367,11 @@ export class SingleStreamDriver {
         handle: dropped.length > 0 ? `obs:read:seg-t${turn}-0@v1` : null,
         key: `segment:turn${turn}`, infoGain: 'low', reason: 'segment-drop-handleized',
       });
+      // v0.4.3（P0-7①）：段边界 = 显式缓存重置点，重置纪元 +1（request 记录携带 resetSeq/resetCause）；
+      // wire 全文基线同步作废（dropAppendHead 是唯一合法的历史收缩通道，不走断言）。
+      this.#resetSeq += 1;
+      this.#resetCause = 'segment-drop';
+      this.#lastRequest = null;
       this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'segment-drop', detail: `dropped ${dropped.length} blocks (${before} chars) at turn ${turn} boundary; originals handleized (obs:read:seg-t${turn}-*)` });
       this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'segment-drop', turn, droppedBlocks: dropped.length, chars: before });
       this.#segmentKeepFrom = 0;
@@ -1255,20 +1430,24 @@ export class SingleStreamDriver {
     this.#replayCapped = false;
     this.#truncationRetries = 0;
     this.#truncation = null;
-    // v0.3.3：收束改造的回合级状态
-    // —— 停滞预算（连续无新增产出的重入）、收束期预算、本回合命令集（产出口径）。
+    // v0.4.3（P0-6）：回合级状态清零——append-drift 的每回合放行预算、兜底交付一次性标记、
+    // 本回合命令集（兜底交付的"台账事实"来源）。
+    this.#prefixResendsTurn = 0;
+    this.#fallbackFinalDelivered = false;
+    this.#turnCommandIds.clear();
+    // v0.4.0（自 0.3.3 回流）：收束改造的回合级状态（停滞预算 / 收束期 / 产出水位）
     this.#stallReentries = 0;
     this.#progressOkMark = 0;
     this.#closeOutActive = false;
     this.#closeOutRequests = 0;
-    this.#turnCommandIds.clear();
-    this.#fallbackFinalDelivered = false;
     let reason: TurnEndReason = { kind: 'blocked', detail: 'turn loop exited without convergence' };
 
     while (true) {
-      // v0.3.2：digest 的落史时机在流结束时（见 consumeStream 之后的 #commitStepDigest），
+      // v0.4.2：digest 的落史时机在流结束时（见 consumeStream 之后的 #commitStepDigest），
       // 易变尾的转正在 render 之后（转正块落位 = 上一请求尾部的同一位置）——两件事各就
-      // 各位，下一请求的公共前缀即可覆盖上一请求的全部 prompt（缓存读零损失）。
+      // 各位，下一请求的公共前缀即可覆盖上一请求的全部 prompt（无 transient 尾时缓存读零损失；
+      // 有 transient（error/nudge）时该块在下一请求被丢弃，前缀在该 index 断裂——损失
+      // bounded 一块，0.5.0 起按 transient-drop 计量）。
       // ---- steer 注入（修复限制 2）：运行中到达的 steer 在下一请求（内建的"下一步"）生效
       // ——进追加区（只追加，前缀单调不破）；流内不打断：当前流早已跑完才会走到这里。
       if (this.#pendingSteers.length > 0) {
@@ -1288,24 +1467,113 @@ export class SingleStreamDriver {
         this.#warn('step/start 事件写入失败', error);
       }
 
+      // ---- v0.4.0 工具面（P1）：每请求解析一次（首请求冻结；失败沿用旧面 degraded=stale）。
+      // 无宿主面（toolSurface=off 或 L2）→ undefined，注入一行降级说明（级别转换时）。 ----
+      const surface = await this.#surface.resolve({
+        ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
+        signal: this.#commandSignal(),
+        modelSelection: { provider: this.#cfg.provider, model: this.#cfg.model, ...(this.#cfg.reasoningEffort === undefined ? {} : { reasoningEffort: this.#cfg.reasoningEffort }) },
+      });
+      this.#currentSurface = surface;
+      // 降级判定：有宿主服务面且解析失败/缺席才是降级；headless 无服务面 = 稳态
+      // protocol-only（0.3.x 行为），不注行不记账（避免对离线路径制造永久噪声）
+      const degradedLevel: 'stale' | 'core' | 'protocol-only' | 'ok' =
+        surface?.degraded
+        ?? (surface === undefined && this.#surface.hasService && this.#cfg.toolSurface !== 'off' ? 'protocol-only' : 'ok');
+      if (degradedLevel !== 'ok' && degradedLevel !== this.#lastSurfaceDegraded) {
+        // 降级注入走追加区（前缀单调不破；同级别不重复——只加一次级别转换行）
+        this.#renderer.appendHistory({ role: 'user', content: degradedLine(degradedLevel) });
+        this.#ledgerWrite('plugin:tf-agent/surface', { event: 'degrade', level: degradedLevel, frozenAt: surface?.frozenAt ?? 0 });
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: `surface-${degradedLevel}`, detail: `frozenAt=${surface?.frozenAt ?? 0}` });
+      } else if (degradedLevel === 'ok' && this.#lastSurfaceDegraded !== 'ok') {
+        this.#ledgerWrite('plugin:tf-agent/surface', { event: 'recover', frozenAt: surface?.frozenAt ?? 0 });
+      }
+      if (surface !== undefined && this.#lastSurfaceDegraded === 'ok' && surface.frozenAt === 1 && this.#cfg.toolSurface !== 'off') {
+        // 首冻结审计（§8.4：surface:freeze 落 obs 台账，不落 session——E6 红线不变）
+        this.#ledgerWrite('plugin:tf-agent/surface', { event: 'freeze', profile: surface.profile, tools: surface.names.length, nativeDeclared: surface.schemas.length, frozenAt: surface.frozenAt });
+      }
+      this.#lastSurfaceDegraded = degradedLevel;
+
       // ---- REQUEST：装配 + O6 preflight（render() 内置断言，违反即抛 → fail-closed）----
-      const messages = this.#renderer.render();
-      // v0.3.2：**刚随本请求发出的**易变尾在此转正——落位 = 它在本请求 prompt 里的同一
-      // 位置（尾部），下一请求的公共前缀因此覆盖本请求的全部 prompt（缓存读零损失）。
+      let messages: RenderMessage[];
+      try {
+        messages = this.#renderer.render();
+      } catch (error) {
+        // v0.4.3（P0-6③④⑤）：内置 preflight 抛出的 stable-drift 与 wire 断言同一条处置
+        // 路径（0 重发 → 最小对账 → 兜底交付 → blocked）——异常上抛开发者日志，但不再是
+        // 用户可见终态（旧实现直接炸出 runTurn，用户侧只剩半截输出）。
+        if (!(error instanceof PrefixBrokenError)) throw error;
+        const detail = this.#prefixFailClosed(error, turn, step, 'render() 内置 preflight');
+        // v0.4.0：兜底交付必须先于 step/end（assistant/message 需落在打开的 turn+step 内）
+        this.#deliverFallbackFinal(turn, step, detail);
+        try {
+          this.#ports.events?.stepEnd(turn, step);
+        } catch (stepError) {
+          this.#warn('step/end 事件写入失败', stepError);
+        }
+        reason = { kind: 'blocked', detail: `前缀校验失败（fail-closed，拒绝发送）：${detail}` };
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'turn-blocked', detail: reason.detail });
+        break;
+      }
+      // v0.4.3（P0-6①②）：wire 边界承诺前缀断言——比较对象是**上一请求收尾后的稳定段**
+      // （#lastRequest.promised：转正之后的 stableMessages() 逐字节快照）。render() 内置
+      // preflight 只守装配时的 stable；本断言补上两个盲区：转正块与已发文本逐字节一致、
+      // 追加区不被代码改写。v0.4.3.1：基线从"上一请求前 N 条（horizon）"改为 promised——
+      // 与易变尾块序完全解耦（混合尾 error 前置不再误报 append-drift，核查 §2）。
+      // 失败按三类处置（P0-6③④）：append-drift 预算内放行一次；其余 fail-closed。
+      if (this.#cfg.faultPrefixDrift !== undefined) this.#faultDriftBaseline(turn);
+      const wire = this.#assertWirePrefix(messages, turn, step);
+      if (wire.verdict === 'fail') {
+        // P0-6⑤：有产出时才有交付。顺序固定：receipt 最小对账（#prefixFailClosed 内）→ 兜底交付 → step/end → blocked。
+        this.#deliverFallbackFinal(turn, step, wire.detail);
+        try {
+          this.#ports.events?.stepEnd(turn, step);
+        } catch (error) {
+          this.#warn('step/end 事件写入失败', error);
+        }
+        reason = { kind: 'blocked', detail: `前缀校验失败（fail-closed，拒绝发送）：${wire.detail}` };
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'turn-blocked', detail: reason.detail });
+        break;
+      }
+      // 分类锚点必须在转正前取（转正会增长 stableMessages）；承诺前缀 = 转正后的稳定段
+      // ——下一请求的前 promised.length 条必须与它逐字节一致（transient 尾块不在承诺里）。
+      const stableLen = this.#renderer.stableMessages().length;
+      // v0.4.2：**刚随本请求发出的**易变尾在此转正——落位 = 它在本请求 prompt 里的同一
+      // 位置（尾部），下一请求的公共前缀因此覆盖本请求的全部 prompt（无 transient 尾时
+      // 缓存读零损失；有 transient 时前缀在该 index 断裂，损失 bounded 一块）。
       // 本步的 digest 在流结束时就地落史（见 consumeStream 之后），时序：转正 → digest。
       this.#commitDeliveredTail();
+      this.#lastRequest = { promised: this.#renderer.stableMessages(), stableLen };
       const stableHash = this.#renderer.stableHash();
       this.#stableHashes.push(stableHash);
       const fullHash = renderHash(messages);
-      this.#record({
+      // v0.4.3（P0-7①）：request 记录携带尺子——prefixTokensEst（本地估算，交叉校验用）、
+      // resetSeq/resetCause（重置纪元）、feedbackBytes（反馈字节分类快照，取后清零）。
+      // providerInput/cacheRead/cacheWrite/output 在流末由 usage chunk 回填（记录先建、数字后补）。
+      const requestRecord: RequestRecord = {
         seq: ++DRIVER_SEQ, kind: 'request', turn, step,
         provider: this.#cfg.provider, model: this.#cfg.model,
         level, stableHash, renderHash: fullHash,
         injectionBlocks: 0,
-      });
+        prefixTokensEst: estimatePromptTokens(messages),
+        resetSeq: this.#resetSeq,
+        ...(this.#resetCause === undefined ? {} : { resetCause: this.#resetCause }),
+        feedbackBytes: { ...this.#feedbackBytes },
+      };
+      this.#feedbackBytes = { full: 0, dedup: 0, handle: 0 };
+      this.#record(requestRecord);
 
       // ---- STREAMING：逐 delta 消费；命令闭合即派发，不结束流 ----
       const streamOutcome = await this.#consumeStream(turn, step, messages, level);
+      // v0.4.3（P0-7①）：本请求的实际计量回填（usage chunk 在流末才到；同一对象引用，外部
+      // 复算口径 = Σ request 记录的 providerInputTokens，权威值非估算——E9）。
+      if (streamOutcome.usage !== null) {
+        const u = streamOutcome.usage;
+        requestRecord.providerInputTokens = u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens;
+        requestRecord.cacheRead = u.cacheReadTokens;
+        requestRecord.cacheWrite = u.cacheWriteTokens;
+        requestRecord.output = u.outputTokens;
+      }
 
       // 不可重试的流错误（凭据/配置层）：fail-fast 终止回合，不进重入循环
       if (streamOutcome.finish.kind === 'error' && NON_RETRYABLE_STREAM_CODES.has(finishCode(streamOutcome.finish))) {
@@ -1330,12 +1598,11 @@ export class SingleStreamDriver {
       // v4 格式要求它落在打开的 turn+step 内；此前在 step/end 之后写会被判
       // "assistant/message does not match an open turn and step" → 整条会话 corrupt。
 
-      // v0.3.2：本步的正文 + 命令摘要**就地落史**（流结束即落，不等下一轮循环顶部）。
+      // v0.4.2：本步的正文 + 命令摘要**就地落史**（流结束即落，不等下一轮循环顶部）。
       // 时序红线：易变尾的转正发生在 render 之后（转正块落位 = 上一请求尾部的同一位置），
       // digest 必须在转正之后追加——下一请求的公共前缀才能覆盖上一请求的全部 prompt
-      //（缓存读零损失；digest 在转正前落史会把转正块整体挤到错位，每条注入被双倍支付）。
-      // 模型视角时间线同样正确：上一步输出（digest）→ 上一步结果（上一请求尾部的注入，
-      // 已在 prompt 里读过）→ 本步结果（本步注入）。
+      //（无 transient 尾时缓存读零损失；digest 在转正前落史会把转正块整体挤到错位，
+      // 每条注入被双倍支付）。
       this.#commitStepDigest();
 
       // ---- 收束判定（仅三种重入事由：失败/拒绝、high 观测、peek 需求）----
@@ -1351,19 +1618,18 @@ export class SingleStreamDriver {
         this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'output-truncated', detail: `${this.#truncation.reason}（第 ${this.#truncationRetries} 次续写）` });
         this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'output-truncated', reason: this.#truncation.reason, retry: this.#truncationRetries, turn });
       }
-      // v0.3.3：畸形/孤立闭合标签的定向纠错注入（一次性；final-only 档不注入——预算已枯竭）。
-      // 挂块即成为重入事由（needsReentry：injections.blocks.length > 0）——真机场景里
-      // "纯 prose 残片 + 无命令无 final"的流也会因此重入一次，模型拿到纠错信号后继续干活。
+      // v0.4.0（自 0.3.3 回流）：畸形/孤立闭合标签的定向纠错注入（一次性；final-only 档
+      // 不注入——预算已枯竭）。挂块即成为重入事由（injections.blocks.length > 0）——真机
+      // 场景里"纯 prose 残片 + 无命令无 final"的流也会因此重入一次，模型拿到纠错信号后继续干活。
       if (this.#strayCloseNudge !== null && level !== 'final-only') {
         injections.blocks.push({ role: 'user', content: this.#strayCloseNudge });
         this.#strayCloseNudge = null;
       }
       // 饥饿防线（07 号结果 §3.6 上报的断链，08 号评测前按其建议修复）：
       // 升格骨架接入注入通路（按 high 观测同款格式；final-only 档不注入——预算已枯竭）。
-      // v0.3.3：**先只算块、不挂块**——升格是"补充上下文"，不是重入事由。此前它无条件挂进
-      // injections.blocks，只要本步有一条升格就必然 needsReentry=true：模型已经给出合法
-      // tf-final，却被一块"补充观测"顶掉 completed，回合继续烧请求直到撞墙（真机 13 步
-      // 会话正是这样停在半途）。合法 final 优先于可选补充——这就是下面的条件。
+      // v0.4.0（自 0.3.3 回流）：**先只算块、不挂块**——升格是"补充上下文"，不是重入事由。
+      // 此前它无条件挂进 injections.blocks，只要本步有一条升格就必然 needsReentry=true：
+      // 模型已经给出合法 tf-final，却被一块"补充观测"顶掉 completed，回合继续烧请求直到撞墙。
       const promoted = this.#obs.noteStep(injections.highInjected);
       const promotedBlock: RenderMessage | null = promoted !== null
         && level !== 'final-only'
@@ -1438,7 +1704,6 @@ export class SingleStreamDriver {
       const finalSeen = lastFinal !== undefined && prematureFinal === undefined && rejectedFinal === undefined;
       // steer 在本流期间到达 → 不能带着未消费的 steer 收敛（对齐内建：插话必须被下一步看到）
       const pendingSteerCount = this.#pendingSteers.length;
-      // v0.3.3：升格块只在"本步没有合法 final"时算重入事由（它补的是上下文，不是任务状态）
       const needsReentry = issues.length > 0 || injections.blocks.length > 0 || prematureFinal !== undefined
         || pendingSteerCount > 0 || (promotedBlock !== null && !finalSeen);
 
@@ -1477,28 +1742,23 @@ export class SingleStreamDriver {
       }
 
       // 非成功路径（重入 / 阻断 / 取消）：本步到此结束。
-      // v0.3.3：走到这里说明本步不会以"合法 final"收场——升格块这才真正挂上
-      //（成功路径已在上面 break，不会再被补充块顶掉）。
-      if (promotedBlock !== null && promotedSeq !== null) {
-        this.#reportedObservations.add(promotedSeq);
-        injections.blocks.push(promotedBlock);
-      }
-      // v0.3.3：step/end 的时机下移到收束判定之后——兜底交付是一条 assistant/message，
-      // v4 校验要求它落在**打开的** turn+step 内，先写 step/end 会被判 corrupt。
+      // v0.4.0（自 0.3.3 回流）：step/end 的时机下移到收束判定之后——兜底交付是一条
+      // assistant/message，v4 校验要求它落在**打开的** turn+step 内，先写 step/end 会被判 corrupt。
+
       const finalOnlyGate = level === 'final-only' && this.#finalOnlyRequests >= 1;
-      // v0.3.2：nudge 进度感知护栏。nudge 不再是一次性预算——被提示后模型**继续产出**
+      // v0.4.2：nudge 进度感知护栏。nudge 不再是一次性预算——被提示后模型**继续产出**
       // （新 ok 命令）就不算"提示失效"，绝不因此中断生产性工作；只有"零产出的连续
-      // nudge"（真打转）才 blocked。整体仍由停滞预算 / O5 预算阶梯兜底。
+      // nudge"（真打转）才 blocked。整体仍由停滞预算 / 请求硬上限 / O5 预算阶梯兜底。
       // 真机取证（session-8f22c7a0）：旧语义下 nudge 在写文件步被消耗，随后的崩溃步
       // （或任何无注入的写步）直接 nudgeExhausted → 任务中断。
       const okCommandCount = [...this.#commands.values()].filter((r) => r.status === 'ok').length;
       const progressSinceNudge = this.#nudgeMark === null || okCommandCount > this.#nudgeMark;
       const nudgeExhausted = !needsReentry && !finalSeen && this.#finalNudges >= 1 && !progressSinceNudge;
 
-      // v0.3.3 收束改造 —— 真机"任务被砍在半途、用户只看到最后一句 prose"的根因就在这里：
-      // 旧实现 `#reentryCount >= maxReentries` 把**生产性重入**（每步都在读/写/跑命令、每步
-      // 都拿到新事实）与**原地打转**一视同仁，第 12 步 hard blocked；且收束时没有任何兜底
-      // 交付，界面于是停在最后一句 prose 上（session-6bb805db / 27876fd9 / 7fbfef8f）。
+      // v0.4.0 收束改造 —— 真机"任务被砍在半途、用户只看到最后一句 prose"的根因就在这里：
+      // 旧实现 `#reentryCount >= maxReentries` 把**生产性重入**（每步都在读/写/跑命令、
+      // 每步都拿到新事实）与**原地打转**一视同仁，第 12 步 hard blocked；且收束时没有任何
+      // 兜底交付，界面于是停在最后一句 prose 上（session-6bb805db / 27876fd9 / 7fbfef8f）。
       // 新口径分三账，互不串味：
       //   ① 停滞预算 #stallReentries——只在"本步没有新增 ok 命令"的重入上累加（真打转）；
       //      有产出就清零并退出收束期，生产性工作不再被"重入次数"硬杀。
@@ -1548,6 +1808,15 @@ export class SingleStreamDriver {
         }
       }
 
+      // v0.4.0：走到这里说明本步不会以"合法 final"收场——升格块这才真正挂上
+      //（成功路径已在上面 break，不会再被补充块顶掉）。
+      if (promotedBlock !== null && promotedSeq !== null) {
+        this.#reportedObservations.add(promotedSeq);
+        injections.blocks.push(promotedBlock);
+        // v0.4.3（P0-7①）：升格骨架 = handle 类反馈
+        this.#noteFeedback('handle', promotedBlock.content);
+      }
+
       if (ending) {
         // 兜底交付：必须在 step/end 之前写（assistant/message 需落在打开的 turn+step 内）
         if (reason.kind === 'blocked') this.#deliverFallbackFinal(turn, step, reason.detail);
@@ -1579,7 +1848,7 @@ export class SingleStreamDriver {
       const replays = this.#materializeReplays();
       if (replays.length > 0) tail = [...tail, ...replays];
       if (closeOut) {
-        // 收束期：保留失败/拒绝事实块（模型要知道哪里错了），收束指令压在最末。
+        // 收束期：保留失败/拒绝事实块（模型要知道哪里错了），收束指令压在最末
         tail = [...tail, { role: 'user' as const, content: this.#closeOutNudge(this.#closeOutRequests, wallDetail) }];
       } else if (tail.length === 0 && !finalSeen) {
         if (level === 'final-only') {
@@ -1606,13 +1875,12 @@ export class SingleStreamDriver {
       }
       this.#injectedChars += tail.reduce((n, b) => n + b.content.length, 0);
       if (level === 'final-only') this.#finalOnlyRequests += 1;
-      // v0.3.3 缓存友好排序：durable 块（observation/peek/replay/tool-result）前置，
-      // 非 durable 块（error/nudge/closeout/truncation）后置。理由在 #commitDeliveredTail：
-      // 只有 durable 块会转正进历史，一旦非 durable 块夹在 durable 块**前面**，转正后的
-      // 历史就在那一处与上一请求的 prompt 分叉——其后所有 durable 块（一次读注入可达上万
-      // 字符）全部退化成未缓存输入。前置 durable 后，上一请求的 prompt 前缀可覆盖到最后一个
-      // durable 块，模型下一请求只需为"新增事实 + 一句指令"付费（命中率的结构性来源）。
-      // 顺序仍是确定性的（两组内部保持原有相对顺序），前缀单调不破。
+      // v0.4.0（自 0.3.3 回流）缓存友好排序：durable 块（observation/peek/replay/tool-result/
+      // plan/receipt）前置，非 durable 块（error/nudge/closeout）后置。理由在 #commitDeliveredTail：
+      // 只有 durable 块会转正进历史，一旦非 durable 块夹在 durable 块**前面**，转正后的历史
+      // 就在那一处与上一请求的 prompt 分叉——其后所有 durable 块（一次读注入可达上万字符）
+      // 全部退化成未缓存输入。两组内部保持原有相对顺序，durable 子序列单调不破（P0-6 的
+      // promised 承诺只覆盖该子序列，排序不影响其逐字节一致性）。
       tail = [...tail.filter(isDurableBlock), ...tail.filter((b) => !isDurableBlock(b))];
       this.#renderer.setTail(tail);
       // v0.3.2：这批尾块会随下一请求发出；发出后由 #commitDeliveredTail 转正为历史。
@@ -1621,8 +1889,7 @@ export class SingleStreamDriver {
         step,
         blocks: tail.map((b) => ({ role: (b.role ?? 'user') as RenderMessage['role'], content: b.content })),
       };
-      // v0.3.3：停滞计数——判据是"本步是否新增了生产性 ok 命令"，不是重入次数。
-      // 有产出 → 清零并退出收束期（生产性工作不该被预算误杀）；无产出 → 累加停滞预算。
+      // v0.4.0：停滞计数——判据是"本步是否新增了生产性 ok 命令"，不是重入次数。
       const productiveNow = this.#productiveOkCount();
       if (productiveNow > this.#progressOkMark) {
         this.#progressOkMark = productiveNow;
@@ -1640,9 +1907,15 @@ export class SingleStreamDriver {
     } catch (error) {
       this.#warn('turn/end 事件写入失败', error);
     }
+    // v0.4.2：回合台账带缓存口径（hit 比 = cacheRead / 计费输入；适配器未上报时省略——
+    // 不把缺数据写成 0%）。缓存命中是 O6 前缀单调性的直接收益，必须可观测可对账。
+    const billedInput = this.#usage.inputTokens + this.#usage.cacheReadTokens + this.#usage.cacheWriteTokens;
+    const cacheHitRatio = billedInput > 0 ? Math.round((this.#usage.cacheReadTokens / billedInput) * 100) / 100 : undefined;
     this.#ledgerWrite('plugin:tf-agent/step', {
-      turn, steps: step, requests: this.#requestCount, usage: { ...this.#usage },
-      cacheHitRate: this.#cacheHitRate(), reason: reason.kind,
+      turn, steps: step, requests: this.#requestCount,
+      usage: { ...this.#usage },
+      ...(cacheHitRatio === undefined ? {} : { cacheHitRatio }),
+      reason: reason.kind,
     });
     return reason;
   }
@@ -1672,7 +1945,11 @@ export class SingleStreamDriver {
     step: number,
     messages: readonly RenderMessage[],
     level: BudgetLevel,
-  ): Promise<{ finish: FinishReasonLike }> {
+  ): Promise<{
+    finish: FinishReasonLike;
+    /** v0.4.3（P0-7①）：本请求的 usage 累计（多条 usage chunk 相加）；适配器未上报 → null。 */
+    usage: null | { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
+  }> {
     // 新流：隐式写序的流内序号清零（跨流依赖仍由 depends_on 显式声明）
     this.#streamSeqCounter = 0;
     this.#streamWrites = [];
@@ -1691,7 +1968,9 @@ export class SingleStreamDriver {
     let reasoningLastIndex: number | null = null;
     const natives = new Map<string, NativeCallAccumulator>();
     let finish: FinishReasonLike | null = null;
-    let usageSeen: TokenUsageLike | undefined;
+    let usageSeen: { inputTokens: number; outputTokens: number } | undefined;
+    // v0.4.3（P0-7①）：本请求的 usage 累计（多条 usage chunk 相加；适配器未上报 → 保持 null）
+    let requestUsage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number } | null = null;
 
     // 看门狗：流空闲超时 → abort（fault-timeout 路径；消费方掐断面）
     const idleMs = this.#cfg.streamIdleTimeoutMs;
@@ -1729,6 +2008,7 @@ export class SingleStreamDriver {
             message: '未解析到可用模型路由（provider/model 为空）：请先在界面选择模型后重试',
             code: 'NO_MODEL_ROUTE',
           },
+          usage: null,
         };
       }
       const stream = this.#ports.stream({
@@ -1736,6 +2016,11 @@ export class SingleStreamDriver {
         model: this.#cfg.model,
         reasoningEffort: this.#cfg.reasoningEffort,
         messages: toWireMessages(messages),
+        // v0.4.0（P1）：nativeTools 开启时携带冻结面 schema（core 档白名单 / standard-full 全量）。
+        // 默认关闭——schema 的每请求 token 成本由 tf-call 的逐调用成本替代（§15 默认文本）。
+        ...(this.#cfg.nativeTools && this.#currentSurface !== undefined && this.#currentSurface.schemas.length > 0
+          ? { tools: this.#currentSurface.schemas }
+          : {}),
         signal: controller.signal,
         sessionId: this.#sessionId,
       });
@@ -1793,12 +2078,28 @@ export class SingleStreamDriver {
             usageSeen = chunk.usage;
             this.#usage.inputTokens += chunk.usage.inputTokens;
             this.#usage.outputTokens += chunk.usage.outputTokens;
+            // v0.4.2：缓存口径（缺省 0——mock/旧适配器不上报时零漂移）。
             this.#usage.cacheReadTokens += chunk.usage.cacheReadTokens ?? 0;
             this.#usage.cacheWriteTokens += chunk.usage.cacheWriteTokens ?? 0;
+            // v0.4.3（P0-7①）：本请求的 usage 累计（回填 request 记录的尺子字段）。
+            requestUsage = requestUsage === null
+              ? {
+                  inputTokens: chunk.usage.inputTokens,
+                  outputTokens: chunk.usage.outputTokens,
+                  cacheReadTokens: chunk.usage.cacheReadTokens ?? 0,
+                  cacheWriteTokens: chunk.usage.cacheWriteTokens ?? 0,
+                }
+              : {
+                  inputTokens: requestUsage.inputTokens + chunk.usage.inputTokens,
+                  outputTokens: requestUsage.outputTokens + chunk.usage.outputTokens,
+                  cacheReadTokens: requestUsage.cacheReadTokens + (chunk.usage.cacheReadTokens ?? 0),
+                  cacheWriteTokens: requestUsage.cacheWriteTokens + (chunk.usage.cacheWriteTokens ?? 0),
+                };
             this.#record({
               seq: ++DRIVER_SEQ, kind: 'usage', turn,
               inputTokens: chunk.usage.inputTokens, outputTokens: chunk.usage.outputTokens,
-              cacheReadTokens: chunk.usage.cacheReadTokens ?? 0, cacheWriteTokens: chunk.usage.cacheWriteTokens ?? 0,
+              ...(chunk.usage.cacheReadTokens === undefined ? {} : { cacheReadTokens: chunk.usage.cacheReadTokens }),
+              ...(chunk.usage.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: chunk.usage.cacheWriteTokens }),
             });
             break;
           case 'finish':
@@ -1887,7 +2188,7 @@ export class SingleStreamDriver {
       }
     }
 
-    return { finish };
+    return { finish, usage: requestUsage };
   }
 
   // ------------------------------------------------------------------ parser 事件处理
@@ -1906,9 +2207,10 @@ export class SingleStreamDriver {
         // fail-soft：记 ledger，流继续（分派 06 硬性要求 + 05 号故障剧本口径）
         this.#record({ seq: ++DRIVER_SEQ, kind: 'malformed', raw: event.raw, reason: event.reason });
         this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'malformed-command', reason: event.reason, raw: event.raw.slice(0, 200) });
-        // v0.3.3：畸形/孤立闭合标签第一次出现时挂一条定向纠错注入（malformedCloserNudge；
-        // 本回合首个非 final-only 请求携带）。此前 fail-soft 只记台账、无纠错信号——真机
-        // 2026-11-20：`</tf-*>` 同一会话两度落进正文，模型全程不知道这是错形态。
+        // v0.4.0（自 0.3.3 回流）：畸形/孤立闭合标签第一次出现时挂一条定向纠错注入
+        // （malformedCloserNudge；本回合首个非 final-only 请求携带）。此前 fail-soft 只记
+        // 台账、无纠错信号——真机 2026-11-20：`</tf-*>` 同一会话两度落进正文，模型全程
+        // 不知道这是错形态（桌面端正文里出现裸的 `</tf-*>`，会话无产出收场）。
         if (event.reason.startsWith('stray-close-tag') && !this.#strayCloseGuided) {
           this.#strayCloseGuided = true;
           this.#strayCloseNudge = malformedCloserNudge(event.raw);
@@ -1943,7 +2245,8 @@ export class SingleStreamDriver {
     // v0.3.1：回合级命令序（跨请求单调）。final 之后又发过非 final 命令 → 那条 final 过期
     //（模型写完 final 又继续干活；旧答案不能当成交付内容）。
     const order = ++this.#cmdOrder;
-    // v0.3.3：本回合命令集（产出口径的基准——含失败命令，"是否真有产出"另看 status）
+    // v0.4.3（P0-6⑤）：本回合命令集（兜底交付的"台账事实"清单来源；含失败命令，
+    // "是否真有产出"另看 status——与 0.3.3 同语义）。
     this.#turnCommandIds.add(cmd.id);
     // v0.3.2：本步摘要（含重复 id 的命令——模型确实发过它们，历史要如实）
     this.#stepCommandIds.push(cmd.id);
@@ -2062,11 +2365,14 @@ export class SingleStreamDriver {
       const body = content.length <= limit
         ? content
         : `${content.slice(0, limit)}\n……（原结果超长，已截断 ${content.length - limit} 字符；用 tf-peek handle="${item.handle}" from_line=.. to_line=.. 精确取回）`;
+      const replayContent = `[tf-stream:replay id=${item.cmdId} name=${item.name} handle=${item.handle}]\n`
+        + '这条命令与之前完全相同（幂等）：没有重复执行，以下回灌它的原结果。\n'
+        + `${body}\n（需要其它行段用 tf-peek handle="${item.handle}" from_line=.. to_line=..）`;
+      // v0.4.3（P0-7①）：原结果完整回灌 = full；超限截断形态 = handle（头 + 句柄）。
+      this.#noteFeedback(content.length <= limit ? 'full' : 'handle', replayContent);
       out.push({
         role: 'user',
-        content: `[tf-stream:replay id=${item.cmdId} name=${item.name} handle=${item.handle}]\n`
-          + '这条命令与之前完全相同（幂等）：没有重复执行，以下回灌它的原结果。\n'
-          + `${body}\n（需要其它行段用 tf-peek handle="${item.handle}" from_line=.. to_line=..）`,
+        content: replayContent,
       });
       this.#record({
         seq: ++DRIVER_SEQ, kind: 'observation',
@@ -2096,7 +2402,7 @@ export class SingleStreamDriver {
     if (digest === null) return;
     const prose = normalizeProse(digest.prose);
     if (prose !== '') {
-      // v0.3.2：assistant 历史块必须带 source（宿主 forAdapter 无防护读
+      // v0.4.2：assistant 历史块必须带 source（宿主 forAdapter 无防护读
       // source.replayState；缺失 = 请求崩溃。provider/model 取驱动器实时路由）。
       this.#renderer.appendHistory({ role: 'assistant', content: capText(prose, STEP_PROSE_COMMIT_LIMIT), source: this.modelSource() });
     }
@@ -2124,15 +2430,20 @@ export class SingleStreamDriver {
 
   /** v0.3.2：把已随请求发出的易变尾转正为追加区历史（下一请求仍可见，不再一次性蒸发）。
    *  只转正"事实类"块（观测/peek/原生结果/回灌）；nudge / degraded / error 这类
-   *  瞬态指令不回灌历史——否则下一回合模型会把过期的"预算告急""final 被拒"当现状。 */
-  #commitDeliveredTail(): void {
+   *  瞬态指令不回灌历史——否则下一回合模型会把过期的"预算告急""final 被拒"当现状。
+   *  v0.4.3：返回转正块数（诊断用）；承诺前缀基线（#lastRequest.promised）在调用方于本方法
+   *  之后取 stableMessages()——v0.4.3.1 起与块序解耦（核查 §2.5）。 */
+  #commitDeliveredTail(): number {
     const delivered = this.#deliveredTail;
     this.#deliveredTail = null;
-    if (delivered === null) return;
+    if (delivered === null) return 0;
+    let promoted = 0;
     for (const block of delivered.blocks) {
       if (!isDurableBlock(block)) continue;
       this.#renderer.appendHistory({ role: block.role, content: block.content });
+      promoted += 1;
     }
+    return promoted;
   }
 
   /** F5 计划快照（final 被计划门槛拒绝时随注入一起给出，模型不必凭记忆猜验收项）。 */
@@ -2141,6 +2452,234 @@ export class SingleStreamDriver {
     return [...this.#plan.items.entries()]
       .map(([id, item]) => `- [${id}] ${item.text}（${item.status}）`)
       .join('\n');
+  }
+
+  // ------------------------------------------------------- v0.4.3 P0-6 wire 断言
+
+  /**
+   * v0.4.3（P0-6②③④）：wire 边界承诺前缀断言 + 三类成因处置。
+   * 返回 'ok'（放行——含预算内的 append-drift 一次放行）或 'fail'（fail-closed 收场，
+   * detail 供 blocked 文案与兜底交付）。比较与分类在内核 assertRequestPrefix：
+   *   - stable-drift：0 重发——稳定段被改写意味着装配被破坏，重发只会烧缓存不修根因；
+   *   - append-drift：预算内放行一次同一份 next（每回合 1 次、每会话 3 次；第 4 次降级
+   *     本路径）——转正纪律被破坏时发送仍安全（新旧内容都是真实历史），基线随本请求推进；
+   *   - shrink：0 重发——承诺前缀收缩 = 历史被销毁；段边界必须走 dropAppendHead 通道。
+   */
+  #assertWirePrefix(next: readonly RenderMessage[], turn: number, step: number): { verdict: 'ok' } | { verdict: 'fail'; detail: string } {
+    const baseline = this.#lastRequest;
+    if (baseline === null) return { verdict: 'ok' };
+    try {
+      assertRequestPrefix(baseline, next);
+      return { verdict: 'ok' };
+    } catch (error) {
+      if (!(error instanceof PrefixBrokenError)) throw error;
+      const cause = error.prefixCause;
+      const diag = `index=${error.index} stablePrefixLen=${error.stablePrefixLen} cause=${cause} 期望="${capText(error.expected, 80)}" 实际="${capText(error.actual, 80)}"`;
+      if (cause === 'append-drift' && this.#prefixResendsTurn < 1 && this.#prefixResendsSession < 3) {
+        // P0-6④（v0.4.3.1 用词，核查 §4.2）：断言在发送前——"放行"= 记账后照常发送同一份
+        // next，0 额外请求；显式缓存重置点（下一请求基线 = 本次发送内容）。
+        this.#prefixResendsTurn += 1;
+        this.#prefixResendsSession += 1;
+        this.#resetSeq += 1;
+        this.#resetCause = 'prefix-reset';
+        const detail = `append-drift 预算内放行一次（会话第 ${this.#prefixResendsSession} 次/上限 3，回合第 ${this.#prefixResendsTurn} 次/上限 1）：${diag}`;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'prefix-reset', detail });
+        this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'prefix-reset', cause, index: error.index, stablePrefixLen: error.stablePrefixLen, turn });
+        this.#warn(`P0-6 append-drift：承诺前缀与下一请求头部不一致——放行一次同一份 next，基线随本请求推进（${diag}）`, error);
+        return { verdict: 'ok' };
+      }
+      const verdict = cause === 'append-drift'
+        ? `append-drift 超出放行预算（每回合 1 次/每会话 3 次，已用 ${this.#prefixResendsSession} 次）——降级 fail-closed`
+        : cause === 'shrink'
+          ? '承诺前缀收缩（历史被销毁；段边界必须走 dropAppendHead 通道并重置基线）'
+          : 'stable-drift（稳定段被改写，0 放行）';
+      const full = this.#prefixFailClosed(error, turn, step, verdict);
+      return { verdict: 'fail', detail: full };
+    }
+  }
+
+  /**
+   * v0.4.3（P0-6⑤）：前缀破坏的 fail-closed 收场事实链——prefix-broken 台账 + 账本 +
+   * 开发者日志 + receipt 最小对账。返回 detail 供 blocked 文案与兜底交付复用。
+   * 异常上抛开发者日志（#warn），但不作为用户可见终态（runTurn 不再把它炸出去）。
+   */
+  #prefixFailClosed(error: PrefixBrokenError, turn: number, step: number, origin: string): string {
+    const cause = error.prefixCause;
+    const diag = `index=${error.index} stablePrefixLen=${error.stablePrefixLen} cause=${cause} 期望="${capText(error.expected, 80)}" 实际="${capText(error.actual, 80)}"`;
+    const detail = `${origin}：${diag}`;
+    this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'prefix-broken', detail });
+    this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'prefix-broken', cause, index: error.index, stablePrefixLen: error.stablePrefixLen, expected: capText(error.expected, 80), actual: capText(error.actual, 80), turn, step });
+    this.#warn(`P0-6 前缀破坏（fail-closed，拒绝发送不做静默修复）：${detail}`, error);
+    // receipt 最小对账——pending 意图一律标 unknown（不重放、不声称回滚）。
+    this.#reconcilePendingIntents('prefix-broken');
+    return detail;
+  }
+
+  /** v0.4.3（P0-6⑤）：最小对账——把 pending 意图整批标 unknown（ack 语义写死：
+   *  只解除恢复锁，不重放工具、不声称回滚）。IO 失败 fail-open + 告警（意图保持 pending，
+   *  恢复锁不解除——宁可多一次人工核对，不可虚报已对账）。 */
+  #reconcilePendingIntents(cause: string): void {
+    try {
+      const result = this.#ports.reconcilePendingIntents?.(cause);
+      this.#record({
+        seq: ++DRIVER_SEQ, kind: 'fault', fault: 'intent-reconciled',
+        detail: `${cause}：pending 意图整批标记 unknown（acked=${result?.acked ?? 0}；只解除恢复锁，不重放工具，不声称回滚）`,
+      });
+    } catch (error) {
+      this.#warn('P0-6⑤ 最小对账失败（fail-open：意图保持 pending，恢复锁不解除）', error);
+    }
+  }
+
+  /** v0.4.3（离线探针，faultPrefixDrift 专用）：篡改上一请求承诺前缀基线的一个字节，模拟
+   *  "历史被改写"——真实世界只因未来装配回归而发生；探针让 P0-6 三类处置可离线复演。
+   *  kind='stable' 篡改稳定段（index 1，task 块）；kind='append' 篡改承诺前缀内的第一个
+   *  转正块（index = stableLen；承诺前缀无转正块时该请求跳过）。oncePerTurn=true
+   *  时每回合只注入一次。只改基线快照（发送原文与 renderHash 不受影响）。
+   *  v0.4.3.1：基线 = promised（转正后 stable），篡改点语义不变。 */
+  #faultDriftBaseline(turn: number): void {
+    const baseline = this.#lastRequest;
+    if (baseline === null) return;
+    const cfg = this.#cfg.faultPrefixDrift;
+    if (cfg === undefined) return;
+    if (cfg.oncePerTurn === true) {
+      if (this.#faultDriftTurns.has(turn)) return;
+      this.#faultDriftTurns.add(turn);
+    }
+    const promised = [...baseline.promised];
+    let index: number;
+    if (cfg.kind === 'stable') {
+      if (baseline.stableLen < 2) return; // 没有可篡改的稳定段（system 之下）
+      index = 1;
+    } else {
+      if (promised.length <= baseline.stableLen) return; // 无转正块可篡改
+      index = baseline.stableLen;
+    }
+    promised[index] = { ...promised[index]!, content: `${promised[index]!.content}（探针篡改）` };
+    this.#lastRequest = { promised, stableLen: baseline.stableLen };
+  }
+
+  /** v0.4.3（P0-7①）：反馈字节分类累计（注入位点调用；request 记录写入时快照清零）。
+   *  'full' = 全量回灌；'handle' = 句柄/骨架/回执（超限或自写回验形态）。dedup 由 P0-4
+   *  （0.5.0）引入，0.4.3 恒 0——字段先占位，口径不漂移。 */
+  #noteFeedback(kind: 'full' | 'handle', content: string): void {
+    this.#feedbackBytes[kind] += content.length;
+  }
+
+  // ------------------------------------------ v0.4.3 P0-6⑤ 兜底交付（回植 0.3.3；有产出时才有交付——核查 §4.3）
+
+  /**
+   * v0.4.3（P0-6⑤，自 0.3.3 回植）：本回合的"生产性 ok 命令"数（兜底交付的产出基准）。
+   * 排除 tf-final（声明不是工作）与 tf-plan（计划不是交付）。
+   */
+  #productiveOkCount(): number {
+    let n = 0;
+    for (const id of this.#turnCommandIds) {
+      const rec = this.#commands.get(id);
+      if (rec === undefined || rec.status !== 'ok') continue;
+      if (rec.cmd.name === 'tf-final' || rec.cmd.name === 'tf-plan') continue;
+      n += 1;
+    }
+    return n;
+  }
+
+  /** v0.4.3（P0-6⑤，自 0.3.3 回植）：本回合 ok 的命令记录（兜底交付取证用；按解析序）。 */
+  #turnOkRecords(): CommandRecord[] {
+    const out: CommandRecord[] = [];
+    for (const id of this.#turnCommandIds) {
+      const rec = this.#commands.get(id);
+      if (rec !== undefined && rec.status === 'ok') out.push(rec);
+    }
+    return out.sort((a, b) => a.cmd.seq - b.cmd.seq);
+  }
+
+  /**
+   * v0.4.0（自 0.3.3 回流）：收束期指令（只在到达停滞/硬上限后注入；排在所有事实块之后，
+   * 模型最后读到它）。它不是"再试一次"的许可，而是"停止探索、立即交付"的最后通牒。
+   */
+  #closeOutNudge(attempt: number, detail: string): string {
+    const ok = this.#productiveOkCount();
+    const last = attempt >= 2;
+    return [
+      `[tf-stream:closeout attempt=${attempt}] ${last ? '这是最后一次收束机会。' : '进入收束阶段。'}`,
+      `本回合已成功执行 ${ok} 条命令；${detail}`,
+      '停止继续探索/验证：不要再读文件、跑检查或补新功能，除非缺少的结果会改变最终结论。',
+      '立即用 tf-final 交付：summary 写最终答案原文（数字/行内容/路径/结论）+ 未验证项清单；',
+      '任务确实没做完就如实写“未完成：…”，不要用 placeholder/占位/TODO。',
+    ].join('\n');
+  }
+
+  /**
+   * v0.4.3（P0-6⑤，自 0.3.3 回植）：兜底交付的交付说明。用户侧的"失败即空转"本质是
+   * 回合结束时没有 assistant 最终消息。这里把台账事实写成一条**明确标注未完成**的
+   * 交付说明（不是伪造模型答案）：已完成什么、最近一次命令输出、哪些没验证。
+   * 零产出回合返回 null（不伪造"已完成"）。
+   */
+  #buildFallbackFinal(detail: string): string | null {
+    const ok = this.#turnOkRecords();
+    if (ok.length === 0) return null;
+    const writes = ok.filter((r) => r.cmd.name === 'tf-write' || r.cmd.name === 'tf-edit' || r.cmd.name === 'tf-append');
+    const bashes = ok.filter((r) => r.cmd.name === 'tf-bash' || r.cmd.name === 'tf-code');
+    const reads = ok.filter((r) => r.cmd.name === 'tf-read' || r.cmd.name === 'tf-grep' || r.cmd.name === 'tf-glob'
+      || r.cmd.name === 'tf-peek' || r.cmd.name === 'tf-call');
+    const lines: string[] = [`[未完成交付] 回合在收束预算内停止（${capText(detail, 160)}），没有收到有效的 tf-final。以下为台账事实，不是模型结论：`];
+    let listed = 0;
+    for (const rec of [...writes, ...bashes, ...reads]) {
+      if (listed >= 8) break;
+      const target = rec.cmd.attrs['path'] ?? rec.cmd.attrs['cmd'] ?? rec.cmd.attrs['pattern'] ?? rec.cmd.attrs['handle'] ?? '';
+      const label = rec.cmd.name;
+      const size = rec.observation?.payload.kind === 'skeleton'
+        ? (rec.observation.payload as { rendered?: string }).rendered?.length
+        : undefined;
+      lines.push(`- ${label}${target === '' ? '' : ` ${capText(target, 120)}`} → ok${rec.handle === undefined ? '' : `（${rec.handle}）`}${size === undefined ? '' : `，${size} 字符`}`);
+      listed += 1;
+    }
+    const lastBash = bashes[bashes.length - 1];
+    if (lastBash !== undefined) {
+      const output = this.#obs.peek(lastBash.handle ?? '', 1, Number.MAX_SAFE_INTEGER);
+      if (output !== null && output.trim() !== '') {
+        const tail = output.length <= 700 ? output : `…${output.slice(output.length - 700)}`;
+        lines.push(`最近一次命令输出（尾部 ≤700 字符）：\n${tail}`);
+      }
+    }
+    const unfinished = [...this.#turnCommandIds]
+      .map((id) => this.#commands.get(id))
+      .filter((r): r is CommandRecord => r !== undefined && (r.status === 'failed' || r.status === 'pending' || r.status === 'dispatched'));
+    if (unfinished.length > 0) {
+      lines.push('未完成/未验证：');
+      for (const rec of unfinished.slice(0, 5)) {
+        lines.push(`- ${rec.cmd.id} ${rec.cmd.name} → ${rec.status}${rec.detail === undefined ? '' : `（${capText(rec.detail, 120)}）`}`);
+      }
+    }
+    lines.push('如需继续，请直接说明下一步（例如“继续修 X”）；本回合没有把未验证的工作标成完成。');
+    return capText(lines.join('\n'), 4000);
+  }
+
+  /**
+   * v0.4.3（P0-6⑤，自 0.3.3 回植）：兜底交付——前缀破坏收场的最后一道闸。
+   * fail-closed 拒绝发送后，把**台账事实**写成一条明确标注未完成的 assistant 消息落进
+   * 会话，而不是让界面停在最后一句 prose 上。零产出（无 ok 命令）→ 不写（不伪造"已完成"）；
+   * 同一回合只写一次。异常上抛开发者日志，不作为用户可见终态。
+   */
+  #deliverFallbackFinal(turn: number, step: number, detail: string): void {
+    if (this.#fallbackFinalDelivered) return;
+    const text = this.#buildFallbackFinal(detail);
+    if (text === null) {
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'fallback-final-skipped', detail: '零产出回合（无 ok 命令）→ 不写兜底交付（不伪造"已完成"）' });
+      return;
+    }
+    this.#fallbackFinalDelivered = true;
+    try {
+      this.#ports.events?.finalAnswer?.(turn, step, text);
+    } catch (error) {
+      this.#warn('兜底交付写入失败', error);
+    }
+    this.#record({
+      seq: ++DRIVER_SEQ, kind: 'fault', fault: 'fallback-final',
+      detail: `回合收束但无 tf-final → 已写未完成交付说明（${capText(detail, 120)}）`,
+    });
+    this.#ledgerWrite('plugin:tf-agent/fault', {
+      fault: 'fallback-final', detail, turn, step, commands: this.#productiveOkCount(),
+    });
   }
 
   /** 派发所有就绪命令（依赖全部 ok、未派发），并发上限 maxParallelToolCalls。
@@ -2360,9 +2899,38 @@ export class SingleStreamDriver {
       return;
     }
 
-    // ---- tf-write / tf-read / tf-edit / tf-append / tf-grep / tf-glob / tf-bash：映射原生工具，单命令批执行 ----
+    // ---- tf-write / tf-read / tf-edit / tf-append / tf-grep / tf-glob / tf-bash / tf-call：映射原生工具，单命令批执行 ----
     let mapped: { name: string; arguments: Record<string, unknown> } | null = null;
     let result: ToolBatchResultLike;
+    // v0.4.0（P2/G2）：tf-call 通用调用通道——name 在冻结工具面内校验（unknown-tool 结构化
+    // 失败 + 前缀建议），body 必须是 JSON 对象（bad-json-arguments 结构化失败）。校验不占
+    // 请求 token（错误只进下一请求注入）；工具面缺席（L2）时引导回 tf-* 命令。
+    if (cmd.name === 'tf-call') {
+      const toolName = cmd.attrs['name'] ?? '';
+      const nameError = this.#surface.validateCallName(toolName);
+      let args: unknown;
+      let argsError: string | undefined;
+      if (nameError === null) {
+        try {
+          args = JSON.parse((cmd.body ?? '').trim());
+          if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+            argsError = 'tf-call body 必须是 JSON 对象（键值参数表），不是数组或标量';
+          }
+        } catch {
+          argsError = 'tf-call body 不是合法 JSON：核对引号转义（属性值内的 " 要写成 \\"）后重发';
+        }
+      }
+      if (nameError !== null || argsError !== undefined) {
+        rec.status = 'failed';
+        rec.detail = (nameError ?? argsError)!.slice(0, 500);
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', kind: nameError !== undefined ? 'unknown-tool' : 'bad-json-arguments', detail: rec.detail.slice(0, 200) });
+        return;
+      }
+      mapped = { name: toolName, arguments: args as Record<string, unknown> };
+    } else {
+      mapped = this.#cfg.toolMapping.toToolCall(cmd);
+    }
     // F6 写前意图：变更类命令（tf-write/tf-edit/tf-append）在派发到宿主工具**之前**落盘（fsync）。
     // 崩溃后"有意图无回执"即可判定写入可能已发生 → resume 停机核对。零注入：只进账本。
     const intentOp: 'write' | 'edit' | 'append' | null = cmd.name === 'tf-write'
@@ -2386,7 +2954,6 @@ export class SingleStreamDriver {
       }
     }
     try {
-      mapped = this.#cfg.toolMapping.toToolCall(cmd);
       if (mapped === null) {
         // tf-edit body 标记解析失败等：映射层无法产出参数——结构化失败，不静默改全文。
         rec.status = 'failed';
@@ -2416,6 +2983,10 @@ export class SingleStreamDriver {
         signal: this.#commandSignal(),
         maxParallelToolCalls: 1,
         ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
+        // v0.4.0（R5）：beta 缺省不透传 toolSet（when 门控不收紧）；strictAdmission 开启才带
+        ...(this.#cfg.strictAdmission && this.#currentSurface?.toolSet !== undefined
+          ? { toolSet: this.#currentSurface.toolSet }
+          : {}),
         log: safeToolLog(this.#ports, turn, step),
       });
     } catch (error) {
@@ -2452,9 +3023,13 @@ export class SingleStreamDriver {
     const contentText = blockTextOf(first?.result?.content);
     const isError = first?.result?.isError === true;
 
-    // ---- 观测登记（O1 三档返回；失败一律 high）----
+    // ---- 观测登记（O1 三档返回；失败一律 high）。v0.4.0：tf-call 按宿主工具名分族
+    // （familyHint 语义：web/skill/agent/ask → high 候选，office/goal → 低增益回执）----
     const observation = this.#obs.observe({
-      tool: cmd.name,
+      tool: cmd.name === 'tf-call' ? (cmd.attrs['name'] ?? 'tf-call')
+        : cmd.name === 'tf-ask' ? 'ask_user_question'
+        : cmd.name === 'tf-skill' ? 'skill'
+        : cmd.name,
       ok: !isError,
       key: observationKey(cmd),
       content: contentText,
@@ -2485,7 +3060,7 @@ export class SingleStreamDriver {
     }
 
     rec.status = 'ok';
-    // v0.3.3：detail 显示**写入正文的大小**（cmd.body = 解析器捕获的原文长度）——
+    // v0.4.2：detail 显示**写入正文的大小**（cmd.body = 解析器捕获的原文长度）——
     // 旧实现显示 contentText.length（回执包装 `<path>...Created file...</content>`
     // 的自身长度 ≈144 字符），模型误读为"文件只有 144 字符"→ 触发全量重写
     // （真机 session-3d4caf01：白烧 2-3 步 + 1 万思考 token）。
@@ -2512,7 +3087,7 @@ export class SingleStreamDriver {
     this.#ledgerWrite('plugin:tf-agent/command', {
       cmdId: cmd.id, name: cmd.name, status: 'ok',
       handle: rec.handle, infoGain: observation.info_gain,
-      // v0.3.3：写入类命令的 chars = 写入正文的大小（与 digest 一致），不是回执包装长度。
+      // v0.4.2：写入类命令的 chars = 写入正文的大小（与 digest 一致），不是回执包装长度。
       chars: (cmd.body ?? '').length,
     });
   }
@@ -2530,6 +3105,10 @@ export class SingleStreamDriver {
       result = await this.#ports.executeTools({
         calls: calls.map((c) => ({ type: 'tool-call' as const, id: c.id, name: c.name ?? 'unknown', arguments: c.arguments || '{}' })),
         ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
+        // v0.4.0（R5）：strictAdmission 开启才带 toolSet（与 tf-* 批同一准入视图）
+        ...(this.#cfg.strictAdmission && this.#currentSurface?.toolSet !== undefined
+          ? { toolSet: this.#currentSurface.toolSet }
+          : {}),
         signal,
         log: safeToolLog(this.#ports, turn, step),
       });
@@ -2560,9 +3139,12 @@ export class SingleStreamDriver {
     const capped = this.#cfg.nativeToolSchemasEnabled === true;
     const blocks = results.map((r) => {
       if (!capped || r.isError || r.content.length <= this.#cfg.nativeResultLimit) {
+        const nativeFull = `[tf-stream:tool-result callId=${r.callId} tool=${r.name}${r.isError ? ' isError=true' : ''}]\n${r.content}`;
+        // v0.4.3（P0-7①）：上限内/未启用上限策略 = full（错误块如实计 full——它是实发内容）
+        this.#noteFeedback('full', nativeFull);
         return {
           role: 'user' as const,
-          content: `[tf-stream:tool-result callId=${r.callId} tool=${r.name}${r.isError ? ' isError=true' : ''}]\n${r.content}`,
+          content: nativeFull,
         };
       }
       const observation = this.#obs.observe({
@@ -2578,9 +3160,12 @@ export class SingleStreamDriver {
         handle: observation.handle, key: `native:${r.name}:${r.callId}`,
         infoGain: observation.info_gain, reason: `${observation.reason}:native-capped`,
       });
+      const nativeCapped = `[tf-stream:tool-result callId=${r.callId} tool=${r.name}] ${r.content.length} 字符超出原生通道注入上限（${this.#cfg.nativeResultLimit}），已句柄化：${skeleton}\n（原文用 tf-peek handle="${observation.handle ?? ''}" from_line=.. to_line=.. 取回）`;
+      // v0.4.3（P0-7①）：超限句柄化 = handle
+      this.#noteFeedback('handle', nativeCapped);
       return {
         role: 'user' as const,
-        content: `[tf-stream:tool-result callId=${r.callId} tool=${r.name}] ${r.content.length} 字符超出原生通道注入上限（${this.#cfg.nativeResultLimit}），已句柄化：${skeleton}\n（原文用 tf-peek handle="${observation.handle ?? ''}" from_line=.. to_line=.. 取回）`,
+        content: nativeCapped,
       };
     });
     this.#injectedChars += blocks.reduce((n, b) => n + b.content.length, 0);
@@ -2624,116 +3209,6 @@ export class SingleStreamDriver {
       this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: rec.cmd.id, name: rec.cmd.name, status: 'ok', handle, detail: rec.detail });
       this.#ledgerWrite('plugin:tf-agent/command', { cmdId: rec.cmd.id, name: rec.cmd.name, status: 'ok', handle, chars: content.length });
     }
-  }
-
-  /**
-   * v0.3.3：本回合的"生产性 ok 命令"数（进度基准）。
-   * 排除 tf-final（声明不是工作）与 tf-plan（计划不是交付）；只读/peek/写/跑命令都算——
-   * 只要模型拿到新信息或改了文件，就不该被"重入次数"硬杀。
-   */
-  #productiveOkCount(): number {
-    let n = 0;
-    for (const id of this.#turnCommandIds) {
-      const rec = this.#commands.get(id);
-      if (rec === undefined || rec.status !== 'ok') continue;
-      if (rec.cmd.name === 'tf-final' || rec.cmd.name === 'tf-plan') continue;
-      n += 1;
-    }
-    return n;
-  }
-
-  /** v0.3.3：本回合 ok 的命令记录（兜底交付取证用；按解析序）。 */
-  #turnOkRecords(): CommandRecord[] {
-    const out: CommandRecord[] = [];
-    for (const id of this.#turnCommandIds) {
-      const rec = this.#commands.get(id);
-      if (rec !== undefined && rec.status === 'ok') out.push(rec);
-    }
-    return out.sort((a, b) => a.cmd.seq - b.cmd.seq);
-  }
-
-  /**
-   * v0.3.3：收束前/硬上限处的兜底交付。用户侧的"输出截断"本质是回合结束时没有
-   * assistant 最终消息，只剩最后一句 prose。这里把台账事实写成一条**明确标注未完成**
-   * 的交付说明（不是伪造模型答案）：已完成什么、最近一次命令输出、哪些没验证。
-   * 零产出回合返回 null（不伪造"已完成"）。
-   */
-  #buildFallbackFinal(detail: string): string | null {
-    const ok = this.#turnOkRecords();
-    if (ok.length === 0) return null;
-    const writes = ok.filter((r) => r.cmd.name === 'tf-write' || r.cmd.name === 'tf-edit' || r.cmd.name === 'tf-append');
-    const bashes = ok.filter((r) => r.cmd.name === 'tf-bash' || r.cmd.name === 'tf-code');
-    const reads = ok.filter((r) => r.cmd.name === 'tf-read' || r.cmd.name === 'tf-grep' || r.cmd.name === 'tf-glob' || r.cmd.name === 'tf-peek');
-    const lines: string[] = [`[未完成交付] 回合在收束预算内停止（${detail}），没有收到有效的 tf-final。以下为台账事实，不是模型结论：`];
-    let listed = 0;
-    for (const rec of [...writes, ...bashes, ...reads]) {
-      if (listed >= 8) break;
-      const target = rec.cmd.attrs['path'] ?? rec.cmd.attrs['cmd'] ?? rec.cmd.attrs['pattern'] ?? rec.cmd.attrs['handle'] ?? '';
-      const label = rec.cmd.name;
-      const size = rec.observation?.payload.kind === 'skeleton'
-        ? (rec.observation.payload as { rendered?: string }).rendered?.length
-        : undefined;
-      lines.push(`- ${label}${target === '' ? '' : ` ${capText(target, 120)}`} → ok${rec.handle === undefined ? '' : `（${rec.handle}）`}${size === undefined ? '' : `，${size} 字符`}`);
-      listed += 1;
-    }
-    const lastBash = bashes[bashes.length - 1];
-    if (lastBash !== undefined) {
-      const output = this.#obs.peek(lastBash.handle ?? '', 1, Number.MAX_SAFE_INTEGER);
-      if (output !== null && output.trim() !== '') {
-        const tail = output.length <= 700 ? output : `…${output.slice(output.length - 700)}`;
-        lines.push(`最近一次命令输出（尾部 ≤700 字符）：\n${tail}`);
-      }
-    }
-    const unfinished = [...this.#turnCommandIds]
-      .map((id) => this.#commands.get(id))
-      .filter((r): r is CommandRecord => r !== undefined && (r.status === 'failed' || r.status === 'pending' || r.status === 'dispatched'));
-    if (unfinished.length > 0) {
-      lines.push('未完成/未验证：');
-      for (const rec of unfinished.slice(0, 5)) {
-        lines.push(`- ${rec.cmd.id} ${rec.cmd.name} → ${rec.status}${rec.detail === undefined ? '' : `（${capText(rec.detail, 120)}）`}`);
-      }
-    }
-    lines.push('如需继续，请直接说明下一步（例如“继续修 X”）；本回合没有把未验证的工作标成完成。');
-    return capText(lines.join('\n'), 4000);
-  }
-
-  /**
-   * v0.3.3：兜底交付——用户侧"输出截断"的最后一道闸。
-   * 回合在收束预算内仍没拿到 tf-final 时，把**台账事实**写成一条明确标注未完成的
-   * assistant 消息落进会话，而不是让界面停在最后一句 prose 上。
-   * 零产出（无 ok 命令）→ 不写（不伪造"已完成"）；同一回合只写一次。
-   */
-  #deliverFallbackFinal(turn: number, step: number, detail: string): boolean {
-    if (this.#fallbackFinalDelivered) return false;
-    const text = this.#buildFallbackFinal(detail);
-    if (text === null) return false;
-    this.#fallbackFinalDelivered = true;
-    try {
-      this.#ports.events?.finalAnswer?.(turn, step, text);
-    } catch (error) {
-      this.#warn('兜底交付写入失败', error);
-    }
-    this.#record({
-      seq: ++DRIVER_SEQ, kind: 'fault', fault: 'fallback-final',
-      detail: `回合收束但无 tf-final → 已写未完成交付说明（${capText(detail, 120)}）`,
-    });
-    this.#ledgerWrite('plugin:tf-agent/fault', {
-      fault: 'fallback-final', detail, turn, step, commands: this.#productiveOkCount(),
-    });
-    return true;
-  }
-
-  /** v0.3.3：收束期指令（只在到达停滞/硬上限后注入；排在所有事实块之后，模型最后读到它）。 */
-  #closeOutNudge(attempt: number, detail: string): string {
-    const ok = this.#productiveOkCount();
-    const last = attempt >= 2;
-    return [
-      `[tf-stream:closeout attempt=${attempt}] ${last ? '这是最后一次收束机会。' : '进入收束阶段。'}`,
-      `本回合已成功执行 ${ok} 条命令；${detail}`,
-      '停止继续探索/验证：不要再读文件、跑检查或补新功能，除非缺少的结果会改变最终结论。',
-      '立即用 tf-final 交付：summary 写最终答案原文（数字/行内容/路径/结论）+ 未验证项清单；',
-      '任务确实没做完就如实写“未完成：…”，不要用 placeholder/占位/TODO。',
-    ].join('\n');
   }
 
   /**
@@ -2799,8 +3274,8 @@ export class SingleStreamDriver {
     //    tf-read 成功 → 注入完整原文；超过 READ_FEEDBACK_LIMIT 截断为中段省略 + 头尾保留，
     //    并提示 tf-peek 精确取回；骨架只作为超大文件的替代形态。
     if (level === 'normal' || level === 'high-only') {
-      // v0.3.3：单请求读注入预算（按本请求新注入的正文累减；已注入过的不占额度）。
-      // ≤0 = 关闭预算（回退点：行为等价 v0.3.2）。
+      // v0.4.0（自 0.3.3 回流）：单请求读注入预算（按本请求新注入的正文累减；已注入过的
+      // 不占额度）。≤0 = 关闭预算（回退点：行为等价 0.4.0 之前的逐文件上限）。
       let readBudget = this.#cfg.readFeedbackBudgetPerRequest > 0
         ? this.#cfg.readFeedbackBudgetPerRequest
         : Number.POSITIVE_INFINITY;
@@ -2810,6 +3285,8 @@ export class SingleStreamDriver {
         // 失败命令的 obs 也是 high，但失败走结构化错误块，这里跳过（避免双重注入）
         if (rec.status !== 'ok') continue;
         if (obs.payload.kind !== 'skeleton') continue;
+        // v0.4.3（P0-7①）：反馈分类（full=全量回灌 / handle=骨架或截断+句柄），整块字节计入
+        let feedbackClass: 'full' | 'handle';
         if (this.#reportedObservations.has(obs.seq)) continue;
         this.#reportedObservations.add(obs.seq);
         let body: string;
@@ -2823,39 +3300,52 @@ export class SingleStreamDriver {
           if (selfWritten) {
             const lines = full === null ? 'unknown' : String(full.split('\n').length);
             const fp = full === null ? 'unavailable' : contentFingerprint(full);
+            const receiptContent = `[tf-stream:receipt handle=${obs.handle ?? ''} path=${rec.cmd.attrs['path']} lines=${lines} sha256=${fp}]`
+              + `\n该路径由你本任务的 tf-write 写入，写入成功（写失败会有 [tf-stream:error]；没有错误注入即写成功）。`
+              + `写入正文不回灌（回验纪律）——若它是在更早的流步骤写的，你当前上下文里没有原文。`
+              + `需要原文（全量或行段）用 tf-peek handle="${obs.handle}" 取回；需要修改用 tf-edit 的 OLD 精确字面量可先 tf-peek 取回后再改。`;
             blocks.push({
               role: 'user',
-              // v0.3.2 文案修正：写入正文不回灌——跨流步骤后"全文已在你的上下文中"是假的
-              // （真机 session-8f22c7a0：模型自述 "I don't have the exact text visible"，
-              // 被迫全量重写四个文件）。如实说明 + 给 tf-peek 取回路径。
-              content: `[tf-stream:receipt handle=${obs.handle ?? ''} path=${rec.cmd.attrs['path']} lines=${lines} sha256=${fp}]`
-                + `\n该路径由你本任务的 tf-write 写入，写入成功（写失败会有 [tf-stream:error]；没有错误注入即写成功）。`
-                + `写入正文不回灌（回验纪律）——若它是在更早的流步骤写的，你当前上下文里没有原文。`
-                + `需要原文（全量或行段）用 tf-peek handle="${obs.handle}" 取回；需要修改用 tf-edit 的 OLD 精确字面量可先 tf-peek 取回后再改。`,
+              // v0.4.2 文案修正：写入正文不回灌——跨流步骤后"全文已在你的上下文中"是假的
+              // （真机 session-8f22c7a0：模型自述 "I don't have the exact text visible"，被迫全量重写）。
+              content: receiptContent,
             });
+            // v0.4.3（P0-7①）：回执 = handle 类反馈（指针，不是全文；dedup 语义 P0-4 再分）
+            this.#noteFeedback('handle', receiptContent);
             highInjected = true;
             continue;
           }
-          body = readFeedbackBody(full, obs.payload.rendered, this.#cfg.readFeedbackLimit ?? DEFAULT_READ_FEEDBACK_LIMIT);
-          // v0.3.3 单请求读注入预算：一次读多文件时不再把每个文件的全文都塞进同一请求
-          //（真机 13 步会话 step 3：单请求 5916 个未缓存 token，占全会话未缓存输入的 47%）。
-          // 预算内给全文，超出给"头 800 字符 + 句柄"，下一请求用 tf-peek 精确补全——
-          // 把大块新内容摊平到多个请求，每个请求只新增它这一步真正要看的那份。
+          const readLimit = this.#cfg.readFeedbackLimit ?? DEFAULT_READ_FEEDBACK_LIMIT;
+          body = readFeedbackBody(full, obs.payload.rendered, readLimit);
+          // v0.4.0（自 0.3.3 回流）单请求读注入预算：一次读多文件时不再把每个文件的全文都
+          // 塞进同一请求（真机 13 步会话 step 3：单请求 5916 个未缓存 token，占全会话未缓存
+          // 输入的 47%）。预算内给全文，超出给"头 800 字符 + 句柄"，下一请求用 tf-peek 精确
+          // 补全——把大块新内容摊平到多个请求，每个请求只新增它这一步真正要看的那份。
+          let previewed = false;
           if (body.length > readBudget) {
             body = readPreviewBody(full, obs.payload.rendered, READ_PREVIEW_CHARS);
+            previewed = true;
           }
           readBudget = Math.max(0, readBudget - body.length);
+          // v0.4.3（P0-7①）：与 readFeedbackBody 同分支的分类——全文 ≤ 上限且未因预算降级
+          // = full；取不到原文（骨架）、超限截断或预算降级 = handle（指针 + 句柄）。
+          feedbackClass = !previewed && full !== null && full.length <= readLimit ? 'full' : 'handle';
         } else if (rec.cmd.name === 'tf-code' && rec.output !== undefined) {
           // F3：code 结果可见性——上限内的首成功/变化值完整注入（省一次 tf-peek 往返）；
           // 句柄仍然有效，需要原文行段时照常 tf-peek。仅 tf-code 显式开启时此路径可达。
           body = rec.output;
+          feedbackClass = 'full';
         } else {
           body = obs.payload.rendered;
+          feedbackClass = 'handle';
         }
+        const observationContent = `[tf-stream:observation handle=${obs.handle ?? ''} key=${observationKey(rec.cmd)}]\n${body}\n（细节用 tf-peek handle="${obs.handle}" from_line=.. to_line=.. 取回）`;
         blocks.push({
           role: 'user',
-          content: `[tf-stream:observation handle=${obs.handle ?? ''} key=${observationKey(rec.cmd)}]\n${body}\n（细节用 tf-peek handle="${obs.handle}" from_line=.. to_line=.. 取回）`,
+          content: observationContent,
         });
+        // v0.4.3（P0-7①）：按整块实发字节计入其分类。
+        this.#noteFeedback(feedbackClass, observationContent);
         highInjected = true;
       }
     }
@@ -2866,10 +3356,13 @@ export class SingleStreamDriver {
         if (rec.cmd.name !== 'tf-peek' || rec.status !== 'ok') continue;
         if (this.#reportedPeeks.has(rec.cmd.id)) continue;
         this.#reportedPeeks.add(rec.cmd.id);
+        const peekContent = `[tf-stream:peek handle=${rec.cmd.attrs['handle'] ?? ''} lines=${rec.cmd.attrs['from_line'] ?? 1}-${rec.cmd.attrs['to_line'] ?? 'end'}]\n${rec.output ?? ''}`;
         blocks.push({
           role: 'user',
-          content: `[tf-stream:peek handle=${rec.cmd.attrs['handle'] ?? ''} lines=${rec.cmd.attrs['from_line'] ?? 1}-${rec.cmd.attrs['to_line'] ?? 'end'}]\n${rec.output ?? ''}`,
+          content: peekContent,
         });
+        // v0.4.3（P0-7①）：peek 是模型的显式取回请求 → 全量回灌
+        this.#noteFeedback('full', peekContent);
       }
     }
 
@@ -2943,14 +3436,14 @@ function commandFingerprint(cmd: TfCommand): string {
  *  故阈值取宽。 */
 export const DEFAULT_READ_FEEDBACK_LIMIT = 8000;
 
-/** v0.3.3：单请求 tf-read 完整正文注入预算（字符）。一次读五个文件时，旧实现把五份
- *  全文都塞进同一请求（真机 13 步会话 step 3：5916 个未缓存 token，占全会话未缓存
- *  输入的 47%）。预算内的文件给全文，超出部分给"头 800 字符 + 句柄"预览，下一请求
+/** v0.4.0（自 0.3.3 回流）：单请求 tf-read 完整正文注入预算（字符）。一次读五个文件时，
+ *  旧实现把五份全文都塞进同一请求（真机 13 步会话 step 3：5916 个未缓存 token，占全会话
+ *  未缓存输入的 47%）。预算内的文件给全文，超出部分给"头 800 字符 + 句柄"预览，下一请求
  *  可用 tf-peek 精确补全——把大块新内容摊平，避免一次请求把缓存命中率拉低。
  *  12000 字符 ≈ 3k tokens；按 8000/文件的单文件上限，通常可容 1-2 份全文。 */
 export const DEFAULT_READ_FEEDBACK_BUDGET_PER_REQUEST = 12_000;
 
-/** v0.3.3：超预算 tf-read 的预览长度（字符）。 */
+/** v0.4.0：超预算 tf-read 的预览长度（字符）。小文件（≤ 此值）照给全文。 */
 const READ_PREVIEW_CHARS = 800;
 
 function readFeedbackBody(full: string | null, skeleton: string, limit: number): string {
@@ -2962,7 +3455,7 @@ function readFeedbackBody(full: string | null, skeleton: string, limit: number):
   return `${full.slice(0, headCut)}\n……（中段省略 ${omitted} 字符；tf-peek handle=<句柄> from_line=.. to_line=.. 精确取回）……\n${full.slice(full.length - tailCut)}`;
 }
 
-/** v0.3.3：本请求读注入预算已满时的降级正文——头 N 字符 + 取回路径。
+/** v0.4.0（自 0.3.3 回流）：本请求读注入预算已满时的降级正文——头 N 字符 + 取回路径。
  *  小文件（≤ N 字符）照给全文：它几乎不占额度，没必要为省几百字符把模型推去额外 peek。 */
 function readPreviewBody(full: string | null, skeleton: string, previewChars: number): string {
   if (full === null) return `${skeleton}\n（原文不可取回，仅骨架；tf-peek 可按行段重试）`;
@@ -3028,6 +3521,10 @@ function suggestFor(cmd: TfCommand): string {
 function observationKey(cmd: TfCommand): string {
   const base = cmd.attrs['path'] ?? cmd.attrs['cmd'] ?? cmd.attrs['handle'];
   if (base !== undefined) return base;
+  // v0.4.0：tf-call 的稳定目标 = 工具名 + 参数指纹（同参数幂等归并，不同参数各自成 key）
+  if (cmd.name === 'tf-call') {
+    return `${cmd.attrs['name'] ?? 'unknown'}:${contentFingerprint(cmd.body ?? '')}`;
+  }
   // tf-code 没有稳定目标：description 优先，缺省用程序体指纹（同 id 重复才归并，不同程序各自成 key）
   if (cmd.name === 'tf-code') {
     return cmd.attrs['description'] !== undefined
@@ -3095,10 +3592,10 @@ function finishDetail(finish: FinishReasonLike): string {
   return finishMessage(finish);
 }
 
-/** RenderMessage → GenerateOptions.messages 线格式（loop-built 请求：首条 system 携带系统提示）。 */
+/** RenderMessage → GenerateOptions.messages 线格式（loop-built 请求：首条 system 携带系统提示）。
+ *  v0.4.2：assistant 消息必须携带 source（宿主 LlmRuntime.forAdapter 无防护读
+ *  message.source.replayState，GitHub master 同源；缺失 = 流 error → 回合中断）。 */
 function toWireMessages(messages: readonly RenderMessage[]): StreamRequestOptions['messages'] {
-  // v0.3.2：assistant 消息必须携带 source（宿主 LlmRuntime.forAdapter 无防护读
-  // `message.source.replayState`，GitHub master 同源；缺失 = 流 error → 回合中断）。
   return messages.map((m) => ({
     role: m.role,
     content: [{ type: 'text' as const, text: m.content }],
@@ -3140,14 +3637,14 @@ export function normalizeStreamShim(inner: AsyncIterable<StreamChunkLike>): Asyn
 // ---------------------------------------------------------------------------
 
 /**
- * 会话日志 assistant 消息的 model source（v0.3.2 修复）。
+ * 会话日志 assistant 消息的 model source（v0.4.1-beta.2 修复，与 0.3.2 同一套）。
  * 宿主校验器（dsh-session assertMessageEventShape → hasProviderModel）要求
  * `source = {kind:'model', provider:<非空字符串>, model:<非空字符串>}`；缺 provider/model
  * 的日志在读取时抛 `message must have model source`，整条会话被判 corrupt——桌面端
- * 表现为"历史加载失败"。0.3.1 及更早版本只写了 `{kind:'model'}`，本类型把实时
+ * 表现为"历史加载失败"。0.4.1-beta.1 及更早版本只写了 `{kind:'model'}`，本类型把实时
  * provider/model 带进写入路径（applySelection 换模后随动）。
  */
-/** v0.3.2：assistant 消息的宿主来源（会话日志 source 与请求装配的 RenderMessage.source
+/** v0.4.2：assistant 消息的宿主来源（会话日志 source 与请求装配的 RenderMessage.source
  *  共用）。kind 固定 'model'（宿主 forAdapter/validateReplay 都先读 source.kind）。 */
 export interface ModelSourceInfo {
   kind: 'model';
@@ -3164,7 +3661,7 @@ export interface ModelSourceInfo {
  * dsh-llm createAssistantMessage（lib/types/message.js:64-73）：{id, role:'assistant',
  * content:[{type:'text',text}], source:{kind:'model', provider, model}}（探针 C 实测可写）。
  *
- * v0.3.2：modelInfo 在**写入时**调用（不缓存）——applySelection 运行时换模后随动；
+ * v0.4.1-beta.2：modelInfo 在**写入时**调用（不缓存）——applySelection 运行时换模后随动；
  * 缺省（离线/无模型路由信息）时 provider/model 落 'unknown'，保证日志形状仍可通过
  * 宿主校验（空字符串同样会被 hasProviderModel 拒绝）。
  */
@@ -3290,8 +3787,8 @@ type AssistantContentBlock = { type: 'text'; text: string } | { type: 'reasoning
 
 /**
  * 构造 assistant 消息（形状镜像 dsh-llm createAssistantMessage，lib/types/message.js:64-73）。
- * v0.3.2：source 必须携带非空 provider/model（宿主 hasProviderModel 校验，缺了整条日志
- * 判 corrupt）；缺写入方未提供或为空串时落 'unknown'——日志保持可加载，不谎报模型。
+ * v0.4.1-beta.2：source 必须携带非空 provider/model（宿主 hasProviderModel 校验，缺了整条日志
+ * 判 corrupt）；写入方未提供或为空串时落 'unknown'——日志保持可加载，不谎报模型。
  */
 function makeAssistantMessage(text: string, toolCalls: readonly ToolCallAdvertisement[] = [], reasoning?: string, modelInfo?: ModelSourceInfo): { id: string; role: 'assistant'; content: AssistantContentBlock[]; source: { kind: 'model'; provider: string; model: string } } {
   const content: AssistantContentBlock[] = [];
@@ -3330,8 +3827,8 @@ export interface StreamLoopAgentDeps {
    *  守卫 chainLayers(exec.agent) 都按 scopeChainOf(agent) 选层，key 不是 agent 实例时
    *  preset 层工具（write/edit/pwsh）永远解析不到。缺省（headless/fake host）不铸造。 */
   scopeModule?: DshScopeLike;
-  /** v0.3.2（UI 卡住修复）：宿主事件总线出口（cordis ctx.emit）。运行态转换时发
-   *  `agent/status`（镜像内建 dsh-agent-loop setPhase：只在状态真正变化时发）。
+  /** v0.4.1-beta.2（UI 卡住修复，与 0.3.2 同一套）：宿主事件总线出口（cordis ctx.emit）。
+   *  运行态转换时发 `agent/status`（镜像内建 dsh-agent-loop setPhase：只在状态真正变化时发）。
    *  桌面端 dsh-api-session-controller 监听它转发 `api-session/status`——不发的话
    *  客户端永远停在"运行中"（回合早已结束，UI 仍在转圈，用户只能强杀）。
    *  缺省 = 不发（headless/离线无总线）。 */
@@ -3359,7 +3856,7 @@ export class StreamLoopAgent {
   #selection: { provider: string; model: string; reasoningEffort?: string };
   #disposeScope: (() => Promise<void>) | undefined;
   #disposed = false;
-  /** v0.3.2：agent/status 发射出口（宿主事件总线；缺省 = 不发）。 */
+  /** v0.4.1-beta.2：agent/status 发射出口（宿主事件总线；缺省 = 不发）。 */
   #emitStatus: ((payload: { agent: unknown; status: 'idle' | 'running' }) => void) | undefined = undefined;
 
   constructor(deps: StreamLoopAgentDeps) {
@@ -3443,8 +3940,8 @@ export class StreamLoopAgent {
     if (this.#status === 'idle') this.#startNextTurn();
   }
 
-  /** v0.3.2：桌面端命令路径的通知注入（dsh-user-approval setPolicy:127 实测调用
-   *  `agent.inject(...)`——0.3.1 缺这个方法，改审批策略的命令以
+  /** v0.4.1-beta.2：桌面端命令路径的通知注入（dsh-user-approval setPolicy:127 实测调用
+   *  `agent.inject(...)`——0.4.1-beta.1 缺这个方法，改审批策略的命令以
    *  "agent.inject is not a function" 报错收场）。镜像内建 send(input,'next-step',false)：
    *  落盘 + 并入"下一步"装配，但**不唤醒空闲 agent**（通知型注入不该自己开回合）。
    *  pendingSteers 在 runTurn 的每次请求前消费（含下一回合首请求）——无论运行中还是
@@ -3508,7 +4005,7 @@ export class StreamLoopAgent {
     }
   }
 
-  /** v0.3.2：运行态转换统一出口（只在真正变化时发 agent/status，镜像内建 setPhase 语义）。
+  /** v0.4.1-beta.2：运行态转换统一出口（只在真正变化时发 agent/status，镜像内建 setPhase 语义）。
    *  发射失败不阻断回合（fail-open，告警不静默）。 */
   #setStatus(next: 'idle' | 'running'): void {
     if (this.#status === next) return;
@@ -3875,9 +4372,9 @@ export function createStreamAgentFactory(deps: StreamAgentFactoryDeps): {
           model: args.agentOptions.model ?? '',
           reasoningEffort: args.agentOptions.reasoningEffort,
         },
-        // v0.3.2（UI 卡住修复）：宿主事件总线在位（cordis ctx.emit）才接 agent/status。
-        // 桌面端 dsh-api-session-controller 监听它转发 api-session/status（running 布尔），
-        // 客户端据此收起"运行中"指示——不接线 = 回合结束后 UI 永远转圈。
+        // v0.4.1-beta.2（UI 卡住修复，与 0.3.2 同一套）：宿主事件总线在位（cordis ctx.emit）
+        // 才接 agent/status。桌面端 dsh-api-session-controller 监听它转发 api-session/status
+        // （running 布尔），客户端据此收起"运行中"指示——不接线 = 回合结束后 UI 永远转圈。
         ...(typeof (deps.ctx as { emit?: unknown }).emit === 'function'
           ? {
               emitStatus: (payload: { agent: unknown; status: 'idle' | 'running' }) => {
@@ -4116,7 +4613,15 @@ export interface LoopEntryConfig {
   nativeToolSchemas?: string;
   systemPrompt?: string;
   protocolText?: string;
-  invariants?: string;
+  /** v0.4.1 不变量段：string = 整段替换；false = 整段不注入（省 242 字符；回退点） */
+  invariants?: string | false;
+  /** v0.4.1 协议档位：'full'（默认，0.4.0 原文逐字节）| 'lean'（全段压缩说明文字）|
+   *  'minimal'（语法铁律面）。显式 protocolText 压过本项。未知值归一 full 并告警。 */
+  protocolLevel?: string;
+  /** v0.4.1 段级增删（宽松表：未知段 id 告警丢弃，不阻断装载） */
+  protocolSections?: Record<string, boolean>;
+  /** v0.4.1 自定义追加：追加在协议末尾（call 段之后）进稳定前缀；不用抄默认文本 */
+  protocolAppend?: string;
   /** 自写回验策略（修复限制 1）：'receipt'（默认）| 'full' —— 见 StreamDriverConfig.selfReadFeedback */
   selfReadFeedback?: 'receipt' | 'full';
   /** tf-code 程序化通道（PTC 桥接）。K1（0.3.0）：**默认关闭**；显式 true 且宿主挂载
@@ -4140,6 +4645,16 @@ export interface LoopEntryConfig {
   segmentMaxChars?: number;
   /** tf-code 默认超时（毫秒）；缺省 = 宿主 provider 默认 */
   codeTimeoutMs?: number;
+  /** v0.4.0 工具面档位（P1）：'core' | 'standard'（默认）| 'full' | 'off'（0.3.x 回退点） */
+  toolSurface?: string;
+  /** v0.4.0 原生通道开关（默认 false——§15 默认文本；schema token 成本见 StreamDriverConfig.nativeTools） */
+  nativeTools?: boolean;
+  /** v0.4.0 tf-call 通用调用通道（默认 true；toolSurface=off 强制关） */
+  callCommand?: boolean;
+  /** v0.4.0 toolSet 准入收紧（R5：beta 默认 false；P6 复跑后再默认开） */
+  strictAdmission?: boolean;
+  /** v0.4.0 模式切换（P4）：控制页/CLI 暴露 PresetRouter（空白会话三向切换；已开回合具名失败） */
+  presetRouter?: boolean;
   /** 修复限制 3/4：宿主缺 storage/sessionPersistence/plugin record 模块时的本地文件持久化兜底
    *  （JSONL 会话日志 + 文件台账 + 本地 KvUnit）。默认开启；false = 维持 v0.1 内存降级行为。 */
   persistFallback?: boolean;
@@ -4151,6 +4666,40 @@ export interface LoopEntryConfig {
   lang?: string;
   /** 接管自证：注册成功后向 stderr 打一行横幅（探针 A 实测 preset 激活对 CLI 静默，排障只能靠插件自证日志） */
   announceTakeover?: boolean;
+}
+
+/** v0.4.0：装配 config 的工具面档位归一（未知值回 standard + 告警由调用方负责；'off' = 0.3.x 回退点）。 */
+export function asSurfaceProfile(value: string | undefined): SurfaceProfile {
+  return value === 'core' || value === 'standard' || value === 'full' || value === 'off' ? value : 'standard';
+}
+
+/**
+ * v0.4.1：装配 config 的段级增删表 → 类型化协议段配置。
+ * 宽松键（拼写错误/前端字段）在这里告警并丢弃——不阻断装载，但绝不静默（红线 5）；
+ * 驱动器构造期对非法值 fail-fast（composeProtocolText 抛错），所以必须在入口先洗净。
+ */
+export function sanitizeProtocolSections(
+  value: Record<string, boolean> | undefined,
+  warn?: (message: string) => void,
+): Partial<Record<ProtocolSectionId, boolean>> | undefined {
+  if (value === undefined) return undefined;
+  const cleaned: Partial<Record<ProtocolSectionId, boolean>> = {};
+  for (const [key, flag] of Object.entries(value)) {
+    if ((PROTOCOL_SECTION_IDS as readonly string[]).includes(key) && typeof flag === 'boolean') {
+      cleaned[key as ProtocolSectionId] = flag;
+    } else {
+      warn?.(`[stream-loop] protocolSections 未知段或非布尔值已忽略: ${key}=${String(flag)}（可用: ${PROTOCOL_SECTION_IDS.join(', ')}）`);
+    }
+  }
+  return Object.keys(cleaned).length > 0 ? cleaned : undefined;
+}
+
+/** v0.4.1：协议档位（字符串形态）归一 + 未知值告警（归一 full 是 fail-open，告警是红线 5）。 */
+export function resolveProtocolLevel(value: string | undefined, warn?: (message: string) => void): ProtocolLevel {
+  if (value === undefined) return 'full';
+  const level = asProtocolLevel(value);
+  if (level !== value) warn?.(`[stream-loop] protocolLevel 未知档位 "${value}"，归一为 full（可用: full|lean|minimal）`);
+  return level;
 }
 
 /**
@@ -4185,7 +4734,8 @@ export default function apply(ctx: {
   // v0.2.1：全部服务读取走 getService —— Cordis 对未 inject 的属性裸读会抛
   // "cannot get property ... without inject"，v0.2.0 因此整层接管未激活（见 cordis-compat.ts）。
   const llm = getService<{ stream(options: StreamRequestOptions): AsyncIterable<StreamChunkLike> }>(ctx, 'llm');
-  const tools = getService<{ execute(input: ToolBatchInputLike): Promise<ToolBatchResultLike> }>(ctx, 'tools');
+  // v0.4.0：tools 服务取全量面（resolve/schemas 给 ToolSurface；execute 给工具批）
+  const tools = getService<{ execute(input: ToolBatchInputLike): Promise<ToolBatchResultLike>; resolve?(context: unknown): unknown; schemas?(scope: unknown, toolSet?: unknown): unknown }>(ctx, 'tools');
   if (llm === undefined || typeof llm.stream !== 'function') {
     throw new Error('[stream-loop] ctx.llm.stream 不可用：entry 挂载失败（需要 dsh-llm 服务在位）');
   }
@@ -4211,6 +4761,7 @@ export default function apply(ctx: {
     maxParallelToolCalls: number;
     maxReentries: number;
     budgetTokens: number | undefined;
+    toolSurface: ReturnType<typeof asSurfaceProfile>;
   } => {
     const preset = modeConfig(control.mode);
     return {
@@ -4221,6 +4772,7 @@ export default function apply(ctx: {
       maxParallelToolCalls: config.maxParallelToolCalls ?? preset.maxParallelToolCalls,
       maxReentries: config.maxReentries ?? preset.maxReentries,
       budgetTokens: config.budgetTokens ?? preset.budgetTokens,
+    toolSurface: asSurfaceProfile(config.toolSurface ?? preset.toolSurface),
     };
   };
   const effective = resolveEffective();
@@ -4230,6 +4782,10 @@ export default function apply(ctx: {
   // 形状不符或缺失 → 通道关闭（协议文本不声明 tf-code），告警不静默（红线 5）。
   // v0.2.1：ptcRuntime 是可选服务，只经 getService 探测（裸读即装载期抛错）。
   const ptcRuntime = getService<unknown>(ctx, 'ptcRuntime');
+  // v0.4.0（P5）：当前会话驱动器引用（createDriver 闭包回填；tf-code 全绑定按面生成）。
+  // v0.4.1-beta.2：同一持有者供会话日志 model source 写入时取实时 provider/model（不缓存）。
+  // v0.4.2：控制页状态面经此读取运行时缓存口径（cacheStats）。
+  const currentDriverRef: { driver?: { surfaceNames(): readonly string[]; modelSource(): ModelSourceInfo; cacheStats(): { cacheHitRatio: number | null; cacheReadTokens: number; billedInput: number } } } = {};
   const codeExecutor = looksLikePtcRuntime(ptcRuntime)
     ? createCodeExecutor(ptcRuntime, { executeTools: (input) => tools.execute(input as never) })
     : undefined;
@@ -4269,6 +4825,17 @@ export default function apply(ctx: {
         systemPrompt: config.systemPrompt,
         protocolText: config.protocolText,
         invariants: config.invariants,
+        // v0.4.1 协议组件化（档位/段增删/自定义追加）：入口宽松表先洗净（未知段告警丢弃），
+        // 未知档位归一 full + 告警；protocolText 显式替换仍压过档位与段配置
+        protocolLevel: resolveProtocolLevel(config.protocolLevel, warning),
+        protocolSections: sanitizeProtocolSections(config.protocolSections, warning),
+        protocolAppend: config.protocolAppend,
+        // v0.4.0 工具面（P1/P2）：档位缺省 standard（对等优先，§16 决议 2）；nativeTools
+        // 缺省关（§15 默认文本）；strictAdmission 缺省关（R5，P6 再收紧）
+        toolSurface: live.toolSurface,
+        nativeTools: config.nativeTools === true,
+        callCommand: config.callCommand !== false,
+        strictAdmission: config.strictAdmission === true,
       };
       // F6 恢复意图：意图日志端口（fsync 落盘；enableIntents: false 关闭——回退点）。
       // 写前意图在派发前落盘、写后回执落定即记；崩溃后"有意图无回执"= 写入可能已发生。
@@ -4284,14 +4851,13 @@ export default function apply(ctx: {
         }
       };
       const intentSeqState = intentsEnabled ? loadIntentState() : { seq: 0 };
-      // v0.3.2（会话日志 model source 修复）：writer 在 driver 之前构造，provider/model
-      // 却要到**写入时**才取实时值（applySelection 换模后随动）——用可变持有者回填。
-      // 写入只发生在回合协程内（构造早已完成），时序安全。
-      let driverRef: SingleStreamDriver | undefined;
       const driver = new SingleStreamDriver(
         {
           stream: (options) => llm.stream(options),
           executeTools: (input) => tools.execute(input),
+          // v0.4.0（P1）：宿主 tools 全量面（resolve/schemas）——方法缺失或解析失败时
+          // ToolSurfaceHolder 自行降级 L2（protocol-only，一行注入 + 台账）
+          ...(tools === undefined ? {} : { toolsService: tools as unknown as ToolsServiceLike }),
           ...(codeExecutor === undefined ? {} : { executeCode: codeExecutor }),
           // v0.3.1 思考过程实时帧：宿主事件总线在位（cordis ctx.emit）才接线；
           // 发射契约由驱动器保证（revision/index 递增、异常熔断），宿主无监听器时是 no-op。
@@ -4314,14 +4880,17 @@ export default function apply(ctx: {
                   intentSeqState.seq += 1;
                   appendIntentRecord(intentFile!, { type: 'receipt', seq: intentSeqState.seq, at: new Date().toISOString(), intentSeq, ok: event.ok, ...(event.detail === undefined ? {} : { detail: event.detail }) });
                 },
+                // v0.4.3（P0-6⑤）：前缀破坏收场时的最小对账——pending 意图整批标 unknown
+                //（只解除恢复锁，不重放工具、不声称回滚；完整三态在 P0-8/0.5.1）。
+                reconcilePendingIntents: (cause: string) => ({ acked: reconcilePendingIntents(intentFile!, cause, intentSeqState) }),
               }
             : {}),
-          events: createSessionEventWriter(session, () => driverRef?.modelSource()),
+          events: createSessionEventWriter(session, () => currentDriverRef.driver?.modelSource()),
           onWarning: warning,
         },
         cfg,
       );
-      driverRef = driver;
+      currentDriverRef.driver = driver;
       // K2：会话工作区解析（tf-code resolve 透传用）。会话 header.cwd（会话原始目录）
       // 优先，缺省回退宿主 workingDirectory 服务的部署默认目录；两者都不可得则不传，
       // 由宿主按自己的默认语义解析。插件不复制宿主的优先级规则。
@@ -4390,7 +4959,11 @@ export default function apply(ctx: {
         maxParallelToolCalls: live.maxParallelToolCalls,
         maxReentries: live.maxReentries,
         budgetTokens: live.budgetTokens ?? null,
+        toolSurface: live.toolSurface,
       },
+      // v0.4.2：运行时缓存口径（控制页"缓存命中"行；当前会话无活动驱动器时为 null，
+      // 客户端隐藏该行——离线/mock 适配器没有缓存数据，不渲染成 0%）。
+      cache: currentDriverRef.driver?.cacheStats() ?? null,
       modes: publicModeCatalog(),
       updatedAt: persisted.updatedAt ?? null,
       stateFile: control.file,

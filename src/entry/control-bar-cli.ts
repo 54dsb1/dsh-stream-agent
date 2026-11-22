@@ -16,6 +16,9 @@
 
 import { readdirSync } from 'node:fs';
 import { MODES, getMode, isModeId } from '../kernel/modes.ts';
+import { PROTOCOL_LEVELS, PROTOCOL_SECTION_IDS, protocolPreview, SECTION_TEXTS } from '../kernel/protocol.ts';
+import type { ComposeProtocolOptions, ProtocolLevel, ProtocolSectionId } from '../kernel/protocol.ts';
+import { DEFAULT_CODE_PROTOCOL_SECTION, DEFAULT_CALL_PROTOCOL_SECTION } from './loop.ts';
 import {
   createControlState,
   isLang,
@@ -61,6 +64,9 @@ function usage(lang: Lang): string[] {
     '  dsh-stream-agent mode <balanced|lean|compat|power>',
     '  dsh-stream-agent lang <zh|en>',
     '  dsh-stream-agent intents [--ack <sessionId>] ' + (zh ? 'F6 意图核对：列出"有意图无回执"（--ack 人工确认后闭合）' : 'F6 intent triage: list intents without receipts (--ack to close)'),
+    '  dsh-stream-agent protocol [--level <full|lean|minimal>] [--sections plan=off,...]',
+    '        ' + (zh ? 'v0.4.1 协议组装预览：逐段字符数 + 总量对比 full + 组装全文（--stats-only 只看数字）'
+      : 'v0.4.1 protocol composition preview: per-section chars, total vs full, composed text (--stats-only)'),
     '  dsh-stream-agent help                       ' + (zh ? '全模式指南' : 'full mode guide'),
     '',
     zh ? '状态文件' : 'State file',
@@ -133,6 +139,121 @@ export function splitKeys(chunk: string): string[] {
     i += 1;
   }
   return keys;
+}
+
+// ---------------------------------------------------------------------------
+// v0.4.1 协议组装预览（protocol 子命令；纯函数导出供测试，main 只负责打印）
+// ---------------------------------------------------------------------------
+
+/** 把 `k=v` 逗号表解析成段开关：v ∈ true/on/1 | false/off/0；其余值返回错误行。 */
+export function parseSectionFlags(spec: string): { sections: Partial<Record<ProtocolSectionId, boolean>> } | { error: string } {
+  const sections: Partial<Record<ProtocolSectionId, boolean>> = {};
+  for (const pair of spec.split(',')) {
+    const trimmed = pair.trim();
+    if (trimmed === '') continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) return { error: trimmed };
+    const key = trimmed.slice(0, eq).trim();
+    const raw = trimmed.slice(eq + 1).trim().toLowerCase();
+    if (!(PROTOCOL_SECTION_IDS as readonly string[]).includes(key)) return { error: `${trimmed}（未知段）` };
+    if (raw === 'true' || raw === 'on' || raw === '1') sections[key as ProtocolSectionId] = true;
+    else if (raw === 'false' || raw === 'off' || raw === '0') sections[key as ProtocolSectionId] = false;
+    else return { error: trimmed };
+  }
+  return { sections };
+}
+
+/** protocol 子命令本体：组装 + 逐段统计 + 文本（--stats-only 只给数字；--json 机器可读）。 */
+export function protocolCommand(args: readonly string[], lang: Lang): { code: number; lines: string[] } {
+  const zh = lang === 'zh';
+  const json = args.includes('--json');
+  const statsOnly = args.includes('--stats-only');
+  const noCall = args.includes('--no-call');
+  const withCode = args.includes('--code');
+  const noPlan = args.includes('--no-plan');
+  const appendIdx = args.indexOf('--append');
+  const append = appendIdx >= 0 ? args[appendIdx + 1] : undefined;
+
+  let level: ProtocolLevel = 'full';
+  const levelIdx = args.indexOf('--level');
+  if (levelIdx >= 0) {
+    const raw = args[levelIdx + 1];
+    if (raw === undefined || !(PROTOCOL_LEVELS as readonly string[]).includes(raw)) {
+      return { code: 2, lines: [`${zh ? '未知档位' : 'Unknown level'}: ${raw ?? '（缺参）'}（${PROTOCOL_LEVELS.join('|')}）`] };
+    }
+    level = raw as ProtocolLevel;
+  }
+
+  let sections: Partial<Record<ProtocolSectionId, boolean>> | undefined;
+  const sectionsIdx = args.indexOf('--sections');
+  if (sectionsIdx >= 0) {
+    const spec = args[sectionsIdx + 1];
+    if (spec === undefined) return { code: 2, lines: [zh ? '--sections 缺参（如 plan=off,timing=on）' : '--sections needs a value (e.g. plan=off,timing=on)'] };
+    const parsed = parseSectionFlags(spec);
+    if ('error' in parsed) return { code: 2, lines: [`${zh ? '段开关格式错' : 'Bad section flag'}: ${parsed.error}`] };
+    sections = parsed.sections;
+  }
+  if (typeof append === 'string' && appendIdx >= 0 && args[appendIdx + 1] === undefined) {
+    return { code: 2, lines: [zh ? '--append 缺参' : '--append needs a value'] };
+  }
+
+  const opts: ComposeProtocolOptions = { level, sections, enablePlan: noPlan ? false : undefined };
+  const preview = protocolPreview(opts);
+
+  // 通道段与追加段（与驱动器组装同序：基座 + code + call + append；这里如实计入总量）
+  const codeSection = withCode ? `\n\n${DEFAULT_CODE_PROTOCOL_SECTION}` : '';
+  const callSection = noCall ? '' : `\n\n${DEFAULT_CALL_PROTOCOL_SECTION}`;
+  const appendSection = append !== undefined && append !== '' ? `\n\n${append}` : '';
+  const extra = codeSection.length + callSection.length + appendSection.length;
+  const total = preview.chars + extra;
+  const fullWithChannels = preview.fullChars
+    + DEFAULT_CALL_PROTOCOL_SECTION.length + 2; // full 基准 = 缺省装配（call 段默认在）
+  const saved = fullWithChannels - total;
+
+  if (json) {
+    return {
+      code: 0,
+      lines: [JSON.stringify({
+        level,
+        enablePlan: opts.enablePlan !== false,
+        channels: { code: withCode, call: !noCall },
+        appendChars: appendSection.length > 0 ? appendSection.length - 2 : 0,
+        sections: preview.sections,
+        baseChars: preview.chars,
+        totalChars: total,
+        fullBaselineChars: fullWithChannels,
+        savedChars: saved,
+        ...(statsOnly ? {} : { text: preview.text + codeSection + callSection + appendSection }),
+      })],
+    };
+  }
+
+  const lines: string[] = [
+    zh ? '协议组装预览（v0.4.1 组件化）' : 'Protocol composition preview (v0.4.1)',
+    `  level=${level}  enablePlan=${opts.enablePlan !== false}  code=${withCode ? 'on' : 'off'}  call=${noCall ? 'off' : 'on'}  append=${appendSection.length > 0 ? `${appendSection.length - 2}${zh ? '字符' : ' chars'}` : 'off'}`,
+    '',
+  ];
+  const width = Math.max(...preview.sections.map((s) => s.id.length));
+  for (const s of preview.sections) {
+    const name = s.id.padEnd(width);
+    if (!s.included) {
+      const dropped = SECTION_TEXTS.full[s.id]?.length ?? 0;
+      lines.push(zh
+        ? `  ${name}   落选（省 ${dropped} 字符）`
+        : `  ${name}   excluded (saves ${dropped} chars)`);
+    } else {
+      const fallback = s.source !== level ? (zh ? 'full（回退）' : 'full (fallback)') : level;
+      lines.push(`  ${name}   ${String(s.chars).padStart(5)}  ${fallback}`);
+    }
+  }
+  lines.push('',
+    zh
+      ? `合计 ${total} 字符（full 缺省装配基准 ${fullWithChannels}；${saved >= 0 ? `省 ${saved} / ${(saved / fullWithChannels * 100).toFixed(1)}%` : `多 ${-saved} 字符（加回段/追加）`}）`
+      : `Total ${total} chars (full default baseline ${fullWithChannels}; ${saved >= 0 ? `saved ${saved} / ${(saved / fullWithChannels * 100).toFixed(1)}%` : `${-saved} chars added back`})`);
+  if (!statsOnly) {
+    lines.push('', zh ? '—— 组装全文 ——' : '—— composed text ——', preview.text + codeSection + callSection + appendSection);
+  }
+  return { code: 0, lines };
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +381,13 @@ function main(argv: readonly string[]): number {
       return 0;
     }
 
+    case 'protocol': {
+      // main() 已把 --json 从 rest 里滤掉，这里按需回传给 protocolCommand
+      const result = protocolCommand(json ? [...rest.slice(1), '--json'] : rest.slice(1), state.lang);
+      print(result.lines);
+      return result.code;
+    }
+
     case 'bar': {
       const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true && !once;
       if (!interactive) {
@@ -272,7 +400,7 @@ function main(argv: readonly string[]): number {
     }
 
     default:
-      print([`${t('usage', state.lang)}: dsh-stream-agent [bar|status|mode|lang|help]`, t('unknownMode', state.lang)]);
+      print([`${t('usage', state.lang)}: dsh-stream-agent [bar|status|mode|lang|intents|protocol|help]`, t('unknownMode', state.lang)]);
       return 2;
   }
 }

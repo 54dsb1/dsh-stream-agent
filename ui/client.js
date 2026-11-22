@@ -41,6 +41,7 @@ window.__ModuleLoader__.load({
 				paramsTitle: "生效参数",
 				langTitle: "控制栏语言",
 				langHint: "只影响控制栏文案与页面，不改模型输出语言。",
+				cacheHit: "缓存命中",
 				version: "版本",
 				mode: "模式",
 				source: "来源",
@@ -73,6 +74,7 @@ window.__ModuleLoader__.load({
 					maxParallelToolCalls: "并行命令",
 					maxReentries: "最大重入",
 					budgetTokens: "token 预算",
+					toolSurface: "工具面档",
 				},
 				values: {
 					receipt: "只回回执",
@@ -104,6 +106,7 @@ window.__ModuleLoader__.load({
 				paramsTitle: "Effective parameters",
 				langTitle: "Control bar language",
 				langHint: "Only the control bar and this page; it does not change the model's output language.",
+				cacheHit: "Cache hit",
 				version: "Version",
 				mode: "Mode",
 				source: "Source",
@@ -136,6 +139,7 @@ window.__ModuleLoader__.load({
 					maxParallelToolCalls: "Parallel commands",
 					maxReentries: "Max re-entries",
 					budgetTokens: "Token budget",
+					toolSurface: "Tool surface",
 				},
 				values: {
 					receipt: "receipt only",
@@ -268,6 +272,7 @@ window.__ModuleLoader__.load({
 				["maxParallelToolCalls", effective.maxParallelToolCalls],
 				["maxReentries", effective.maxReentries],
 				["budgetTokens", effective.budgetTokens],
+				["toolSurface", effective.toolSurface],
 			];
 			return h("div", { className: "sa-params" },
 				rows.map(([key, value]) => h("div", { className: "sa-param", key },
@@ -381,6 +386,13 @@ window.__ModuleLoader__.load({
 							h(StatusCell, { label: t.stateFile, wide: true },
 								h("code", { className: "sa-code", title: status.stateFile }, status.stateFile),
 							),
+							// v0.4.2：运行时缓存命中率（当前会话有缓存数据才显示；离线/mock 隐藏该行）。
+							status.cache && status.cache.cacheHitRatio !== null && status.cache.cacheHitRatio !== undefined
+								? h(StatusCell, { label: t.cacheHit },
+									h("span", { title: `${t.cacheHit}: cacheRead=${status.cache.cacheReadTokens} / billedInput=${status.cache.billedInput}` },
+										`${Math.round(status.cache.cacheHitRatio * 100)}%`),
+								)
+								: null,
 						),
 						locked ? h("div", { className: "sa-hint" }, status.modeSource === "env" ? t.lockedEnv : t.lockedConfig) : null,
 					),

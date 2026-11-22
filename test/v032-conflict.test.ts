@@ -1,4 +1,4 @@
-// test/v032-conflict.test.ts —— v0.3.2 宿主契约冲突回归（真机 session-8f22c7a0，2026-11-20 23:31）
+// test/v032-conflict.test.ts —— v0.4.2 宿主契约冲突回归（与 0.3.2/0.3.3 同源）（真机 session-8f22c7a0，2026-11-20 23:31）
 //
 // "修复"后截断仍发生——对照 GitHub deepseek-harness 源码（packages/llm/llm/src/index.ts
 // 的 forAdapter 与 packages/llm/llm-deepseek/src/serialize.ts）找到的**四个独立因素**：

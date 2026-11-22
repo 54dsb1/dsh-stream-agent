@@ -13,21 +13,21 @@ every failure, cancellation, and sandbox denial into an **auditable fact** inste
 error string.
 
 Measured on real connections (10 tasks, two arms, same `deepseek-flash` model, stamp
-`2026-11-15-v02`, four-component totals recomputed by `summarize.cjs`): **28.9% of the
-native loop's tokens with parity on correctness**. The historical 22.3% figure comes from an
-earlier batch — the two are not comparable; see the honest note in
-[eval/RESULTS.md](eval/RESULTS.md) §6. The R3 rerun will re-measure both arms in one batch.
-
-A separate **single-session** measurement (2026-11-21, one run with and one without the
-plugin): total tokens **600,410 → 109,546 (−81.8%)**, uncached input **14,471 → 8,840
-(−38.9%)**. Details and an honest reading of the hit-rate change:
-[§7.1](#71-single-session-measurement-with-vs-without-the-plugin-v033).
+`2026-11-15-v02`, totals recomputed by `summarize.cjs`, four-column table in §7): **the
+four-component total (uncached input + cache read + cache write + output) drops to 28.9%
+of the native loop (446,410 → 129,178; this batch has cache-write 0 on both arms — never
+triggered), with parity on correctness (checks 9/10); the cost is requests 50 → 59 (+18%)
+and a strict two-component total (uncached input + output) of 134.9% (52,682 → 71,066,
+higher on the plugin side — exactly what P0-2/P0-10 target)**. The R3 rerun will
+re-measure both arms in one batch.
+The accounting headline is the aggregate triple **ΣproviderInput / N / resetCount** (v0.4.3
+ruler, recomputable per request record, §7.3); cache hit ratio is diagnostic-only.
 
 | Dimension | Status |
 | ----- | ----- |
 | Host | DeepSeek Harness `0.2.2-rc.1` (type anchor) / `rc.3` (runtime-tested) |
 | Dependencies | Zero npm dependencies; Node ≥ 22.18 (native type stripping) |
-| Tests | 339 cases green, zero API calls (mock full-chain + 20 scenarios + activation/desktop/new-capability/session-format/host-conformance regressions) |
+| Tests | 388 cases green, zero API calls (mock full-chain + 20 scenarios + activation/desktop/new-capability/session-format/protocol-composition/host-conformance/cache-and-plan-durability/prefix-fallback-with-mixed-tail-and-ruler regressions) |
 | Shape | Single bundle + **dedicated profile** (`profiles/stream` template); `dsh plugin remove` unwinds the whole layer and restores the host loop atomically |
 | Control bar | `dsh-stream-agent bar`: four modes + zh/en + intent triage, onboarding banner on load |
 | Desktop page | Left-rail **Control bar**: status + four mode cards + zh/en switch, **without touching the Electron shell** |
@@ -126,25 +126,17 @@ benchmarked" — we do not present unmeasured numbers as percentages.
 
 Mode → config mapping (explicit config > mode > built-in defaults):
 
-| Mode | `selfReadFeedback` | `enableCode` | `persistFallback` | Parallel | Stall reentries | `budgetTokens` |
+| Mode | `selfReadFeedback` | `enableCode` | `persistFallback` | Parallel | Reentries | `budgetTokens` |
 | --- | --- | --- | --- | --- | --- | --- |
-| `balanced` | `receipt` | `false` | `true` | 3 | 12 | — |
-| `lean` | `receipt` | `false` | `true` | 2 | 8 | 60,000 |
-| `compat` | `full` | `false` | `true` | 1 | 16 | — |
-| `power` | `receipt` | `true` | `true` | 3 | 14 | — |
-
-"Stall reentries" (v0.3.3) counts only **consecutive reentries that produced nothing new**.
-Reentries where the model kept reading/writing/running commands do not consume this budget —
-productive work is never killed by a counter. What still binds the turn is the hard request
-cap (2× reentries) plus a close-out window: one closing instruction (up to 2), and if no
-`tf-final` follows, a delivery note that explicitly marks the work as unfinished instead of
-dropping a half-finished session on the user.
-
+| `balanced` | `receipt` | `false` | `true` | 3 | 8 | — |
+| `lean` | `receipt` | `false` | `true` | 2 | 6 | 60,000 |
+| `compat` | `full` | `false` | `true` | 1 | 12 | — |
+| `power` | `receipt` | `true` | `true` | 3 | 10 | — |
 
 One-line decision guide: **stay on `balanced`; switch to `lean` when the bill matters;
 `compat` when diffing against the native loop; `power` for programmatic data work.**
 
-## 4. The tf-* protocol (11 commands)
+## 4. The tf-* protocol (14 commands, the v0.4.0 hard cap)
 
 The parser (`src/kernel/parser.ts`) is the authority; full semantics in
 [docs/protocol.md](docs/protocol.md).
@@ -161,12 +153,45 @@ The parser (`src/kernel/parser.ts`) is the authority; full semantics in
 | `tf-peek` | Fetch a line range from a handle | Injected on demand |
 | `tf-plan` | Declare/revise the plan and acceptance items (`- [id] description` lines) | State lives driver-side; requests carry **diffs only** |
 | `tf-final` | Finish (summary must contain the answer verbatim) | Flagged premature while acceptance items are unverified (F5) |
+| `tf-ask` (v0.4.0) | Blocking user question (`q` required; `header`/`options` comma-separated optional; maps to host ask_user_question) | The answer is injected in full (ask family, high); complex multi-question shapes via tf-call body |
+| `tf-skill` (v0.4.0) | Load a skill (`name`; maps to host skill) | Skill instructions injected in full (skill family, high); loading is session-level |
+| `tf-call` (v0.4.0) | Universal call channel: `name` = a host tool name in this session's frozen surface, body = JSON argument object (web/skill/job/schedule/goal/ask/todo/present/office/subagent all reachable) | Results classified by host tool family (read-type injected, write-type ledger); unknown-tool injects nearest-name suggestions; off with `toolSurface: off` or no host face (zero protocol chars) |
 | `tf-code` | Programmatic tool calls (**off by default**; `power` mode or explicit opt-in) | Values within the cap injected in full; over-limit → skeleton+handle; failures carry `kind` + retry verdict |
 
 Common attributes: `id` (auto-numbered when omitted), `depends_on` (cycles detected and
 named), `accepts` (acceptance links, F5). Two token-saving disciplines are written into the
 protocol text: **don't re-read files you just wrote** (you get a receipt) and **don't use
 tf-bash as a search tool** (tf-grep/tf-glob are cheaper and return matching lines only).
+
+### 4.1 Protocol slimming & customization (v0.4.1-beta.1) — per-request injection cost is configurable
+
+The protocol text is now composed from named sections (`src/kernel/protocol.ts`): 7 sections
+(syntax / plan / results / selfread / timing / finalSummary / rules) assembled per level;
+**the default composition is byte-identical to the 0.4.0-beta.1 text** (pinned by a golden
+test — zero cache regression). Token-saving knobs:
+
+| Config | Effect | Stable-prefix size (measured) |
+| --- | --- | --- |
+| `protocolLevel: 'full'` (default) | the 0.4.0 text; no config = no behavior change | 2,836 chars |
+| `protocolLevel: 'lean'` | all 7 sections kept, prose compressed (syntax table untouched) | 2,324 chars (−18.1%) |
+| `protocolLevel: 'minimal'` | syntax + iron rules only (selfread/timing dropped) | 1,446 chars (−49.0%) |
+| `enablePlan: false` | **hard-linked** drop of the plan section — the protocol no longer declares a command that would be rejected (0.4.0 gap: the section stayed) | another 285 chars saved |
+| `protocolSections: { timing: false, ... }` | per-section toggles; unknown ids fail fast; sections absent from the level can be added back | 86–901 chars each |
+| `protocolAppend: 'project rules…'` | custom rules **appended** after the call section — add one rule without copying the 2,836-char default | as needed |
+| `invariants: false` | invariants block not injected at all (string-replacement semantics unchanged) | another 242 chars saved |
+
+Reference combo: `protocolLevel: 'minimal'` + `enablePlan: false` = **1,161 chars (40.9% of the
+default full)**. Preview and verify: `dsh-stream-agent protocol --level minimal --stats-only` —
+per-section chars, total vs full, savings percentage; `--sections`/`--append`/`--code` simulate
+assembly effects; `--json` for machines. All numbers are measured source-text sizes pinned by
+`test/v041-protocol.test.ts`; the protocol rides the stable prefix and is billed every request
+(cache reads are cheaper) — no unmeasured token conversions are claimed here.
+
+Precedence: explicit `protocolText` (full replacement) > `protocolLevel`/`protocolSections` >
+default full. Level and section config are **frozen at construction** (part of the stable
+prefix, never mutates mid-session — O4 red line unchanged); with `enablePlan: false` the
+command-level failure guard stays (protocol does not declare it + driver rejects it —
+defense in depth).
 
 ## 5. Plan, recovery, long sessions (on by default, each with an off switch)
 
@@ -253,7 +278,7 @@ Every tool runs offline with zero API calls; real-machine batches are executed m
 
 | Tool | Purpose | Current evidence |
 | --- | --- | --- |
-| `eval/tools/summarize.cjs` | M1 four-component totals (input/cache-read/cache-write/output; missing components marked "unavailable") | Stamp 2026-11-15-v02: baseline 446,410 → plugin 129,178 (28.9%), per-task rows in summary.json |
+| `eval/tools/summarize.cjs` | M1 four-component totals (input/cache-read/cache-write/output; missing components marked "unavailable") | Stamp 2026-11-15-v02: baseline 446,410 → plugin 129,178 (**four-component 28.9%**; uncached input 33,028→42,782, cache read 393,728→58,112, cache write 0→0, output 19,654→28,284), requests 50 → 59, checks 9/10 — four-column table below; per-task rows in summary.json |
 | `eval/tools/replay-check.cjs` | M3 replay consistency (replayed tree hash == live tree hash) | Plugin arm **10/10** after fixing two extractor root causes; the native-loop arm's limitation is recorded honestly |
 | `eval/tools/t3-cells.cjs` | M2 T3 three-cell baseline (B / A-1a / A-1b first-request split) | Script + three patch arms ready; the tf-code section measures 1,175 chars; cell numbers await a same-batch real run |
 | `eval/tools/runner.cjs` | R3 eval matrix (two arms × 10 tasks + sentinels) | 0.3.0 rerun pending (new protocol surface) |
@@ -261,35 +286,57 @@ Every tool runs offline with zero API calls; real-machine batches are executed m
 | `npm run check` | R2 assembly/doc consistency (4 checks) | Re-runnable with one command |
 | `npm run gate` | R4 release gate (6 items) | Offline items judged in place; real-machine items (G5/G6) marked honestly — no release until green |
 
+**External tables always carry four columns** (checklist P1-4; a metric missing any column
+must not be quoted externally):
+
+| Batch | Requests (baseline vs plugin) | Two-component: uncached input + output | Four-component: uncached input + cache read + cache write + output | checks |
+| --- | --- | --- | --- | --- |
+| 2026-11-15-v02 (10 tasks total) | 50 vs 59 (+18%) | 52,682 → 71,066 (**134.9%**, higher on the plugin side) | 446,410 → 129,178 (**28.9%**) | 9/10 |
+
+> Labelling discipline (2026-11-22 audit, corrected per the compliance check §3): "input"
+> always means **uncached input**; cache read is a separate column counted into the
+> four-component total but not into the strict two-component total. Historical data had two
+> same-named fields with different meanings (`M1_tokens.input` = uncached + cache read +
+> cache write vs `summary.json` `inputTokens` = uncached); the canonical terms are defined
+> in `eval/METRICS.md` (historical metrics.json left as-is). **22.3% (840,138 → 187,290)
+> was a cache-read double-counted wrong figure and is retired** — it was labelled "the
+> 0.2.0 earlier batch's four-component total", a batch that does not exist. A headline
+> quoting a single percentage is disqualified. Component-level originals:
+> [eval/RESULTS.md](eval/RESULTS.md) §6.1.
+
 Discipline: per-task tokens = Σ(input + cacheRead + cacheWrite + output) (four components,
 per-request usage kept verbatim); missing cache components are marked "unavailable", never
 zero-filled; title side-requests are excluded from both arms; the two-component figure is
-reference-only and always labelled.
+reference-only and always labelled. **Any external number must present all four columns
+(requests / two-component / four-component / checks) in one table** — checklist P1-4;
+external headlines never lead with a single multiple or a hit ratio.
 
-### 7.1 Single-session measurement: with vs. without the plugin (V0.3.3)
+### 7.3 v0.4.3 ruler: ΣproviderInput / N / resetCount (externally recomputable)
 
-2026-11-21, real desktop sessions, same model, same task, same starting context, one run on
-each arm (`deepseek-flash`; usage summed from per-request originals):
+Each request record (driver ledger `kind:'request'`) carries: `prefixTokensEst` (local
+estimate = ⌈Σ message chars / 4⌉, cross-check only), `providerInputTokens` (billed input =
+uncached input + cacheRead + cacheWrite, authoritative), `cacheRead` / `cacheWrite` /
+`output`, `resetSeq` / `resetCause` (reset epoch and cause: `segment-drop` /
+`prefix-reset`), and `feedbackBytes{full,dedup,handle}` (feedback byte classes; `dedup`
+lands with P0-4 in 0.5.0 and stays 0 in 0.4.3).
 
-| Metric | Without plugin | With V0.3.3 | Change |
-| --- | ---: | ---: | ---: |
-| **Total tokens** | 600,410 | **109,546** | **−81.8%** (5.48×) |
-| **Uncached input** | 14,471 | **8,840** | **−38.9%** |
-| Cache read | 548,864 | 83,200 | −84.8% |
-| Output | 37,075 | 17,506 | −52.8% |
-| Cache hit rate | 97.4% | 90.4% | −7.0 pt |
+- **ΣproviderInput** = Σ `providerInputTokens` over request records (=
+  `cacheStats().providerInputSum`);
+- **N** = number of request records (= `cacheStats().requests`);
+- **resetCount** = the last record's `resetSeq` (= `cacheStats().resetCount`).
 
-Denominator: `total = uncached input + cache read + output` (**DISJOINT** — cache is listed
-separately and never double-counted into input). Both rows add up exactly to the reported
-totals: `14,471 + 548,864 + 37,075 = 600,410` and `8,840 + 83,200 + 17,506 = 109,546`.
+Seven-column derivation (P0-10, per release): `N` = request count; `inputPerPass` =
+ΣproviderInput / passing tasks; `outputPerPass` = Σoutput / passing tasks; `costPerPass` =
+Σᵣ(uᵣ·p_u + cᵣ·p_c + wᵣ·p_w + oᵣ·p_o) / passing tasks — **price multipliers are never
+hardcoded; they come from the release-day price snapshot (`eval/price-snapshot.json`,
+mechanism in `eval/METRICS.md` §9); until the snapshot is filled the column is marked
+"awaiting price snapshot"**; `resetCount` as above; `cacheReadAbs` = Σ`cacheRead`;
+`checks` comes from the eval run. A release missing any column is not a result (an
+awaiting-snapshot costPerPass is an honest label, not an omission).
 
-**Why the hit rate dropped by 7 points (stated plainly)**: a hit rate is a ratio. The plugin
-cuts requests and injected volume by an order of magnitude, so while uncached input also fell
-from 14,471 to 8,840 (−38.9%), cache reads fell much harder (548,864 → 83,200, −84.8%) and the
-ratio moved from 97.4% to 90.4%. What drives the bill is the **absolute volume of uncached
-input** and the **total**; shrinking the total is the goal and the hit rate is a by-product.
-When comparing hit rates across approaches, fix the task and context size and always report
-absolute volumes — percentages alone support the opposite conclusion.
+`cacheHitRatio` stays **diagnostic-only**: the denominator shrinks as totals compress, so
+the ratio and low cost necessarily diverge in this plugin shape (checklist §0.5) — it is
+not a gate and never a headline.
 
 ## 8. Control bar & desktop page
 
@@ -302,6 +349,9 @@ absolute volumes — percentages alone support the opposite conclusion.
   - `status` / `mode <balanced|lean|compat|power>` / `lang <zh|en>` / `--json`;
   - `intents` lists per-session "intent without receipt" (F6 triage); `intents --ack
     <session>` closes them after a human check;
+  - `protocol` composition preview (v0.4.1): per-section chars, total vs full, composed text —
+    `--level <full|lean|minimal>`, `--sections plan=off,...`, `--no-plan`, `--append "…"`,
+    `--code`, `--stats-only`, `--json`; preview the slimming before writing it into config;
   - `help` prints the full mode guide.
 - **Desktop page**: the client sidebar panel shows takeover state, current mode and source,
   six effective parameters, four mode cards (when to choose / trade-offs + saving tier +
@@ -317,7 +367,7 @@ absolute volumes — percentages alone support the opposite conclusion.
 ```
 dsh-stream-agent/
 ├── src/
-│   ├── kernel/            # parser / render / obs / gate / state / modes / control-bar
+│   ├── kernel/            # parser / render / obs / gate / state / modes / control-bar / protocol
 │   │                      #   (zero deps, no IO, unit-testable in isolation)
 │   └── entry/             # Cordis shell: loop (driver+factory) / ptc-bridge / intent-log /
 │                          #   json-persistence / state-handle / obs-broker / action-gate /
@@ -325,7 +375,7 @@ dsh-stream-agent/
 │                          #   cordis-compat / takeover-registry
 ├── ui/                    # Desktop control page subpackage (own dsh.client; the main package
 │                          #   must not declare one)
-├── dist/                  # Build output (25 files, committed, referenced by patches)
+├── dist/                  # Build output (28 files, committed, referenced by patches)
 ├── profiles/
 │   ├── stream/            # S1 dedicated profile template (web entry + registry override)
 │   └── stream-headless/   # S1 headless entry variant
@@ -338,14 +388,14 @@ dsh-stream-agent/
 │                          #   disabled-lines-audit / v0.4.0-plan / TEST-PROPOSITIONS
 ├── scripts/               # build / check-consistency / gate / install-check / install-cycle /
 │                          #   repair-session-logs / release
-└── test/                  # 339 cases (2 kernel + 22 entry suites + 20 mock scenarios; zero API)
+└── test/                  # 388 cases (2 kernel + 26 entry suites + 20 mock scenarios; zero API)
 ```
 
 ## 10. Development
 
 ```bash
-npm test          # 339/339, zero API calls
-npm run build     # emits dist/ (25 files) + smoke imports + desktop-page build gates
+npm test          # 388/388, zero API calls (1 preloaded skip)
+npm run build     # emits dist/ (28 files) + smoke imports + desktop-page build gates
 npm run check     # R2: assembly & doc consistency (4 checks)
 npm run gate      # R4: release gate (6 items; real-machine items marked honestly)
 node eval/tools/f6-kill-drill.cjs --rounds 10   # F6 kill drill (offline, zero API)
@@ -356,7 +406,7 @@ npm run release:dry
 
 | Doc | Content |
 | --- | --- |
-| [docs/protocol.md](docs/protocol.md) | Protocol grammar and closed-loop semantics (11 commands + F5/F6/F7) |
+| [docs/protocol.md](docs/protocol.md) | Protocol grammar and closed-loop semantics (14 commands + F5/F6/F7 + v0.4.1 composition) |
 | [docs/limitations.md](docs/limitations.md) | Known limitations (ordered by "will you hit it", each with evidence) |
 | [docs/adr-001-segment-boundary.md](docs/adr-001-segment-boundary.md) | Segment boundary ADR (whole-block discard vs host compaction) |
 | [docs/disabled-lines-audit.md](docs/disabled-lines-audit.md) | Disabled-lines audit table (S5: why each row is kept/disabled) |
