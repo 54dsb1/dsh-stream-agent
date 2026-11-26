@@ -117,6 +117,31 @@ test('S4. degradedLine 三级文案各不相同（§8.3：每级一行注入）'
   assert.ok(degradedLine('stale').startsWith('[tf-stream:degraded surface=stale]'));
 });
 
+test('S4b. tf- 前缀被外部工具占用 → degraded=reserved（结构化暴露，不静默丢弃）', async () => {
+  // 0.6.0 复查修复：此前 violations 被映射成 degraded: undefined，占用事实算完即焚。
+  const squatter: readonly HostToolSchemaLike[] = [
+    ...HOST_TOOLS,
+    { name: 'tf-external-tool', description: '第三方占用了保留前缀', parameters: {} },
+  ];
+  const service: ToolsServiceLike = {
+    resolve: () => Promise.resolve({ ok: true }),
+    schemas: () => squatter,
+  };
+  const holder = new ToolSurfaceHolder(service, { policy: 'reserved-only', profile: 'full', nativeTools: true, callCommand: true });
+  const surface = await holder.resolve({ agent: {} });
+  assert.ok(surface !== undefined);
+  assert.equal(surface.degraded, 'reserved', '占用必须以 reserved 降级级暴露');
+  assert.ok(surface.names.includes('tf-external-tool'), 'fail-open：工具照常透传进面');
+  // 正常面不注降级（回归：修复不得让无占用的常态也报 reserved）
+  const clean = new ToolSurfaceHolder(fakeToolsService(), { policy: 'reserved-only', profile: 'full', nativeTools: true, callCommand: true });
+  const cleanSurface = await clean.resolve({ agent: {} });
+  assert.equal(cleanSurface?.degraded, undefined);
+  // 第 4 级文案与既有三级互不相同（§8.3 每级一行注入）
+  const lines = new Set([degradedLine('stale'), degradedLine('core'), degradedLine('protocol-only'), degradedLine('reserved')]);
+  assert.equal(lines.size, 4);
+  assert.ok(degradedLine('reserved').startsWith('[tf-stream:degraded surface=reserved]'));
+});
+
 // ---------------------------------------------------------------- 驱动器 E2E
 
 interface Harness {
@@ -257,7 +282,7 @@ test('S8. familyHint：tf-call 的观测按宿主工具名分族（web_search �
     const obs = h.driver.snapshot().records.filter((r) => r.kind === 'observation');
     const web = obs.find((r) => (r as { handle?: string }).handle?.startsWith('obs:web:'));
     assert.ok(web !== undefined, `web_search 归 web 族（handle=obs:web:...），实际 ${JSON.stringify(obs.map((r) => (r as { handle?: string }).handle))}`);
-    assert.equal((web as { infoGain?: string }).infoGain, 'high', 'web 族首注 high');
+    assert.equal((web as { infoGain?: string }).infoGain, 'full', 'web 族首注 high');
   } finally {
     h.cleanup();
   }
@@ -410,11 +435,12 @@ test('S13. §6.4 高频例外：tf-skill / tf-ask 映射宿主工具（免 JSON 
   }
 });
 
-test('S14. 命令表上限（G2）：14 条到达硬上限，检查5 口径与 parser 一致', async () => {
+test('S14. 命令表上限（G2）：0.6.0 正式版 17 条（v1.5.0 加 tf-changes/tf-diff/tf-revert），口径与 parser 一致', async () => {
   const { readFileSync } = await import('node:fs');
   const parserSrc = readFileSync(join(import.meta.dirname, '..', 'src', 'kernel', 'parser.ts'), 'utf8');
   const names = parserSrc.match(/const COMMAND_NAMES: readonly TfCommandName\[\] =\s*\[([^\]]*)\]/);
   assert.ok(names !== null);
   const count = names![1]!.split(',').filter((s) => s.includes('tf-')).length;
-  assert.equal(count, 14, 'tf-call + tf-ask + tf-skill = 14（§6.4 硬上限）');
+  // v0.4.0 硬上限 14；v1.5.0（0.6.0 正式版，changes 缺口修复）经 PROTOCOL §8.1 加语法流程 +3。
+  assert.equal(count, 17, '14 + tf-changes/tf-diff/tf-revert = 17（v1.5.0）');
 });

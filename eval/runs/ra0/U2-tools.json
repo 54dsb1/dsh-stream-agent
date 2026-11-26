@@ -1,0 +1,138 @@
+{
+  "id": "U2",
+  "question": "tools 字段能否由插件置空或裁剪；宿主是否补回自己的工具面",
+  "observation": "请求 tools 字段与宿主 request/header.tools",
+  "verdict": "supported",
+  "scope": "plugin-seam",
+  "hostVerification": "pending",
+  "reason": "真实驱动器：首请求 tools 字段缺省（0 schema）、后续 7/7 项（≤7）；端口未补回工具面。宿主是否强制补回需真机确认",
+  "requests": [
+    {
+      "index": 0,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 4054,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 4054,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 1,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 4054,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 a。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=1 上一步动作与结果]\n- r1 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r1@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        }
+      ],
+      "tools": 7,
+      "systemChars": 4054,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 2,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 4054,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 a。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=1 上一步动作与结果]\n- r1 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r1@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 b。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=2 上一步动作与结果]\n- r2 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r2@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        }
+      ],
+      "tools": 7,
+      "systemChars": 4054,
+      "hasReasoningBlocks": false
+    }
+  ],
+  "diff": [
+    "每请求声明工具数 0 → 7 → 7（宿主面共 12 个）"
+  ],
+  "evidence": [
+    {
+      "at": "entry/loop.ts:3751",
+      "quote": "? (this.#lastPlan === null || this.#lastPlan.tools === null ? {} : { tools: this.#lastPlan.tools })"
+    },
+    {
+      "at": "kernel/assembly.ts:144",
+      "quote": "export function projectToolDecls("
+    }
+  ]
+}

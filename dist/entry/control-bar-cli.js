@@ -31,7 +31,13 @@ import {
 } from '../kernel/control-bar.js';
                                                                    
 import { VERSION } from '../version.js';
-import { controlFileOf, readPersistedControl, writePersistedControl } from './control-state.js';
+import { controlFileOf, parseSwitchValue, readPersistedControl, updatePersistedLimits, writePersistedControl } from './control-state.js';
+import {
+  LIMIT_SPECS,
+  formatLimitValue,
+  parseLimitAssignments,
+  publicLimitCatalog,
+} from '../kernel/limits.js';
 import { ControlSession } from './control-session.js';
 import { resolveStateDir } from './json-persistence.js';
 import { appendIntentRecord, intentFileOf, loadIntentRecords, pendingIntents } from './intent-log.js';
@@ -63,9 +69,14 @@ function usage(lang      )           {
     '  dsh-stream-agent status [--json]            ' + (zh ? '当前通道/档位与语言' : 'current channel/tier and language'),
     '  dsh-stream-agent channel <standard|code>    ' + (zh ? '① 执行通道' : 'block A: execution channel'),
     '  dsh-stream-agent tier <light|standard|deep> ' + (zh ? '② 上下文档位（只改数值）' : 'block B: context tier (numbers only)'),
-    '  dsh-stream-agent mode <balanced|lean|compat|power>',
-    '        ' + (zh ? '旧模式值（0.5.x 别名 → channel/tier，0.6.0 移除）' : 'legacy mode value (0.5.x alias → channel/tier, removed in 0.6.0)'),
+    '  dsh-stream-agent fold <on|off|toggle>        ' + (zh ? '④ 上下文折叠（压缩 / 效果折叠 / 段边界）' : 'block D: context fold (compaction / effects / segment boundary)'),
+    '  dsh-stream-agent final <on|off|toggle>       ' + (zh ? '④ 流末验收（tf-final / accepts）' : 'block D: final check (tf-final / accepts)'),
+    '  dsh-stream-agent raw <on|off|toggle>         ' + (zh ? '④ 上下文原样（完全不处理：不压缩/不折叠/不丢段/不去重/不截断）' : 'block D: raw context (no processing at all)'),
     '  dsh-stream-agent lang <zh|en>',
+    '  dsh-stream-agent limits [--json]             ' + (zh ? '列出全部可定义上限与当前值（未设 = 不限制）' : 'list every configurable limit and its value (unset = no cap)'),
+    '  dsh-stream-agent limits --set k=v[,k=v]      ' + (zh ? '定义上限（增量）；例 --set maxSteps=40,maxInputTokens=48000' : 'define limits (merge); e.g. --set maxSteps=40,maxInputTokens=48000'),
+    '  dsh-stream-agent limits --replace k=v        ' + (zh ? '整组替换（先清空再写入）' : 'replace the whole set'),
+    '  dsh-stream-agent limits --reset              ' + (zh ? '清空为"全部不限制"' : 'clear to "no caps"'),
     '  dsh-stream-agent intents [--ack <sessionId>] ' + (zh ? 'F6 意图核对：列出"有意图无回执"（--ack 人工确认后闭合）' : 'F6 intent triage: list intents without receipts (--ack to close)'),
     '  dsh-stream-agent protocol [--level <full|lean|minimal>] [--sections plan=off,...]',
     '        ' + (zh ? '协议组装预览：逐段字符数 + 总量对比 full + 组装全文（--stats-only 只看数字）'
@@ -259,6 +270,36 @@ export function protocolCommand(args                   , lang      )            
 // 命令分发
 // ---------------------------------------------------------------------------
 
+/** limits 子命令的分组展示（与 kernel/limits.ts 的 group 一一对应）。 */
+function renderLimitsLines(limits                                    , zh         )           {
+  const groups                                                = [
+    { id: 'budget', zh: '预算（轮数/token）', en: 'Budget (rounds/tokens)' },
+    { id: 'retrieval', zh: '取回与回灌', en: 'Retrieval & feedback' },
+    { id: 'compaction', zh: '压缩', en: 'Compaction' },
+    { id: 'rebase', zh: '换基与重入', en: 'Rebase & re-entry' },
+    { id: 'execution', zh: '并行', en: 'Concurrency' },
+    { id: 'code', zh: 'tf-code 配额', en: 'tf-code quota' },
+  ];
+  const lines           = [];
+  for (const group of groups) {
+    const specs = LIMIT_SPECS.filter((s) => s.group === group.id);
+    if (specs.length === 0) continue;
+    lines.push(`  ${zh ? group.zh : group.en}`);
+    for (const spec of specs) {
+      const value = limits[spec.key];
+      const shown = value === undefined ? (zh ? '未设（不限制）' : 'unset (no cap)') : formatLimitValue(spec.key, value);
+      lines.push(`    ${spec.key.padEnd(28)} ${shown.padEnd(14)} ${zh ? spec.zh : spec.en}`);
+    }
+  }
+  return lines;
+}
+
+function assertEmptyLimits(limits                        )       {
+  if (Object.keys(limits).length !== 0) {
+    throw new Error(`limits --reset 之后仍残留 ${Object.keys(limits).join(',')}`);
+  }
+}
+
 function main(argv                   )         {
   const args = [...argv];
   const json = args.includes('--json');
@@ -339,6 +380,47 @@ function main(argv                   )         {
       return 0;
     }
 
+    case 'fold':
+    case 'final':
+    case 'raw': {
+      // 0.6.0 区块 D：布尔开关（on/off/toggle；缺省 = toggle）。手工修改清除预设标记。
+      const current = command === 'fold'
+        ? state.contextFold !== false
+        : command === 'final'
+          ? state.finalCheck !== false
+          : state.contextRaw === true;
+      const target = rest[1];
+      let next         ;
+      if (target === undefined || target === 'toggle') {
+        next = !current;
+      } else {
+        const parsed = parseSwitchValue(target);
+        if (parsed === undefined) {
+          print([`${command}: on|off|toggle（${state.lang === 'zh' ? '当前' : 'current'} ${current ? 'on' : 'off'}）`]);
+          return 2;
+        }
+        next = parsed;
+      }
+      const nextState               = command === 'fold'
+        ? { ...state, contextFold: next }
+        : command === 'final'
+          ? { ...state, finalCheck: next }
+          : { ...state, contextRaw: next };
+      const file = save(nextState);
+      const label = command === 'fold'
+        ? t('foldLabel', state.lang)
+        : command === 'final'
+          ? t('finalLabel', state.lang)
+          : t('rawLabel', state.lang);
+      if (json) {
+        process.stdout.write(`${renderJson(nextState, { version: VERSION })}\n`);
+      } else {
+        print([`${label} → ${next ? t('switchOn', state.lang) : t('switchOff', state.lang)}`,
+          `${t('saved', state.lang)}: ${file}`]);
+      }
+      return 0;
+    }
+
     case 'mode': {
       // 0.5.x 别名（0.6.0 移除）：旧模式值 → (channel, tier)，输出一行 warn
       const target = rest[1];
@@ -356,7 +438,7 @@ function main(argv                   )         {
       if (json) {
         process.stdout.write(`${renderJson(next, { version: VERSION })}\n`);
       } else {
-        print([`${state.lang === 'zh' ? '旧模式' : 'legacy mode'} ${target} → channel=${mapped.channel} tier=${mapped.tier}（${state.lang === 'zh' ? '别名映射；0.5.x 保留，0.6.0 移除' : 'aliased; kept in 0.5.x, removed in 0.6.0'}）`,
+        print([`${state.lang === 'zh' ? '旧模式' : 'legacy mode'} ${target} → channel=${mapped.channel} tier=${mapped.tier}（${state.lang === 'zh' ? '别名映射' : 'aliased'}）`,
           `${t('saved', state.lang)}: ${file}`]);
       }
       return 0;
@@ -433,6 +515,52 @@ function main(argv                   )         {
       return result.code;
     }
 
+    case 'limits': {
+      // 0.5.2：所有行为上限由用户定义（插件不预设）。未出现的键 = 不限制。
+      const zh = state.lang === 'zh';
+      const tail = rest.slice(1);
+      const setIndex = tail.indexOf('--set') >= 0 ? tail.indexOf('--set') : tail.indexOf('--replace');
+      const replace = tail.includes('--replace');
+      if (tail.includes('--reset')) {
+        const { file, limits } = updatePersistedLimits({}, { replace: true });
+        print([zh ? `已清空全部上限（= 不限制）：${file}` : `Cleared every limit (= no caps): ${file}`]);
+        assertEmptyLimits(limits);
+        return 0;
+      }
+      if (setIndex >= 0) {
+        const raw = tail.slice(setIndex + 1).join(' ').replace(/[,;]/g, ' ').trim();
+        const assignments = raw.split(/\s+/).filter((s) => s !== '');
+        const parsed = parseLimitAssignments(assignments);
+        if (parsed.errors.length > 0) {
+          print([zh ? '参数有误：' : 'Invalid arguments:', ...parsed.errors.map((e) => `  - ${e}`)]);
+          return 2;
+        }
+        if (Object.keys(parsed.patch).length === 0) {
+          print([zh ? '未提供任何上限（例：--set maxSteps=40,maxInputTokens=48000）' : 'No limits given (e.g. --set maxSteps=40,maxInputTokens=48000)']);
+          return 2;
+        }
+        const { file, limits } = updatePersistedLimits(parsed.patch, { replace });
+        print([
+          zh ? `已写入 ${Object.keys(parsed.patch).length} 项上限${replace ? '（整组替换）' : '（增量）'}：${file}` : `Wrote ${Object.keys(parsed.patch).length} limit(s)${replace ? ' (replaced)' : ' (merged)'}: ${file}`,
+          ...renderLimitsLines(limits, zh),
+        ]);
+        return 0;
+      }
+      const { limits } = readPersistedControl();
+      if (json) {
+        process.stdout.write(`${JSON.stringify({ limits, catalog: publicLimitCatalog(limits) }, null, 2)}\n`);
+        return 0;
+      }
+      print([
+        zh ? '行为上限（未设 = 不限制；0 = 显式不限制）' : 'Behavior limits (unset = no cap; 0 = explicitly no cap)',
+        ...renderLimitsLines(limits, zh),
+        '',
+        zh ? '定义方式：--set maxSteps=40,maxInputTokens=48000   清空：--reset' : 'Define: --set maxSteps=40,maxInputTokens=48000   Clear: --reset',
+        zh ? '也可写进 preset 的 config.limits / config.limitsByChannel' : 'Or set config.limits / config.limitsByChannel in the preset',
+      ]);
+      return 0;
+    }
+
     case 'bar': {
       const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true && !once;
       if (!interactive) {
@@ -445,7 +573,7 @@ function main(argv                   )         {
     }
 
     default:
-      print([`${t('usage', state.lang)}: dsh-stream-agent [bar|status|channel|tier|mode|lang|intents|protocol|help]`]);
+      print([`${t('usage', state.lang)}: dsh-stream-agent [bar|status|channel|tier|fold|final|raw|mode|lang|limits|intents|protocol|help]`]);
       return 2;
   }
 }

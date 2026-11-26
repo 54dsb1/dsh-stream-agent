@@ -1,10 +1,11 @@
 // test/v043-prefix.test.ts —— v0.4.3 P0-6 前缀退路 + P0-7① 尺子回归（升级清单 §4/§7）
 //
-// 门禁判据（清单 §7 0.4.3 行）：
-//   ① append 漂移探针：恰好 1 次放行、1 条 prefix-reset、任务完成；
-//   ② stable 漂移探针：0 放行、1 条可诊断错误、blocked 且存在 fallback final；
-//   ③ 「每回合必漂移」探针：第 4 次不静默通过（每会话放行预算 3 次）；
-//   ④ 前缀破坏收场：pending intent 全落 unknown（最小对账），悬空 0；
+// 门禁判据（0.6.1 修订：前缀不单调默认"接受继续"）：
+//   ① append 漂移探针：接受为缓存重置点、1 条 prefix-reset、任务完成、0 额外请求；
+//   ② stable 漂移探针：同样接受继续（P2）；fail-closed 收场面只在显式 prefixPolicy='fail'
+//     下保留（P2b / P4）——blocked 且存在 fallback final、最小对账；
+//   ③ 「每回合必漂移」探针：5 个回合全部完成（无放行预算——接受 0 额外开销，限流退役）；
+//   ④ 前缀破坏收场（显式 fail 面）：pending intent 全落 unknown（最小对账），悬空 0；
 //   尺子：ΣproviderInput / N / resetCount 可外部复算；prefixTokensEst / feedbackBytes /
 //   resetSeq / resetCause 落 request 记录；cacheHitRate 标 diagnostic-only。
 //
@@ -194,6 +195,8 @@ function makeProbe(
   const driver = new SingleStreamDriver(ports, {
     provider: 'mock',
     model: 'mock-v043',
+    // 0.5.1（1.1）：前缀/收束探针覆盖 0.4.x 收束机制 → 回退开关
+    requireFinal: true,
     ...config,
   });
   for (const task of tasks) driver.pushUserTask(task);
@@ -233,22 +236,56 @@ test('P1（探针①）. append 漂移 → 恰好 1 次放行、1 条 prefix-res
 
 // ---------------------------------------------------------------- 探针② stable 漂移
 
-test('P2（探针②）. stable 漂移 → 0 放行、prefix-broken 可诊断、blocked 且存在兜底交付', async () => {
+test('P2（探针②）. stable 漂移 → 接受为缓存重置点：同一份 next 照常发送、任务完成、0 额外请求（0.6.1）', async () => {
+  // 0.6.1：前缀不单调（含 stable-drift）默认全部**接受**——发送前放行同一份 next（0 额外
+  // 请求 / 0 注入文本），基线随本请求推进，对话不中断。fail-closed 面由 P2b
+  // （prefixPolicy='fail' 显式回退面）单独钉住。
+  //
   // R1: 写文件 ok（无 final → nudge）；R2 装配时探针篡改 R1 稳定段（index 1）→ stable-drift
-  // → fail-closed：不发第二个请求、最小对账、兜底交付（tf-write ok → 有台账事实可交付）。
+  // → 接受 → R2 照常发送（本响应自带 final 收尾）。
   const responses: ReadonlyArray<readonly StreamChunkLike[]> = [
     [textDelta('写文件。\n'), textDelta('<tf-write path="p.txt" id="w1">P</tf-write>\n'), finishStop()],
-    // R2 不会发出（fail-closed 在发送前拦截）
+    [textDelta('写入已确认：p.txt 内容 P 已落盘核对一致。\n'), textDelta('<tf-final id="f1" summary="p.txt 已写入并核对：内容 P，无未完成项。"/>\n'), finishStop()],
   ];
   const harness = makeProbe(responses, ['写一个文件。'], { faultPrefixDrift: { kind: 'stable' } });
   try {
     const reason = await harness.driver.runTurn();
-    assert.equal(reason.kind, 'blocked', 'stable-drift 必须 0 放行、fail-closed 收场');
-    assert.ok(reason.kind === 'blocked' && (reason.detail ?? '').includes('前缀校验失败'), 'blocked 文案可诊断');
+    assert.equal(reason.kind, 'completed', `stable-drift 必须接受继续：${JSON.stringify(reason)}`);
+    assert.equal(harness.prompts.length, 2, '接受 = 同一份 next 照常发送（0 额外请求）');
+    assert.equal(faultsOf(harness, 'prefix-reset').length, 1, '恰 1 条 prefix-reset（可诊断）');
+    assert.equal(faultsOf(harness, 'prefix-broken').length, 0, '默认策略不再 fail-closed');
+    assert.equal(faultsOf(harness, 'prefix-auto-continue').length, 0, '接受路径不需要续跑');
+    const detail = faultsOf(harness, 'prefix-reset')[0]!.detail ?? '';
+    assert.ok(detail.includes('cause=stable-drift'), 'prefix-reset 必须带成因');
+    assert.ok(detail.includes('stablePrefixLen'), 'prefix-reset 必须带 stablePrefixLen（判定依据）');
+    assert.ok(detail.includes('接受为缓存重置点'), '处置语义进台账');
+    // request 记录：R2 处于新纪元（resetSeq=1，cause=prefix-reset）
+    const records = requestRecordsOf(harness);
+    assert.equal(records[1]!.resetSeq, 1, 'R2 进入重置新纪元');
+    assert.equal(records[1]!.resetCause, 'prefix-reset');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('P2b. prefixPolicy=\'fail\'（显式回退面）：stable 漂移仍 fail-closed（§12.4 保留面）', async () => {
+  // 显式配置"绝不换基，违约必报错"是用户的选择——0.6.1 把它作为唯一保留的 fail-closed 面。
+  const responses: ReadonlyArray<readonly StreamChunkLike[]> = [
+    [textDelta('写文件。\n'), textDelta('<tf-write path="p.txt" id="w1">P</tf-write>\n'), finishStop()],
+    // R2 不会发出（fail-closed 在发送前拦截）
+  ];
+  const harness = makeProbe(responses, ['写一个文件。'], {
+    faultPrefixDrift: { kind: 'stable' },
+    prefixPolicy: 'fail',
+    autoContinueOnPrefixFail: false,
+  });
+  try {
+    const reason = await harness.driver.runTurn();
+    assert.equal(reason.kind, 'blocked', '显式 fail 策略必须 fail-closed 收场');
     assert.ok(reason.kind === 'blocked' && (reason.detail ?? '').includes('stable-drift'), 'blocked 文案含成因 stable-drift');
     assert.equal(harness.prompts.length, 1, '0 放行：第二个请求不得发出');
     assert.equal(faultsOf(harness, 'prefix-broken').length, 1, '恰 1 条 prefix-broken（可诊断错误）');
-    assert.equal(faultsOf(harness, 'prefix-reset').length, 0, 'stable-drift 不放行');
+    assert.equal(faultsOf(harness, 'prefix-reset').length, 0, 'fail 策略不放行');
     assert.equal(faultsOf(harness, 'fallback-final').length, 1, '有 ok 命令 → 存在 fallback final（P0-6⑤）');
     assert.equal(harness.finalAnswers.length, 1, '兜底交付落成 assistant 消息');
     assert.ok(harness.finalAnswers[0]!.includes('[未完成交付]'), '兜底交付明确标注未完成（不伪造模型结论）');
@@ -260,10 +297,11 @@ test('P2（探针②）. stable 漂移 → 0 放行、prefix-broken 可诊断、
 
 // ---------------------------------------------------------------- 探针③ 每回合必漂移
 
-test('P3（探针③）. 每回合必漂移 → 前 3 次各放行一次，第 4 次不静默通过（每会话预算 3）', async () => {
+test('P3（探针③）. 每回合必漂移 → 每次都接受为缓存重置点，对话永不中断（0.6.1：无放行预算）', async () => {
+  // 旧契约（≤0.6.0）：append-drift 受限换基有会话预算 3 次，第 4 次降级 fail-closed →
+  // 对话中断。0.6.1：接受不产生任何额外请求/计费/注入，限流失去意义——5 个回合全部完成。
   // 每回合 2 请求：A=读文件（观测 durable 尾块留基线）、B=final 收敛。漂移在下一回合首请求
-  // 装配时触发（oncePerTurn）——回合 1 的基线无 durable 尾块不触发，回合 2/3/4 各放行一次
-  //（会话预算 3），回合 5 的漂移降级 fail-closed（第 4 次不静默通过）。
+  // 装配时触发（oncePerTurn）。
   const readFinal = (file: string, n: number): ReadonlyArray<readonly StreamChunkLike[]> => [
     [textDelta(`读 ${file}。\n`), textDelta(`<tf-read path="${file}" id="r${n}"/>\n`), finishStop()],
     [textDelta(`${file} 已核对，约定如下：示例文件，内容为占位文本，无阻塞项。\n`), textDelta(`<tf-final id="f${n}" summary="${file} 已核对：示例文件，约定一致，无未完成项。"/>\n`), finishStop()],
@@ -273,27 +311,25 @@ test('P3（探针③）. 每回合必漂移 → 前 3 次各放行一次，第 4
     ...readFinal('b.txt', 2),
     ...readFinal('c.txt', 3),
     ...readFinal('d.txt', 4),
-    // 回合 5 的漂移在装配时 fail-closed（第 4 次），后续响应不会消费
-    [textDelta('读 e。\n'), textDelta('<tf-read path="e.txt" id="r5"/>\n'), finishStop()],
+    ...readFinal('e.txt', 5),
   ];
   const harness = makeProbe(responses, ['读 a 收尾。', '读 b 收尾。', '读 c 收尾。', '读 d 收尾。', '读 e 收尾。'], {
     faultPrefixDrift: { kind: 'append', oncePerTurn: true },
   });
   try {
-    for (let i = 0; i < 4; i += 1) {
+    for (let i = 0; i < 5; i += 1) {
       const reason = await harness.driver.runTurn();
-      assert.equal(reason.kind, 'completed', `回合 ${i + 1} 应完成（放行第 ${i} 次或预算内）`);
+      assert.equal(reason.kind, 'completed', `回合 ${i + 1} 必须完成（接受继续，永不中断）：${JSON.stringify(reason)}`);
     }
-    assert.equal(faultsOf(harness, 'prefix-reset').length, 3, '会话预算内恰好 3 次放行（回合 2/3/4）');
-    const fifth = await harness.driver.runTurn();
-    assert.equal(fifth.kind, 'blocked', '第 4 次漂移不得静默通过');
-    assert.ok(fifth.kind === 'blocked' && (fifth.detail ?? '').includes('前缀校验失败'), '第 4 次收场文案可诊断');
-    assert.ok(fifth.kind === 'blocked' && (fifth.detail ?? '').includes('超出放行预算'), '第 4 次 = 预算耗尽降级 fail-closed');
-    assert.equal(faultsOf(harness, 'prefix-reset').length, 3, '预算耗尽后不再新增放行');
-    assert.equal(faultsOf(harness, 'prefix-broken').length, 1, '恰 1 条 prefix-broken');
-    // 回合 5 自身零命令（漂移发生在装配前）→ 零产出回合不写兜底交付（不伪造"已完成"，0.3.3 语义）
-    assert.equal(faultsOf(harness, 'fallback-final').length, 0, '零产出回合不伪造兜底交付');
-    assert.equal(faultsOf(harness, 'fallback-final-skipped').length, 1, '跳过事实如实落台账');
+    assert.equal(faultsOf(harness, 'prefix-broken').length, 0, '0 fail-closed（不再有预算耗尽降级）');
+    assert.equal(harness.prompts.length, 10, '每回合 2 请求 × 5 = 10（接受 = 0 额外请求）');
+    const resets = faultsOf(harness, 'prefix-reset');
+    assert.ok(resets.length >= 4, `每回合漂移都接受（实际 ${resets.length} 次）`);
+    for (const rec of resets) {
+      assert.ok((rec.detail ?? '').includes('cause=append-drift'), 'prefix-reset 必须带成因');
+      assert.ok((rec.detail ?? '').includes('接受为缓存重置点'), '处置语义进台账');
+    }
+    assert.ok(harness.finalAnswers.length >= 5, '5 个回合各自交付 final');
   } finally {
     harness.cleanup();
   }
@@ -301,7 +337,7 @@ test('P3（探针③）. 每回合必漂移 → 前 3 次各放行一次，第 4
 
 // ---------------------------------------------------------------- 探针④ 最小对账
 
-test('P4（探针④）. 前缀破坏收场 → pending intent 全落 unknown（悬空 0），ack 注明不重放不回滚', async () => {
+test('P4（探针④）. prefixPolicy=\'fail\' 下前缀破坏收场 → pending intent 全落 unknown（悬空 0），ack 注明不重放不回滚', async () => {
   const sandboxDir = mkdtempSync(join(tmpdir(), 'tf-v043-intent-'));
   try {
     const intentFile = intentFileOf(sandboxDir, 'probe-session');
@@ -313,7 +349,8 @@ test('P4（探针④）. 前缀破坏收场 → pending intent 全落 unknown（
     const harness = makeProbe(
       [[textDelta('写文件。\n'), textDelta('<tf-write path="p.txt" id="w1">P</tf-write>\n'), finishStop()]],
       ['写一个文件。'],
-      { faultPrefixDrift: { kind: 'stable' } },
+      // 0.6.1：最小对账挂在 fail-closed 收场链上——显式回退面（prefixPolicy='fail'）触发
+      { faultPrefixDrift: { kind: 'stable' }, prefixPolicy: 'fail', autoContinueOnPrefixFail: false },
       {
         reconcile: (cause) => {
           const acked = reconcilePendingIntents(intentFile, cause, seqState);
@@ -403,7 +440,7 @@ test('M0. 同一 mock 轨迹跑两次：renderHash 序列与 fault 序列逐字�
 
 // ================================================================ P0-7① 尺子
 
-test('M1. request 记录带 prefixTokensEst：= Σcontent 字符/4 上取整（对实际发送消息独立复算）', async () => {
+test('M1. request 记录带 prefixTokensEst：ASCII=Σcontent/4、CJK=0.7 token/字符（对实际发送消息独立复算）', async () => {
   const responses: ReadonlyArray<readonly StreamChunkLike[]> = [
     [textDelta('收尾。\n'), textDelta('<tf-final id="f1" summary="直接交付：任务无文件操作，答案原文如下。"/>\n'), finishStop()],
   ];
@@ -414,9 +451,17 @@ test('M1. request 记录带 prefixTokensEst：= Σcontent 字符/4 上取整（�
     const records = requestRecordsOf(harness);
     assert.equal(records.length, 1);
     const sent = harness.wireMessages[0]!;
-    let chars = 0;
-    for (const m of sent) chars += m.content.map((b) => b.text ?? '').join('').length;
-    assert.equal(records[0]!.prefixTokensEst, Math.ceil(chars / 4), '估算 = Σ消息 content 字符 / 4 上取整（与 O5 阶梯同启发式）');
+    // 0.5.2：估算口径按 CJK 加权（汉字 ≈0.7 token/字符，ASCII 仍 4 字符/token）——
+    // 纯 /4 会把中文前缀低估 ~2.8 倍，让压缩触发得太晚。
+    let ascii = 0;
+    let wide = 0;
+    for (const m of sent) {
+      for (const ch of m.content.map((b) => b.text ?? '').join('')) {
+        if (ch.codePointAt(0)! >= 0x2e80) wide += 1;
+        else ascii += 1;
+      }
+    }
+    assert.equal(records[0]!.prefixTokensEst, Math.ceil(ascii / 4 + wide * 0.7), '估算 = ASCII/4 + CJK×0.7 上取整');
     assert.ok(records[0]!.prefixTokensEst! > 0);
   } finally {
     harness.cleanup();
@@ -514,7 +559,8 @@ test('M5. feedbackBytes 分类：全量观测=full、自写回验回执=handle�
     [textDelta('回验 w。\n'), textDelta('<tf-read path="w.txt" id="r2"/>\n'), finishStop()],
     [textDelta('回验通过：写入成功且无错误注入，内容一致。\n'), textDelta('<tf-final id="f1" summary="w.txt 已写入并回验：写入成功，无错误注入。"/>\n'), finishStop()],
   ];
-  const harness = makeProbe(responses, ['写后回验收尾。']);
+  // 0.5.1（2.2）：M5 覆盖自写回验 receipt 的字节分类 → 显式走回退点（默认已改 full）
+  const harness = makeProbe(responses, ['写后回验收尾。'], { selfReadFeedback: 'receipt' });
   try {
     const reason = await harness.driver.runTurn();
     assert.equal(reason.kind, 'completed', JSON.stringify(reason));

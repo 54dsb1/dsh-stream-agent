@@ -44,7 +44,7 @@ export type SurfaceProfile = 'core' | 'standard' | 'full';
 export const RESERVED_TOOL_PREFIX = 'tf-';
 
 /** 面降级时注入的一行告警（每级都有一行注入 + 台账）。 */
-export function degradedLine(level: 'stale' | 'core' | 'protocol-only'): string {
+export function degradedLine(level: 'stale' | 'core' | 'protocol-only' | 'reserved'): string {
   switch (level) {
     case 'stale':
       return '[tf-stream:degraded surface=stale] 本请求工具面沿用上一次冻结（重新解析失败，详见台账）';
@@ -52,6 +52,8 @@ export function degradedLine(level: 'stale' | 'core' | 'protocol-only'): string 
       return '[tf-stream:degraded surface=core] 工具面降级为 core 白名单（schema 成本超预算或部分解析失败）';
     case 'protocol-only':
       return '[tf-stream:degraded surface=protocol-only] 宿主工具面不可用：回到纯文本协议（tf-* 七工具映射 + tf-call 不可用）';
+    case 'reserved':
+      return '[tf-stream:degraded surface=reserved] 工具面含占用 tf- 保留前缀的外部工具（照常透传；tf-* 命令语义仍归本插件）';
   }
 }
 
@@ -80,8 +82,9 @@ export interface ToolSurface {
   readonly definitions: ReadonlyMap<string, HostToolSchemaLike>;
   /** 冻结时点的准入视图（strictAdmission 开启时透传 execute；beta 缺省关闭）。 */
   readonly toolSet?: unknown;
-  /** 降级行（undefined = 无降级）。驱动器负责注入与台账。 */
-  readonly degraded?: 'stale' | 'core' | 'protocol-only';
+  /** 降级行（undefined = 无降级）。驱动器负责注入与台账。
+   *  'reserved' = 宿主面出现占用 tf- 保留前缀的外部工具（§6.3 约束 1；fail-open 注入一行）。 */
+  readonly degraded?: 'stale' | 'core' | 'protocol-only' | 'reserved';
   /** 冻结序号：会话内首次请求 = 1；additions-only。 */
   readonly frozenAt: number;
 }
@@ -155,6 +158,8 @@ export class ToolSurfaceHolder {
       if (!Array.isArray(all)) throw new Error('tools.schemas returned non-array');
       // §6.3 约束 1：tf- 前缀保留给本插件——外部占用在解析面直接暴露（fail-open：
       // 工具照常透传，但降级行注入让模型与用户都知道面被污染）。
+      // 修复（0.6.0 复查）：此前 violations 映射成 degraded: undefined（反向），占用事实
+      // 被静默丢弃——检查算完即焚，违反本文件头部"不静默"的声明。现在映射为 'reserved' 级。
       const violations = reservedPrefixViolations(all.map((d) => String(d.name)));
       const previous = this.current;
       const names = mergeNames(previous?.names ?? [], all.map((d) => String(d.name)));
@@ -170,7 +175,7 @@ export class ToolSurfaceHolder {
           : [],
         names,
         definitions,
-        ...(violations.length > 0 ? { degraded: undefined } : {}),
+        ...(violations.length > 0 ? { degraded: 'reserved' as const } : {}),
         toolSet,
         frozenAt: (previous?.frozenAt ?? 0) + 1,
       };

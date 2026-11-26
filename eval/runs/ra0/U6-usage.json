@@ -1,0 +1,140 @@
+{
+  "id": "U6",
+  "question": "请求头 / usage 是否暴露逐请求 cacheRead / cacheWrite",
+  "observation": "eval-probe 逐请求 usage 原文",
+  "verdict": "supported",
+  "scope": "plugin-seam",
+  "hostVerification": "pending",
+  "reason": "真实驱动器 3 个请求的 request 记录都带 cacheRead/cacheWrite，且 providerInputTokens = 未命中 + 缓存读 + 缓存写（640/643/646）——可外部复算",
+  "requests": [
+    {
+      "index": 0,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3502,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3502,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 1,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3502,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 a。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=1 上一步动作与结果]\n- r1 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r1@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3502,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 2,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3502,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 a。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=1 上一步动作与结果]\n- r1 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r1@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 b。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=2 上一步动作与结果]\n- r2 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r2@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3502,
+      "hasReasoningBlocks": false
+    }
+  ],
+  "diff": [
+    "请求 1: providerInput=640 cacheRead=500 cacheWrite=40",
+    "请求 2: providerInput=643 cacheRead=501 cacheWrite=41",
+    "请求 3: providerInput=646 cacheRead=502 cacheWrite=42"
+  ],
+  "evidence": [
+    {
+      "at": "entry/loop.ts:3107",
+      "quote": "requestRecord.cacheRead = u.cacheReadTokens;"
+    },
+    {
+      "at": "entry/loop.ts:3106",
+      "quote": "requestRecord.providerInputTokens = u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens;"
+    }
+  ]
+}

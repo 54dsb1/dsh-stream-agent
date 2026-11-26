@@ -77,9 +77,12 @@ function runTask(task, arm, runDir, apiKey, timeoutSec) {
     fs.copyFileSync(path.join(FIXTURES, s.fixture), dst);
   }
 
-  const patch = arm === 'baseline' ? PATCH_BASELINE : PATCH_STREAM;
+  // 0.5.0 four-arm: --patch selects the arm's patch overlay (L0/L1/L2/L3);
+  // omitted => legacy behavior (baseline|stream).
+  const patch = arg('patch', '') || (arm === 'baseline' ? PATCH_BASELINE : PATCH_STREAM);
   const env = { ...process.env, DSH_EVAL_PROBE_DIR: probeDir };
-  if (arm === 'stream') env.STREAM_LOOP_EVAL_DUMP = path.join(taskDir, 'driver-');
+  // four-arm: dump only for stream-side arms (patch name contains 'stream')
+  if (patch.includes('stream')) env.STREAM_LOOP_EVAL_DUMP = path.join(taskDir, 'driver-');
   if (apiKey) env.DEEPSEEK_API_KEY = apiKey;
   else delete env.DEEPSEEK_API_KEY;
 
@@ -198,8 +201,10 @@ function runTask(task, arm, runDir, apiKey, timeoutSec) {
 
 function main() {
   const arm = arg('arm', '');
-  if (arm !== 'baseline' && arm !== 'stream') {
-    console.error('--arm ������ baseline �� stream');
+  // 0.5.0 four-arm: any label is allowed when --patch is given; without --patch
+  // only the two legacy labels are meaningful.
+  if (arg('patch', '') === '' && arm !== 'baseline' && arm !== 'stream') {
+    console.error('--arm requires baseline|stream (or any label together with --patch <file>)');
     process.exit(2);
   }
   const all = JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8'));

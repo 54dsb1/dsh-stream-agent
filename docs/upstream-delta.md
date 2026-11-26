@@ -17,7 +17,7 @@
 | 语义 | 上游出处（模块） | 本插件落点 | 一致性判据 |
 |---|---|---|---|
 | `<tf-*>` 命令语法与 id/depends_on | parser.py | kernel/parser.ts | 测试向量重述（schema/属性校验/环检测） |
-| 观测三档（high/low/none） | context.py | kernel/obs.ts | 分类规则表逐条 |
+| 观测三档（full/dedup/handle；0.5.1 前称 high/low/none） | context.py | kernel/obs.ts | 分类规则表逐条 |
 | 声明序 = 执行序 = 注入序 | executor.py（只搬语义，不搬单 worker 实现） | kernel/parser.ts readyCommands + loop #dispatchReady | 顺序单调性测试 |
 | 确定性摘要纪律（`_build_summary`） | compaction.py | kernel/compaction.ts | max_item_chars / 保留头尾 / 不做语义归纳 |
 | 消息单一事实源 | conversation.py | kernel/render.ts（实现不同：三段式装配） | 前缀单调断言 |

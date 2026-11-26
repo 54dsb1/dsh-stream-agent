@@ -10,7 +10,7 @@
 #   obs-broker.ts      工具结果出口登记 + llm/stream 泄漏扫描（依赖 state 服务）
 #   action-gate.ts     ToolsService guard：spec 暂存、一次性凭据、deny 层
 #   context-render.ts  O6 preflight 前缀断言
-#   control-bar.ts     控制栏：装载横幅 + 模式/语言状态（v0.2.1）
+#   control-bar.ts     控制栏：装载横幅 + 执行通道/上下文档位/语言状态（两轴）
 #   ui/index.js        桌面控制页的宿主半边（独立子包，含 dsh.client 的浏览器半边）
 #   mock-provider.ts   离线假模型——测试专用，绝不进本文件
 #
@@ -49,10 +49,68 @@
       name: ./dist/entry/loop.js
       inject: [llm, tools, agents, sessions, sessionProjections]
       config:
-        maxParallelToolCalls: 3
-        # v0.4.2：maxReentries 不在装配里钉死——由模式默认值决定（balanced 12 / lean 8 /
-        # compat 16 / power 14）。语义是"防打转兜底"不是"任务步数预算"（真机
-        # session-7fbfef8f/2079562e：钉死 8 曾把任务在第 8 步硬杀）。
+        # **行为上限一律由用户定义**（插件不预设任何会截断工作的轮数）。
+        # 未写 limits = 跟随 thinkflow 对齐默认层；想覆盖就在这里写，或用
+        # `dsh-stream-agent limits --set ...` 写进 control.json（跨会话生效），
+        # 或临时用 STREAM_AGENT_LIMITS 环境变量。
+        # 全表的键名/单位/语义见 docs/limits.md（29 个键）。
+        #
+        #   limits:
+        #     maxSteps: 40              # 轮数（单任务请求数；插件永不预设）
+        #     maxInputTokens: 48000     # 上下文（触顶压缩）
+        #     maxTokens: 8192           # 输出预算（0 = 委托给 provider）
+        #     thinkingBudget: 2048      # 思考预算（0 = 关闭；≥1024 生效）
+        #     streamUsage: 1            # stream_options.include_usage（0 = 关 1 = 开）
+        #     maxRetries: 2             # 请求建立重试（0 = 不重试）
+        #     retryBackoffMs: 1000      # 重试退避
+        #     peekBudgetChars: 48000    # 每回合取回预算
+        #     keepRecent: 30            # 压缩保留最近条数
+        #     maxRebasesPerTurn: 2      # 每回合换基（-1 = 不限制，0 = 禁止）
+        #     codeMaxWallMs: 120000     # tf-code 墙钟（未设 = 跟随宿主 runtime.timeout.maxMs）
+        #
+        # limitsByChannel / limitsByTier 可再按通道/档位覆盖（docs/limits.md §3）。
         streamIdleTimeoutMs: 30000
-        # K1（0.3.0）：tf-code 默认关闭；显式开启见 docs/protocol.md（前提 K2–K6）。
+        # K1：tf-code 默认关闭；显式开启见 docs/protocol.md（前提 K2–K6）。
         enableCode: false
+        # 交付构建校验（默认关闭，需显式 opt-in——避免对无 package.json 的会话产生副作用）：
+        #   设置 projectDir: "<项目根>" 即启用；插件把 buildVerificationPlan 产出的
+        #   npm install / npm run build 经 toolMapping 转成宿主 shell 工具调用
+        #   （不硬编码宿主不存在的 bash 工具），失败拒绝 tf-final。
+        #   也可显式注入 projectFacts / runVerification（接口见 src/entry/loop.ts LoopEntryConfig）。
+        # projectDir: null
+        #
+        # ---- 默认值即安全面（以下全部可选）----
+        # 默认数值面 = thinkflow 对齐层（THINKFLOW_ALIGNED_LIMITS：keepRecent=30 /
+        # maxSummaryChars=16000 / maxReadChars=200000 / maxReentries=8；传输五键
+        # maxTokens=0 / thinkingBudget=0 / streamUsage=0 / maxRetries=2 / retryBackoffMs=1000；
+        # **无 maxSteps——轮数一律不设上限**）。
+        # 用户自定义权力完整保留：显式 limits 逐项覆盖默认层（0 = 该项不限制）。
+        # 也可在 CLI `limits --set k=v` / 控制栏 u 编辑 / 桌面页上限区块修改。
+        # limits:
+        #   keepRecent: 60           # 覆盖默认层的示例
+        #   maxSteps: 40             # 轮数（用户显式定义才生效；插件永不预设）
+        #
+        # wire 推理/思考配置（字符串设置；默认 provider-required / disabled）：
+        # reasoningStrategy: provider-required   # drop-stale = 回放状态不回传（thinkflow 等价语义）
+        # thinkingMode: disabled                 # enabled = 请求携带 thinking + reasoning_effort（默认 high）
+        #
+        # 上下文"完全不处理"（默认 false）：true = 压缩/效果折叠/段丢弃/重复抑制/读取与回灌
+        # 截断全部停用，内容原样进请求（预算类 limits 仍生效）。控制栏 x / CLI `raw on`。
+        # contextRaw: false
+        #
+        # 默认密钥保护（默认开）：tf-read 拒读 .env/*.pem/id_rsa 等（allowSensitivePaths: true
+        # 显式放行）；模型可见输出脱敏（redactOutput: false 显式回退）。
+        # allowSensitivePaths: false
+        # redactOutput: true
+        #
+        # 变更回执与守卫式回滚（默认开）：tf-write/tf-edit/tf-append 成功后登记私有回执
+        # （stateDir/changes/<session>/），tf-changes/tf-diff/tf-revert 可用。
+        # 模型可见语法在可选协议段 v15——默认不进装配（前缀缓存零回归），显式开启：
+        # protocolSections:
+        #   v15: true
+        # changeReceipts: true
+        #
+        # DSH 标准/PTC 适配：channel=standard 对应宿主 standard preset（A 模式）；
+        # channel=code（用户可见名"PTC兼容模式"）对应宿主 ptc preset 或 ptcRuntime
+        # （B 模式，来源探测见控制栏"来源"行）。宿主 preset 名册在桌面控制页只读展示；
+        # 切换在宿主会话页新建会话时选择。

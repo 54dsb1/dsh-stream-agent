@@ -308,7 +308,10 @@ test('E2. protocolCommand：stats 与 --json；--stats-only 不含组装全文',
   const json = protocolCommand(['--level', 'lean', '--stats-only', '--json'], 'zh');
   const payload = JSON.parse(json.lines[0]!) as { level: string; sections: unknown[]; totalChars: number; savedChars: number };
   assert.equal(payload.level, 'lean');
-  assert.equal(payload.sections.length, 8);
+  // v1.1/v1.2/v1.4：新增 v11/v12/v14 三个可选段（默认不进装配，金样不变），故预览段数 8 → 11。
+  // v1.3.0（0.5.2）不新增段：它修正的是既有命令语义（沙箱白名单/release/receipt:N），无需新块。
+  // v1.5.0（0.6.0 正式版）：changes 缺口修复新增 v15 可选段（默认不进装配），11 → 12。
+  assert.equal(payload.sections.length, 12);
   assert.equal(payload.totalChars, 2626 + 535, 'lean 基座 + call 段（含连接符）');
 });
 

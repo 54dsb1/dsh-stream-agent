@@ -115,6 +115,8 @@ function makeHarness(responses: ReadonlyArray<readonly StreamChunkLike[]>, task:
   const driver = new SingleStreamDriver(ports, {
     provider: 'mock',
     model: 'mock-v032',
+    // 0.5.1（1.1）：0.4.x 收束机制回归 → 回退开关
+    requireFinal: true,
     ...config,
   });
   driver.pushUserTask(task);

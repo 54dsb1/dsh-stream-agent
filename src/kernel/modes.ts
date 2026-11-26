@@ -35,8 +35,6 @@ export interface ChannelSpec {
   /** 执行器来源的说明（来源由探测决定，这里只写"怎么选它"） */
   useWhen: { zh: string; en: string };
   tradeoff: { zh: string; en: string };
-  /** 隐含的旧模式行为面（回退对照用；§3.3：区块 A 回退到 standard = 0.4.0 balanced 行为面） */
-  legacyBehavior: { zh: string; en: string };
 }
 
 export const CHANNEL_SPECS: readonly ChannelSpec[] = [
@@ -47,16 +45,14 @@ export const CHANNEL_SPECS: readonly ChannelSpec[] = [
     tagline: { zh: 'tf-* 原生工具，协议段注入，可验收。', en: 'tf-* native commands, protocol section, acceptance gate.' },
     useWhen: { zh: '日常读写与查改任务；不依赖宿主 PTC。', en: 'Everyday read/write tasks; no host PTC needed.' },
     tradeoff: { zh: '工具面 = tf-* + 宿主工具透传；命令逐条解析。', en: 'Tool surface = tf-* + host passthrough; commands parsed one by one.' },
-    legacyBehavior: { zh: '等于 0.4.0 的 balanced 行为面。', en: 'Same behavior face as 0.4.0 balanced.' },
   },
   {
     id: 'code',
     order: 2,
-    label: { zh: '代码', en: 'Code' },
+    label: { zh: 'PTC兼容模式', en: 'PTC-compat' },
     tagline: { zh: '单一 run_code 入口，协议段 0 字符（preset 来源）。', en: 'Single run_code entry, zero protocol chars (preset source).' },
     useWhen: { zh: '多步数据加工；宿主有 PTC 预设或 ptcRuntime。', en: 'Multi-step data work; host has PTC preset or ptcRuntime.' },
     tradeoff: { zh: '来源=preset 完全让位；来源=bridge 仅 tf-code 受限通道；两者皆无时不可用。', en: 'preset = full yield; bridge = tf-code only; neither = unavailable.' },
-    legacyBehavior: { zh: '数值面等于 0.4.0 的 power（enableCode=true）。', en: 'Numeric face equals 0.4.0 power (enableCode=true).' },
   },
 ];
 
@@ -80,7 +76,11 @@ export function isTierId(value: unknown): value is TierId {
 
 export type CompactAggressiveness = 'conservative' | 'balanced' | 'aggressive';
 
-/** 档位数值（§4.2 表）：只改数值，不改工具面/并行度/执行器/协议段。 */
+/** 档位数值（§4.2 表）：只改数值，不改工具面/并行度/执行器/协议段。
+ *
+ * 0.5.2 起：**档位不再预设行为上限**。未在 `limits` 里定义的项目一律为 0（不限制）——
+ * 档位只是"命名 + 展示"，实际数值由用户定义（见 kernel/limits.ts）。
+ * `compactAggressiveness` 不是上限而是压缩强度，缺省 balanced。 */
 export interface TierValues {
   /** 单任务请求数上限（N 上限；触顶注入收束指令）。0 = 无上限（仅观测告警）。 */
   maxSteps: number;
@@ -104,8 +104,21 @@ export interface TierSpec {
   useWhen: { zh: string; en: string };
   /** 代价：控制栏按实际数值展示，不做定性宣传（§4.2："深"只表示余量更大、压缩更保守） */
   tradeoff: { zh: string; en: string };
+  /** 生效值：0.5.2 起全部为「未设置 = 不限制」，由用户 limits 覆盖 */
   values: TierValues;
+  /** 参考值（**不生效**，仅控制栏/文档示例；用户想用就把它们写进 limits） */
+  reference: TierValues;
 }
+
+/** 「未设置」档位值：所有上限 0（不限制）。 */
+export const UNSET_TIER_VALUES: TierValues = {
+  maxSteps: 0,
+  maxInputTokens: 0,
+  compactAggressiveness: 'balanced',
+  peekBudgetChars: 0,
+  keepRecent: 0,
+  maxSummaryChars: 0,
+};
 
 export const TIER_SPECS: readonly TierSpec[] = [
   {
@@ -113,45 +126,28 @@ export const TIER_SPECS: readonly TierSpec[] = [
     order: 1,
     label: { zh: '轻', en: 'Light' },
     useWhen: { zh: '单文件小改、问答。', en: 'Single-file edits, Q&A.' },
-    tradeoff: { zh: '步数与上下文余量最小，压缩最激进。', en: 'Smallest step/context budget, most aggressive compaction.' },
-    values: {
-      maxSteps: 16,
-      maxInputTokens: 12_000,
-      compactAggressiveness: 'aggressive',
-      peekBudgetChars: 12_000,
-      keepRecent: 12,
-      maxSummaryChars: 8_000,
-    },
+    tradeoff: { zh: '默认对齐 thinkflow 数值面；仅压缩强度 aggressive。', en: 'thinkflow-aligned numbers; aggressive compaction.' },
+    values: { ...UNSET_TIER_VALUES },
+    // 0.6.1：参考值对齐 thinkflow 出厂预设；maxSteps 一律 0（不限制，轮数上限已移除）。
+    reference: { maxSteps: 0, maxInputTokens: 0, compactAggressiveness: 'aggressive', peekBudgetChars: 0, keepRecent: 30, maxSummaryChars: 16_000 },
   },
   {
     id: 'standard',
     order: 2,
     label: { zh: '标准', en: 'Standard' },
     useWhen: { zh: '默认档。', en: 'Default.' },
-    tradeoff: { zh: '缺省数值；压缩 balanced。', en: 'Defaults; balanced compaction.' },
-    values: {
-      maxSteps: 24,
-      maxInputTokens: 20_000,
-      compactAggressiveness: 'balanced',
-      peekBudgetChars: 24_000,
-      keepRecent: 30,
-      maxSummaryChars: 16_000,
-    },
+    tradeoff: { zh: '默认对齐 thinkflow 数值面；压缩强度 balanced。', en: 'thinkflow-aligned numbers; balanced compaction.' },
+    values: { ...UNSET_TIER_VALUES },
+    reference: { maxSteps: 0, maxInputTokens: 0, compactAggressiveness: 'balanced', peekBudgetChars: 0, keepRecent: 30, maxSummaryChars: 16_000 },
   },
   {
     id: 'deep',
     order: 3,
     label: { zh: '深', en: 'Deep' },
     useWhen: { zh: '跨模块改造、需要保留更多历史。', en: 'Cross-module changes; keep more history.' },
-    tradeoff: { zh: '单请求更贵；压缩保守，不表示更强。', en: 'Costlier per request; conservative compaction — not "stronger".' },
-    values: {
-      maxSteps: 40,
-      maxInputTokens: 48_000,
-      compactAggressiveness: 'conservative',
-      peekBudgetChars: 48_000,
-      keepRecent: 60,
-      maxSummaryChars: 32_000,
-    },
+    tradeoff: { zh: '默认对齐 thinkflow 数值面；压缩强度最保守。', en: 'thinkflow-aligned numbers; most conservative compaction.' },
+    values: { ...UNSET_TIER_VALUES },
+    reference: { maxSteps: 0, maxInputTokens: 0, compactAggressiveness: 'conservative', peekBudgetChars: 0, keepRecent: 30, maxSummaryChars: 16_000 },
   },
 ];
 
@@ -226,20 +222,21 @@ export function reverseLegacyMode(channel: ChannelId, tier: TierId): LegacyModeI
 // ---------------------------------------------------------------------------
 
 export function publicChannelCatalog() {
-  return CHANNEL_SPECS.map(({ id, order, label, tagline, useWhen, tradeoff, legacyBehavior }) => ({
-    id, order, label, tagline, useWhen, tradeoff, legacyBehavior,
+  return CHANNEL_SPECS.map(({ id, order, label, tagline, useWhen, tradeoff }) => ({
+    id, order, label, tagline, useWhen, tradeoff,
   }));
 }
 
 export function publicTierCatalog() {
-  return TIER_SPECS.map(({ id, order, label, useWhen, tradeoff, values }) => ({
-    id, order, label, useWhen, tradeoff, values,
+  return TIER_SPECS.map(({ id, order, label, useWhen, tradeoff, values, reference }) => ({
+    id, order, label, useWhen, tradeoff, values, reference,
+    /** 0.5.2：生效值需要用户 limits 定义；本字段只说明"默认不限制" */
+    unset: true,
   }));
 }
 
 /**
- * 旧模式目录投影（别名期兼容）：旧 CLI/UI 消费者拿到的还是四条目录，
- * 每条标注 alias 目标。0.6.0 移除。
+ * 旧模式别名目录投影：四条映射（alias 目标），供配置迁移与诊断对照。
  */
 export function publicLegacyModeCatalog() {
   return (LEGACY_MODE_IDS as readonly LegacyModeId[]).map((id, index) => {
@@ -248,8 +245,6 @@ export function publicLegacyModeCatalog() {
       id,
       order: index + 1,
       aliasTarget: mapped,
-      deprecated: true,
-      removal: '0.6.0',
     };
   });
 }

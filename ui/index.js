@@ -10,14 +10,18 @@
 //   2. 复用宿主的 connection.admit 做鉴权（桌面端是 cookie，Web 端是同一套会话）
 //   3. 优先调用 loop 提供的 streamAgentRuntime 服务；服务缺席时降级为只读诊断
 //
+// 0.5.3 区块 C：POST 面再增 {limits?: {k:v}, limitsReplace?: boolean}——
+// 上限一律由用户在控制页定义（未定义/0 = 不限制），路由层只做校验与落盘，不注入任何默认值。
 // 0.5.0 两区块（§3.3）：POST 面 = {channel?, tier?, lang?, mode?, budget?}——
 // mode 是 0.5.x 别名（0.6.0 移除）；区块 A 不出现"PTC 模式"字样（来源是探测结果）。
 //
 // 刻意不引入任何 npm 依赖：只 import 本包 dist/ 里已有的内核模块。
 
-import { readPersistedControl, writePersistedControl } from '../dist/entry/control-state.js';
+import { readPersistedControl, writePersistedControl, parseSwitchValue } from '../dist/entry/control-state.js';
 import { isChannelId, isTierId, publicChannelCatalog, publicTierCatalog, publicLegacyModeCatalog, getTier } from '../dist/kernel/modes.js';
-import { isLang } from '../dist/kernel/control-bar.js';
+import { isLang, switchSummaryLine } from '../dist/kernel/control-bar.js';
+// 0.5.2：降级视图要给"生效参数"报账，语义必须与运行时同源（0 = 不限制）
+import { limitOf, mergeLimits, publicLimitCatalog, sanitizeLimitPatch, THINKFLOW_ALIGNED_LIMITS } from '../dist/kernel/limits.js';
 // v0.4.0（P4）：预设路由（空白会话三向切换的唯一入口；locked 具名识别）
 import { createPresetRouter, isPresetLockedError } from '../dist/entry/preset-router.js';
 import { VERSION } from '../dist/version.js';
@@ -42,6 +46,12 @@ function sendJson(res, status, body) {
 function fallbackStatus() {
   const persisted = readPersistedControl();
   const tierValues = getTier(persisted.state.tier).values;
+  // 0.5.2：档位不再预设上限（`tier.values` 的数值位全是 0 = 不限制）。
+  // 降级视图的"生效参数"必须由用户 limits 报账，不能继续拿档位参考值顶替——
+  // 否则面板会显示 0（不限制）当上限，或把 reference 值说成已生效。
+  // 0.6.1：状态文件 = 纯用户层（默认层不物化进盘）；"生效参数"投影 = thinkflow 对齐层 + 用户 limits
+  const limits = persisted.limits ?? {};
+  const effectiveLimits = mergeLimits(THINKFLOW_ALIGNED_LIMITS, limits);
   return {
     version: VERSION,
     takeover: false,
@@ -56,15 +66,23 @@ function fallbackStatus() {
     lang: persisted.state.lang,
     langSource: persisted.found ? 'file' : 'default',
     langLocked: isLang(process.env.STREAM_AGENT_LANG),
+    // 0.6.0：降级视图也要暴露两个开关（否则面板无法显示"关了没有"，写回也拿不到现值）
+    contextFold: persisted.state.contextFold !== false,
+    finalCheck: persisted.state.finalCheck !== false,
+    // 0.6.0 正式版：原样档（0.6.1：行为预设已移除——默认面 = thinkflow 对齐层）
+    contextRaw: persisted.state.contextRaw === true,
+    switchSummary: switchSummaryLine(persisted.state, persisted.state.lang),
     effective: {
-      maxSteps: tierValues.maxSteps,
-      maxInputTokens: tierValues.maxInputTokens,
+      maxSteps: limitOf(effectiveLimits, 'maxSteps'),
+      maxInputTokens: limitOf(effectiveLimits, 'maxInputTokens'),
       compactAggressiveness: tierValues.compactAggressiveness,
-      peekBudgetChars: tierValues.peekBudgetChars,
-      keepRecent: tierValues.keepRecent,
-      maxSummaryChars: tierValues.maxSummaryChars,
+      peekBudgetChars: limitOf(effectiveLimits, 'peekBudgetChars'),
+      keepRecent: limitOf(effectiveLimits, 'keepRecent'),
+      maxSummaryChars: limitOf(effectiveLimits, 'maxSummaryChars'),
       surfacePolicy: 'reserved-only',
     },
+    limits,
+    limitCatalog: publicLimitCatalog(limits),
     channels: publicChannelCatalog(),
     tiers: publicTierCatalog(),
     legacyModes: publicLegacyModeCatalog(),
@@ -224,9 +242,25 @@ export async function handleControlRequest(ctx, req, res) {
   const wantsBudget = body.budget !== undefined && body.budget !== null;
   const wantsLang = body.lang !== undefined;
   const wantsMode = body.mode !== undefined;
-  if (!wantsChannel && !wantsTier && !wantsLang && !wantsMode && !wantsBudget) {
-    sendJson(res, 400, { ok: false, error: { code: 'empty', message: 'channel, tier, budget or lang required' }, status: live });
+  // 0.5.3（区块 C）：上限由用户定义——`limits` 为增量补丁，`limitsReplace` 为整组替换，
+  // `limits: {}` + limitsReplace 等价于"清空为全部不限制"。
+  const wantsLimits = body.limits !== undefined;
+  const limitsReplace = body.limitsReplace === true || body.limits === null;
+  // 0.6.0 正式版：三个行为开关（与终端/CLI 同源）。0.6.1：行为预设已移除。
+  const switchPatch = {};
+  for (const key of ['contextFold', 'finalCheck', 'contextRaw']) {
+    if (body[key] !== undefined) switchPatch[key] = body[key];
+  }
+  const wantsSwitches = Object.keys(switchPatch).length > 0;
+  if (!wantsChannel && !wantsTier && !wantsLang && !wantsMode && !wantsBudget && !wantsLimits && !wantsSwitches) {
+    sendJson(res, 400, { ok: false, error: { code: 'empty', message: 'channel, tier, budget, limits, switches or lang required' }, status: live });
     return;
+  }
+  for (const [key, raw] of Object.entries(switchPatch)) {
+    if (typeof raw !== 'boolean' && parseSwitchValue(raw) === undefined) {
+      sendJson(res, 400, { ok: false, error: { code: 'invalid-switch', message: `${key} must be a boolean (on/off)` }, status: live });
+      return;
+    }
   }
   if (wantsChannel && !isChannelId(body.channel)) {
     sendJson(res, 400, { ok: false, error: { code: 'invalid-channel', message: `unknown channel: ${String(body.channel)}（valid: standard | code）` }, status: live });
@@ -248,6 +282,26 @@ export async function handleControlRequest(ctx, req, res) {
     sendJson(res, 400, { ok: false, error: { code: 'invalid-lang', message: `unknown language: ${String(body.lang)}` }, status: live });
     return;
   }
+  // 上限校验走内核 sanitize（与 CLI / control.json 同一套规则：未知键/非整数/负数一律拒绝并回报）
+  let limitsPatch = {};
+  let limitsWarnings = [];
+  if (wantsLimits) {
+    if (body.limits !== null && (typeof body.limits !== 'object' || Array.isArray(body.limits))) {
+      sendJson(res, 400, { ok: false, error: { code: 'invalid-limits', message: 'limits must be an object: { maxSteps?: 40, ... }' }, status: live });
+      return;
+    }
+    const parsed = sanitizeLimitPatch(body.limits ?? {}, 'control-page');
+    limitsWarnings = parsed.warnings;
+    if (Object.keys(parsed.values).length === 0 && !limitsReplace && limitsWarnings.length > 0) {
+      sendJson(res, 400, {
+        ok: false,
+        error: { code: 'invalid-limits', message: limitsWarnings.join('; ') },
+        status: live,
+      });
+      return;
+    }
+    limitsPatch = parsed.values;
+  }
 
   // 锁定判断放在路由层：运行时服务即使实现有出入，也不会绕过装配配置/环境变量。
   if ((wantsChannel && live.channelLocked === true) || (wantsTier && live.tierLocked === true)
@@ -268,12 +322,54 @@ export async function handleControlRequest(ctx, req, res) {
     if (result.ok !== false && wantsChannel) result = runtime.setChannel(body.channel);
     if (result.ok !== false && wantsTier) result = runtime.setTier(body.tier);
     if (result.ok !== false && wantsBudget && typeof runtime.setBudget === 'function') result = runtime.setBudget(body.budget);
+    // 0.5.3：上限优先走 setLimits（0.6.0 起 24 个键全落点）；老运行时只有 setBudget 时退化为那两个键
+    if (result.ok !== false && wantsLimits) {
+      if (typeof runtime.setLimits === 'function') {
+        const applied = runtime.setLimits(limitsPatch, { replace: limitsReplace });
+        if (applied !== null && typeof applied === 'object' && applied.ok === false) {
+          result = applied;
+        } else {
+          const accepted = (applied !== null && typeof applied === 'object' && (applied.accepted ?? applied.limits)) || limitsPatch;
+          result = {
+            ok: true,
+            persisted: true,
+            limits: accepted,
+            ...(applied !== null && typeof applied === 'object' && applied.ignored !== undefined
+              ? { ignored: applied.ignored }
+              : {}),
+          };
+        }
+      } else if (typeof runtime.setBudget === 'function') {
+        const budgetPatch = {};
+        if (limitsPatch.maxSteps !== undefined) budgetPatch.maxSteps = limitsPatch.maxSteps;
+        if (limitsPatch.maxInputTokens !== undefined) budgetPatch.maxInputTokens = limitsPatch.maxInputTokens;
+        if (Object.keys(budgetPatch).length > 0) result = runtime.setBudget(budgetPatch);
+      }
+    }
+    if (result.ok !== false && wantsSwitches) {
+      if (typeof runtime.setSwitches === 'function') {
+        const applied = runtime.setSwitches(switchPatch);
+        if (applied !== null && typeof applied === 'object' && applied.ok === false) result = applied;
+      } else {
+        result = { ok: false, code: 'unsupported', detail: '运行时没有 setSwitches（请升级插件运行时）' };
+      }
+    }
     if (result.ok !== false && wantsLang) result = runtime.setLang(body.lang);
     if (result.ok === false) {
       const statusCode = result.code === 'locked' ? 409 : result.code === 'rebase-limit' ? 409 : 400;
       sendJson(res, statusCode, {
         ok: false,
         error: { code: result.code ?? 'refused', message: result.detail ?? (result.code === 'locked' ? '当前值由装配配置或环境变量锁定' : 'invalid value') },
+        status: currentStatus(ctx),
+      });
+      return;
+    }
+    if (limitsWarnings.length > 0 || result.ignored !== undefined) {
+      sendJson(res, 200, {
+        ok: true,
+        persisted: result.persisted !== false,
+        limits: result.limits ?? limitsPatch,
+        warnings: [...limitsWarnings, ...(result.ignored ?? [])],
         status: currentStatus(ctx),
       });
       return;
@@ -294,6 +390,25 @@ export async function handleControlRequest(ctx, req, res) {
       : (wantsTier ? body.tier : live.tier),
     lang: wantsLang ? body.lang : live.lang,
   };
+  // BUGFIX（0.5.3）：降级分支此前只写 channel/tier/lang —— 用户定义的上限会在
+  // "loop 未接管时改一次通道"时被整组抹掉（writePersistedControl 收到没有 limits 的对象
+  // 就按"没有上限"落盘）。这里必须把生效的 limits 一起带上。
+  if (wantsLimits) {
+    next.limits = limitsReplace ? limitsPatch : mergeLimits(live.limits, limitsPatch);
+  } else if (live.limits !== undefined) {
+    next.limits = live.limits;
+  }
+  // 0.6.0：同样的坑在行为开关上——writePersistedControl 对缺字段按默认 true 落盘，
+  // 降级分支只写 channel/tier/lang 会把关掉的 contextFold/finalCheck 重置回开。
+  if (live.contextFold !== undefined) next.contextFold = live.contextFold;
+  if (live.finalCheck !== undefined) next.finalCheck = live.finalCheck;
+  if (live.contextRaw !== undefined) next.contextRaw = live.contextRaw;
+  // 0.6.1：行为预设应用分支已移除；开关手工修改直接生效。
+  if (wantsSwitches) {
+    for (const [key, raw] of Object.entries(switchPatch)) {
+      next[key] = typeof raw === 'boolean' ? raw : parseSwitchValue(raw);
+    }
+  }
   try {
     writePersistedControl(next);
   } catch (error) {
@@ -308,6 +423,8 @@ export async function handleControlRequest(ctx, req, res) {
     ok: true,
     persisted: true,
     degraded: true,
+    limits: next.limits ?? {},
+    ...(limitsWarnings.length > 0 ? { warnings: limitsWarnings } : {}),
     notice: 'loop 未接管：已写入状态文件，修复装载后重启生效',
     status: currentStatus(ctx),
   });

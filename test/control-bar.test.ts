@@ -52,6 +52,7 @@ import {
   renderJson,
   renderPanel,
   renderStatusBar,
+  limitsSummaryLine,
   statsLine,
   t,
   textKeys,
@@ -85,11 +86,20 @@ test('两轴目录：通道 2 条、档位 3 条，id 与序号唯一，默认�
   assert.ok(isTierId('light') && !isTierId('lean'));
 });
 
-test('档位数值（§4.2 表）：16/24/40 步 · 12k/20k/48k · 压缩三档 · 取回预算 · keepRecent · 摘要上限', () => {
+test('档位数值（0.5.2）：生效值全部未设置（不限制）；0.6.1 参考值对齐 thinkflow 且无 maxSteps', () => {
   const [light, standard, deep] = TIER_SPECS;
-  assert.deepEqual(light!.values, { maxSteps: 16, maxInputTokens: 12_000, compactAggressiveness: 'aggressive', peekBudgetChars: 12_000, keepRecent: 12, maxSummaryChars: 8_000 });
-  assert.deepEqual(standard!.values, { maxSteps: 24, maxInputTokens: 20_000, compactAggressiveness: 'balanced', peekBudgetChars: 24_000, keepRecent: 30, maxSummaryChars: 16_000 });
-  assert.deepEqual(deep!.values, { maxSteps: 40, maxInputTokens: 48_000, compactAggressiveness: 'conservative', peekBudgetChars: 48_000, keepRecent: 60, maxSummaryChars: 32_000 });
+  const unset = { maxSteps: 0, maxInputTokens: 0, compactAggressiveness: 'balanced', peekBudgetChars: 0, keepRecent: 0, maxSummaryChars: 0 };
+  assert.deepEqual(light!.values, unset);
+  assert.deepEqual(standard!.values, unset);
+  assert.deepEqual(deep!.values, unset);
+  // 0.6.1：参考值对齐 thinkflow 对齐层——轮数一律 0（不限制），保留/摘要 = thinkflow 数值
+  for (const tier of TIER_SPECS) {
+    assert.equal(tier.reference.maxSteps, 0, `${tier.id} 参考值不得携带轮数上限`);
+    assert.equal(tier.reference.keepRecent, 30);
+    assert.equal(tier.reference.maxSummaryChars, 16_000);
+  }
+  assert.deepEqual(light!.reference.compactAggressiveness, 'aggressive');
+  assert.deepEqual(deep!.reference.compactAggressiveness, 'conservative');
 });
 
 test('双语字段完整性：通道/档位 en 无中文、zh 有中文', () => {
@@ -104,11 +114,15 @@ test('双语字段完整性：通道/档位 en 无中文、zh 有中文', () => 
   }
 });
 
-test('区块 B 数值行：三档实际数值同屏展示（不做定性宣传）', () => {
+test('区块 B 数值行：生效值（未设=不限制）+ thinkflow 对齐默认说明（不做定性宣传）', () => {
   const line = tierValuesLine('zh');
-  assert.ok(line.includes('16/24/40'), line);
-  assert.ok(line.includes('12k/20k/48k'), line);
-  assert.ok(line.includes('aggressive/balanced/conservative'), line);
+  assert.ok(line.includes('未设'), line);
+  assert.ok(line.includes('thinkflow'), line);
+  const withLimits = tierValuesLine('zh', { maxSteps: 40, maxInputTokens: 48_000 });
+  assert.ok(withLimits.includes('40'), withLimits);
+  assert.ok(withLimits.includes('48k'), withLimits);
+  const unlimited = tierValuesLine('zh', { maxSteps: 0, maxInputTokens: 0 });
+  assert.ok(unlimited.includes('不限制'), unlimited);
 });
 
 // ---------------------------------------------------------------- 别名（§4.4）
@@ -137,14 +151,15 @@ test('反向别名（回滚兼容）：可精确表达的组合写回 mode 字�
   assert.equal(reverseLegacyMode('code', 'deep'), undefined, '不可精确表达的组合省略 mode 字段');
 });
 
-test('对外目录投影：channels/tiers/legacyModes（legacy 标注 deprecated 与移除版本）', () => {
+test('对外目录投影：channels/tiers/legacyModes（别名映射目录，无版本标注）', () => {
   assert.equal(publicChannelCatalog().length, 2);
   assert.equal(publicTierCatalog().length, 3);
   const legacy = publicLegacyModeCatalog();
   assert.deepEqual(legacy.map((m) => m.id), [...LEGACY_MODE_IDS]);
   for (const m of legacy) {
-    assert.equal(m.deprecated, true);
-    assert.equal(m.removal, '0.6.0');
+    assert.equal('deprecated' in m, false, '目录不带弃用标注（版本痕迹已清）');
+    assert.equal('removal' in m, false, '目录不带移除版本（版本痕迹已清）');
+    assert.ok('aliasTarget' in m);
   }
 });
 
@@ -165,14 +180,15 @@ test('状态条：通道与档位都在单行里', () => {
   assert.ok(line.includes('code') && line.includes('deep'), line);
 });
 
-test('面板：两个区块都在（① 执行通道 / ② 上下文档位），来源行存在', () => {
+test('面板：两个区块都在（① 执行通道 / ② 上下文档位），来源行存在；预设条已移除', () => {
   const state = createControlState({ channel: 'standard', tier: 'standard' });
   const lines = renderPanel(state, V);
   const text = lines.join('\n');
   assert.ok(text.includes('① 执行通道'), text);
   assert.ok(text.includes('② 上下文档位'), text);
   assert.ok(text.includes('来源'), text);
-  assert.ok(text.includes('maxSteps 16/24/40'), text);
+  assert.ok(text.includes('thinkflow'), text);
+  assert.ok(!text.includes('[p]'), 'p 键预设条已随预设系统移除');
 });
 
 test('面板盒子：56-92 列逐行等宽（盒子不错位）', () => {
@@ -189,14 +205,17 @@ test('renderJson：channels/tiers/legacyModes 三份目录 + channel/tier/values
   const state = createControlState({ channel: 'code', tier: 'light' });
   const payload = JSON.parse(renderJson(state, V)) as {
     channel: { id: string };
-    tier: { id: string; values: Record<string, number> };
+    tier: { id: string; values: Record<string, number>; reference: Record<string, number> };
     channels: unknown[];
     tiers: unknown[];
     legacyModes: unknown[];
   };
   assert.equal(payload.channel.id, 'code');
   assert.equal(payload.tier.id, 'light');
-  assert.equal(payload.tier.values.maxSteps, 16);
+  assert.equal(payload.tier.values.maxSteps, 0);
+  assert.equal(payload.tier.reference.maxSteps, 0, '0.6.1：参考值轮数 = 不限制');
+  assert.equal('preset' in payload, false, '行为预设字段已移除');
+  assert.equal('presets' in payload, false, '行为预设目录已移除');
   assert.equal(payload.channels.length, 2);
   assert.equal(payload.tiers.length, 3);
   assert.equal(payload.legacyModes.length, 4);
@@ -232,7 +251,10 @@ test('按键：1-2 选通道，3-5 选档位，c/t 快切，方向键移动，En
   assert.deepEqual(interpretKey('q', { helpOpen: true }), { kind: 'close-help' });
   assert.deepEqual(interpretKey('\x1b[B'), { kind: 'move', delta: 1 });
   assert.deepEqual(interpretKey('\r'), { kind: 'apply' });
-  assert.deepEqual(interpretKey('x'), { kind: 'none' });
+  // 0.6.0 正式版：x = 上下文原样开关；0.6.1：p 键已随预设系统移除（回落为未知键）
+  assert.deepEqual(interpretKey('x'), { kind: 'toggle-context-raw' });
+  assert.deepEqual(interpretKey('p'), { kind: 'none' });
+  assert.deepEqual(interpretKey('z'), { kind: 'none' });
 });
 
 test('焦点移动：扁平五选项环状移动', () => {
@@ -285,7 +307,7 @@ test('control.json 往返：channel/tier/lang 写读一致；写回保留旧 mod
     assert.equal(raw.channel, 'code');
     assert.equal(raw.tier, 'deep');
     assert.equal(raw.lang, 'en');
-    assert.equal(raw.schema, 2, '0.5.0 schema 升 2');
+    assert.equal(raw.schema, 5, '0.6.0 正式版 schema 升 5（新增 contextRaw / preset）');
     assert.equal(raw.mode, undefined, 'code+deep 无可精确表达的旧模式 → mode 字段省略');
     const round = readPersistedControl(dir);
     assert.equal(round.state.channel, 'code');
@@ -366,6 +388,36 @@ test('坏文件 fail-open：坏 JSON 回默认并告警；未知轴值忽略', (
   assert.equal(bad.state.lang, 'zh');
 });
 
+test('STREAM_AGENT_MODE 在无落盘文件（全新安装）时同样走别名映射，不静默忽略', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tf-cs5-')); // 不写 control.json
+  const savedMode = process.env.STREAM_AGENT_MODE;
+  const savedChannel = process.env.STREAM_AGENT_CHANNEL;
+  const savedTier = process.env.STREAM_AGENT_TIER;
+  try {
+    delete process.env.STREAM_AGENT_CHANNEL;
+    delete process.env.STREAM_AGENT_TIER;
+    process.env.STREAM_AGENT_MODE = 'lean';
+    const warnings: string[] = [];
+    const resolved = resolveControlState({}, dir, (m) => warnings.push(m));
+    assert.equal(resolved.channel, 'standard');
+    assert.equal(resolved.tier, 'light');
+    assert.equal(resolved.aliased, true);
+    assert.equal(resolved.channelSource, 'env');
+    assert.equal(resolved.tierSource, 'env');
+    assert.ok(warnings.some((w) => w.includes('STREAM_AGENT_MODE') && w.includes('lean')), warnings.join('\n'));
+    // 显式 STREAM_AGENT_CHANNEL 仍压过旧 mode 值
+    process.env.STREAM_AGENT_CHANNEL = 'code';
+    const resolved2 = resolveControlState({}, dir);
+    assert.equal(resolved2.channel, 'code');
+    assert.equal(resolved2.tier, 'standard');
+    assert.equal(resolved2.aliased, false);
+  } finally {
+    if (savedMode === undefined) delete process.env.STREAM_AGENT_MODE; else process.env.STREAM_AGENT_MODE = savedMode;
+    if (savedChannel === undefined) delete process.env.STREAM_AGENT_CHANNEL; else process.env.STREAM_AGENT_CHANNEL = savedChannel;
+    if (savedTier === undefined) delete process.env.STREAM_AGENT_TIER; else process.env.STREAM_AGENT_TIER = savedTier;
+  }
+});
+
 // ---------------------------------------------------------------- CLI 拆键
 
 test('splitKeys：方向键三字节成组（不拆散）', () => {
@@ -378,4 +430,103 @@ test('truncate / wrapText：宽度截断与折行纪律', () => {
   assert.equal(displayWidth('中'), 2);
   const lines = wrapText('一二三四五 six seven', 8);
   assert.ok(lines.every((l) => displayWidth(l) <= 8), lines.join('|'));
+});
+
+// ---------------------------------------------------------------- 区块 C 用户上限（0.5.3）
+
+test('C1. 面板区块 C：未设上限时显式声明"不限制"，设了则逐项列出生效值', () => {
+  const bare = createControlState({ channel: 'standard', tier: 'standard' });
+  const lines = renderPanel(bare, { version: '0.0.0-test', columns: 100 }).join('\n');
+  assert.ok(lines.includes('③ 用户上限'), '面板必须有区块 C');
+  assert.ok(lines.includes('全部未设') && lines.includes('不限制'), `未设时必须写明不限制：${lines.slice(0, 80)}`);
+  assert.ok(!/轮数 \d/.test(lines), '未设上限时不得凭空渲染出数字（不预设）');
+
+  assert.equal(limitsSummaryLine(undefined, 'zh'), t('limitsUnsetAll', 'zh'));
+  assert.equal(limitsSummaryLine({}, 'en'), t('limitsUnsetAll', 'en'));
+
+  const withLimits = createControlState({ limits: { maxSteps: 40, maxInputTokens: 48_000, codeMaxSubcalls: 8 } });
+  const line = limitsSummaryLine(withLimits.limits, 'zh');
+  assert.ok(line.includes('maxSteps 40'), line);
+  assert.ok(line.includes('48k'), `token 上限按 k 展示：${line}`);
+  assert.ok(line.includes('已定义 3'), `必须报已定义项数：${line}`);
+  const panelText = renderPanel(withLimits, { version: '0.0.0-test', columns: 100 }).join('\n');
+  assert.ok(panelText.includes('maxSteps 40'), '面板必须显示生效值');
+});
+
+test('C2. u 键进入上限编辑：键入 key=value → 回车生效并落盘（含 limits）', () => {
+  const saved: ControlState[] = [];
+  const session = new ControlSession(createControlState({ channel: 'code', tier: 'deep' }), {
+    save: (next) => { saved.push(next); return '/tmp/control.json'; },
+    columns: () => 100,
+    version: '0.0.0-test',
+  });
+  assert.deepEqual(interpretKey('u'), { kind: 'edit-limits' });
+  assert.deepEqual(interpretKey('U'), { kind: 'edit-limits' });
+
+  // 1) 帧里没有任何数字上限
+  assert.ok(!session.frame().includes('maxSteps 40'));
+  // 2) 按 u 进入编辑，逐字符输入
+  assert.equal(session.handle('u').changed, true);
+  assert.equal(session.limitsBuffer, '');
+  for (const ch of 'maxSteps=40;maxInputTokens=48000') assert.equal(session.handle(ch).changed, true);
+  assert.equal(session.limitsBuffer, 'maxSteps=40;maxInputTokens=48000');
+  assert.ok(session.frame().includes('上限编辑'), '编辑态必须在帧里可见（含缓冲回显）');
+  // 3) 回车生效
+  const committed = session.handle('\r');
+  assert.equal(committed.changed, true);
+  assert.equal(session.limitsBuffer, null, '提交后退出编辑态');
+  assert.deepEqual(session.state.limits, { maxSteps: 40, maxInputTokens: 48_000 });
+  assert.equal(saved.length, 1);
+  assert.deepEqual(saved[0]!.limits, { maxSteps: 40, maxInputTokens: 48_000 }, '落盘必须带 limits（否则改通道就被抹掉）');
+  assert.equal(saved[0]!.channel, 'code', '通道不能被上限编辑带走');
+  assert.ok(session.note.includes('已写入上限'));
+
+  // 4) 再编辑一项：合并而不是替换
+  session.handle('u');
+  for (const ch of 'codeMaxSubcalls=8') session.handle(ch);
+  session.handle('\r');
+  assert.deepEqual(session.state.limits, { maxSteps: 40, maxInputTokens: 48_000, codeMaxSubcalls: 8 });
+});
+
+test('C3. 非法输入不落盘；Esc 取消；reset 清空为"全部不限制"', () => {
+  const saved: ControlState[] = [];
+  const session = new ControlSession(createControlState({ limits: { maxSteps: 24 } }), {
+    save: (next) => { saved.push(next); return '/tmp/control.json'; },
+    columns: () => 100,
+    version: '0.0.0-test',
+  });
+  session.handle('u');
+  for (const ch of 'nosuchKey=3') session.handle(ch);
+  session.handle('\r');
+  assert.deepEqual(session.state.limits, { maxSteps: 24 }, '未知键必须被拒，且不得改动已有值');
+  assert.equal(saved.length, 0, '被拒的输入不得落盘');
+  assert.ok(session.note.includes('未通过校验'), session.note);
+
+  session.handle('u');
+  for (const ch of 'maxSteps=-1') session.handle(ch);
+  session.handle('\r');
+  assert.deepEqual(session.state.limits, { maxSteps: 24 }, '负数被拒');
+  assert.equal(saved.length, 0);
+
+  session.handle('u');
+  assert.equal(session.handle('\x1b').changed, true);
+  assert.equal(session.limitsBuffer, null, 'Esc 退出编辑态');
+  assert.deepEqual(session.state.limits, { maxSteps: 24 }, '取消不改值');
+
+  session.handle('u');
+  for (const ch of 'reset') session.handle(ch);
+  session.handle('\r');
+  assert.equal(session.state.limits, undefined, 'reset 后必须完全没有 limits（= 全部不限制）');
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0]!.limits, undefined);
+
+  // reset 键（r）也把上限一起清掉：初始状态 = 一项上限都没有
+  const second = new ControlSession(createControlState({ channel: 'code', limits: { maxSteps: 24 } }), {
+    save: () => '/tmp/control.json',
+    columns: () => 100,
+    version: '0.0.0-test',
+  });
+  second.handle('r');
+  assert.equal(second.state.limits, undefined);
+  assert.equal(second.state.channel, 'standard');
 });

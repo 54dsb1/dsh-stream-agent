@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -206,7 +206,7 @@ test('路由 GET：降级分支的目录投影带通道/档位/旧别名（页�
   assert.equal(body.status.tiers.length, 3);
   assert.ok(body.status.tiers.every((x) => x.values && typeof x.values.maxSteps === 'number'), '档位目录带实际数值');
   assert.equal(body.status.legacyModes.length, 4);
-  assert.ok(body.status.legacyModes.every((m) => m.deprecated === true && m.removal === '0.6.0'), '旧模式目录标注弃用与移除版本');
+  assert.ok(body.status.legacyModes.every((m) => 'aliasTarget' in m && !('removal' in m)), '旧模式目录只带别名映射，不带版本标注');
 });
 
 test('路由 POST：切通道/档位/语言走运行时服务，并回报 persisted', async () => {
@@ -368,5 +368,141 @@ test('降级路径：运行时缺席时写状态文件（旧 mode 值按别名�
   } finally {
     if (previous === undefined) delete process.env.STREAM_AGENT_STATE_DIR;
     else process.env.STREAM_AGENT_STATE_DIR = previous;
+  }
+});
+
+test('降级视图的生效参数来自用户 limits（0 = 不限），不拿档位参考值冒充', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tf-ui-effective-'));
+  const previous = process.env.STREAM_AGENT_STATE_DIR;
+  process.env.STREAM_AGENT_STATE_DIR = dir;
+  try {
+    // 先落一份带 limits 的状态（deep 档的参考值 = 40/48000，若被冒充就会露馅）
+    writeFileSync(
+      join(dir, 'control.json'),
+      JSON.stringify({ schema: 3, channel: 'standard', tier: 'deep', lang: 'zh', limits: { maxSteps: 9 } }),
+      'utf8',
+    );
+
+    const res = await invoke(ctxWith({}), makeReq({ method: 'GET', headers: {} }));
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.payload);
+    assert.equal(body.status.degraded, true, '运行时缺席 → 降级视图');
+
+    // ① 用户设过的键如实回报
+    assert.equal(body.status.effective.maxSteps, 9);
+    // ② 未设过的键 = thinkflow 对齐默认层（0.6.1：keepRecent 30 / maxSummaryChars 16k）；
+    //    token/取回无默认层 → 0（不限制），不得回落到 deep 档的旧参考值 48000
+    assert.equal(body.status.effective.maxInputTokens, 0, '不得用档位参考值顶替生效值');
+    assert.equal(body.status.effective.peekBudgetChars, 0);
+    assert.equal(body.status.effective.keepRecent, 30);
+    assert.equal(body.status.effective.maxSummaryChars, 16_000);
+    // ③ 非 limits 的两项仍要给出（来自档位/装配）
+    assert.equal(typeof body.status.effective.compactAggressiveness, 'string');
+    assert.equal(typeof body.status.effective.surfacePolicy, 'string');
+    // ④ 原始 limits（纯用户层）一并投影，供控制页展示"你设了什么"
+    assert.deepEqual(body.status.limits, { maxSteps: 9 });
+  } finally {
+    if (previous === undefined) delete process.env.STREAM_AGENT_STATE_DIR;
+    else process.env.STREAM_AGENT_STATE_DIR = previous;
+  }
+});
+
+// ---------------------------------------------------------------- 区块 C 用户上限（0.5.3）
+
+function postBody(body: unknown): any {
+  return makeReq({
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+test('路由 POST limits：走 setLimits（23 键全落点），并把 accepted/ignored 原样回报', async () => {
+  const runtime = runtimeStub();
+  const seen: any[] = [];
+  runtime.setLimits = (patch: unknown, options: unknown) => {
+    seen.push({ patch, options });
+    return { ok: true, accepted: patch, ignored: ['stray=1'] };
+  };
+  const ctx = ctxWith({ streamAgentRuntime: runtime });
+  const res = await invoke(ctx, postBody({ limits: { maxSteps: 40, maxInputTokens: 48000 }, limitsReplace: true }));
+  assert.equal(res.status, 200);
+  const payload = JSON.parse(res.payload);
+  assert.equal(payload.ok, true);
+  assert.deepEqual(seen, [{ patch: { maxSteps: 40, maxInputTokens: 48000 }, options: { replace: true } }]);
+  assert.ok(Array.isArray(payload.warnings) && payload.warnings.includes('stray=1'), 'ignored 键必须回报');
+});
+
+test('路由 POST limits：非法/未知/负数被内核校验拒绝（400），不落盘也不调运行时', async () => {
+  const runtime = runtimeStub();
+  const seen: any[] = [];
+  runtime.setLimits = (patch: unknown) => { seen.push(patch); return { ok: true }; };
+  const ctx = ctxWith({ streamAgentRuntime: runtime });
+
+  const unknown = await invoke(ctx, postBody({ limits: { nosuch: 3 } }));
+  assert.equal(unknown.status, 400, JSON.parse(unknown.payload).error.message);
+  const negative = await invoke(ctx, postBody({ limits: { maxSteps: -1 } }));
+  assert.equal(negative.status, 400);
+  const notObject = await invoke(ctx, postBody({ limits: [1, 2] }));
+  assert.equal(notObject.status, 400);
+  assert.deepEqual(seen, [], '被拒的补丁不得进入运行时');
+});
+
+test('路由 POST limits：limits:null + limitsReplace = 清空为"全部不限制"', async () => {
+  const runtime = runtimeStub();
+  const seen: any[] = [];
+  runtime.setLimits = (patch: unknown, options: unknown) => { seen.push({ patch, options }); return { ok: true, persisted: {} }; };
+  const ctx = ctxWith({ streamAgentRuntime: runtime });
+  const res = await invoke(ctx, postBody({ limits: null }));
+  assert.equal(res.status, 200);
+  assert.deepEqual(seen, [{ patch: {}, options: { replace: true } }]);
+});
+
+test('降级分支不再抹掉用户上限：只改通道时 limits 原样保留（0.5.2 真 bug 回归）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tf-ui-limits-'));
+  const prev = process.env.STREAM_AGENT_STATE_DIR;
+  process.env.STREAM_AGENT_STATE_DIR = dir;
+  try {
+    const { writePersistedControl, readPersistedControl } = await import('../dist/entry/control-state.js');
+    writePersistedControl({ channel: 'standard', tier: 'standard', lang: 'zh', limits: { maxSteps: 40 } });
+    const ctx = ctxWith({}); // 无 streamAgentRuntime → 降级分支
+    const res = await invoke(ctx, postBody({ channel: 'code' }));
+    assert.equal(res.status, 200);
+    const after = readPersistedControl();
+    assert.equal(after.state.channel, 'code');
+    assert.deepEqual(after.limits, { maxSteps: 40 }, '改通道不得抹掉用户定义的上限');
+  } finally {
+    if (prev === undefined) delete process.env.STREAM_AGENT_STATE_DIR;
+    else process.env.STREAM_AGENT_STATE_DIR = prev;
+  }
+});
+
+test('路由 POST 降级分支：改通道不得把关掉的 contextFold/finalCheck 写回 true', async () => {
+  // 0.6.0：writePersistedControl 对缺字段按默认 true 落盘，降级分支若只写
+  // channel/tier/lang，就把用户关掉的开关整个抹掉（与 0.5.3 "改通道丢 limits" 同源）。
+  const dir = mkdtempSync(join(tmpdir(), 'tf-ui-degrade-'));
+  const saved = process.env['STREAM_AGENT_STATE_DIR'];
+  try {
+    process.env['STREAM_AGENT_STATE_DIR'] = dir;
+    writeFileSync(join(dir, 'control.json'), JSON.stringify({
+      schema: 4, channel: 'standard', tier: 'standard', lang: 'zh', contextFold: false, finalCheck: false,
+    }), 'utf8');
+    // 无 streamAgentRuntime = loop 未接管的降级分支
+    const res = await invoke(
+      ctxWith({}),
+      makeReq({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ channel: 'code' }),
+      }),
+    );
+    assert.equal(res.status, 200);
+    const raw = JSON.parse(readFileSync(join(dir, 'control.json'), 'utf8')) as Record<string, unknown>;
+    assert.equal(raw['channel'], 'code', '通道要写对');
+    assert.equal(raw['contextFold'], false, '降级分支不得把 contextFold 写回 true');
+    assert.equal(raw['finalCheck'], false, '降级分支不得把 finalCheck 写回 true');
+  } finally {
+    if (saved === undefined) delete process.env['STREAM_AGENT_STATE_DIR'];
+    else process.env['STREAM_AGENT_STATE_DIR'] = saved;
   }
 });

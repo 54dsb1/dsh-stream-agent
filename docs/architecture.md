@@ -30,7 +30,7 @@
 | 模块 | 职责 | 关键不变量 |
 |---|---|---|
 | `state.ts` | 内容寻址的状态树、句柄分配、blob 寻址 | 同一内容必然得到同一 hash，句柄稳定可重算 |
-| `obs.ts` | 工具观测归类（`info_gain` = high / low / none）、行骨架、目录差分 | 分类是纯函数，输入相同结果必相同 |
+| `obs.ts` | 工具观测归类（`info_gain` = full / dedup / handle）、行骨架、目录差分 | 分类是纯函数，输入相同结果必相同 |
 | `parser.ts` | `tf-*` 命令的逐 chunk 解析 | 协议语法的唯一权威；命令闭合才派发，不等流结束 |
 | `gate.ts` | 动作准入：read / spec / commit / fatal 四级 + 一次性凭据 | 缺 reversibility 声明在 `registry.freeze()` 就抛错（启动期失败，不是运行期惊喜） |
 | `render.ts` | 上下文三段式装配 + 前缀单调断言 | 动态内容不得进入稳定前缀；hash 不单调即 fail-closed |

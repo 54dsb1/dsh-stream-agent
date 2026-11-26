@@ -10,6 +10,8 @@ node_modules/
 #   迭代/调试批次（probe-*、smoke-*、同日早期轮次）不入库，避免模型现场生成的临时脚本污染仓库。
 eval/runs/*
 !eval/runs/2026-11-15-v02/
+#   0.6.0 RA-0 六项探针产物是计划 §2.4 的交付物（结论 + 证据行），必须入库：
+!eval/runs/ra0/
 
 # 测试覆盖
 coverage/
@@ -26,3 +28,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# 测试/调试临时产物（v051 等用例会在仓库根建 .tmp-test/；不留入库）
+.tmp-*

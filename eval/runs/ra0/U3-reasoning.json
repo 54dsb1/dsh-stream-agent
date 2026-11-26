@@ -1,0 +1,78 @@
+{
+  "id": "U3",
+  "question": "reasoning 块是否必须原样回传（DeepSeek thinking 语义）",
+  "observation": "去掉旧 reasoning 后的请求是否被拒 / 降质",
+  "verdict": "unknown",
+  "scope": "plugin-seam",
+  "hostVerification": "pending",
+  "reason": "本插件不走 reasoning 通道（文本协议，请求里从无 reasoning 块）；provider 是否要求回传只能由真机 provider 判定，离线不得推断。策略固定 provider-required。",
+  "requests": [
+    {
+      "index": 0,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3,
+          "head": "SYS"
+        },
+        {
+          "role": "user",
+          "chars": 6,
+          "head": "turn-0"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 1,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3,
+          "head": "SYS"
+        },
+        {
+          "role": "user",
+          "chars": 6,
+          "head": "turn-1"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 2,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3,
+          "head": "SYS"
+        },
+        {
+          "role": "user",
+          "chars": 6,
+          "head": "turn-2"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3,
+      "hasReasoningBlocks": false
+    }
+  ],
+  "diff": [
+    "3 个请求均无 reasoning 块（hasReasoningBlocks=false）"
+  ],
+  "evidence": [
+    {
+      "at": "entry/loop.ts:3777",
+      "quote": "case 'reasoning-delta': {"
+    },
+    {
+      "at": "kernel/assembly.ts:60",
+      "quote": "reasoning: 'provider-required' | 'drop-stale';"
+    }
+  ]
+}

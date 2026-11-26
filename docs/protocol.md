@@ -1,5 +1,11 @@
 # 单流协议
 
+> **归档说明（0.5.0 起）**：本文是 0.3.x–0.4.x 的实现参考，逐命令的细节行为仍可对照本文；
+> **语义权威已迁至 [PROTOCOL-v1.md](../PROTOCOL-v1.md)**，两者冲突时以 PROTOCOL-v1 为准。
+> 本文不再跟随版本修订（只修正错字与失效链接）；新增能力与通道语义只写进 PROTOCOL-v1。
+> 另：本文中出现的 `power` 模式 / `enableCode` 等旧开关为 0.4.x 口径，0.5.0 由控制栏的
+> 执行通道与上下文档位替代（见 [docs/channel-matrix.md](channel-matrix.md)）。
+
 ## 命令语法
 
 模型在一次流里连续输出 `tf-*` 命令。语法以 `src/kernel/parser.ts` 为唯一权威，下面只是等价描述。
@@ -7,7 +13,7 @@
 | 命令 | 属性 | 语义 | 结果处理 |
 |---|---|---|---|
 | `tf-write` | `path`、`content`/`patch` | 写或改文件 | 成功只记 ledger，**绝不注入** |
-| `tf-read` | `path`，可选 `offset`/`limit`（1 基行号） | 读文件 | 读**外部文件**完整反馈一次（≤8000 字符，超限留头尾）；读**本任务 `tf-write` 写过的路径**只注入回执（`[tf-stream:receipt]`，行数 + sha256 指纹，0.2.0 O7）；补充走 `tf-peek` |
+| `tf-read` | `path`，可选 `offset`/`limit`（1 基行号） | 读文件 | 读**外部文件**完整反馈一次（≤8000 字符，超限留头尾）；读**本任务 `tf-write` 写过的路径**默认同样全文注入（0.5.1 起，对齐上游 `max_content_chars=0`）；装配 `selfReadFeedback: 'receipt'` 则回退为只注入回执（`[tf-stream:receipt]`，行数 + sha256 指纹，0.2.0 O7）；补充走 `tf-peek` |
 | `tf-edit`（0.3.0 F1） | `path`，可选 `replace_all`；body = `<<<<<<< OLD` / 原文 / `=======` / 新文 / `>>>>>>> NEW` 标记块 | 精确替换（映射宿主 `edit`；不做模糊匹配，匹配失败结构化报错，绝不静默改全文） | 成功只记 ledger；失败注结构化原因 |
 | `tf-append`（0.3.0 F1） | `path`，可选 `anchor`（锚点原文）；body = 追加正文 | 只追加不改既有内容：有 anchor = 锚点后插入（映射宿主 `edit`）；无 anchor = EOF 追加（映射宿主 `apply_patch` 的 `*** End of File` 锚） | 成功只记 ledger |
 | `tf-grep`（0.3.0 F2） | `pattern`，可选 `path`/`include` | 内容搜索（映射宿主 fs-search `grep`），只回匹配行（自带行号、按文件分组） | 首次/变化完整注入；超限句柄化 |
@@ -36,7 +42,7 @@ tf-call 是通用调用通道（G2：命令表净增 1，上限 14）：对等�
 | **过早 final 检测** | final 带未满足依赖或未完成命令时，注入引导让模型重发 | 提前收工 |
 | **错误取因** | 逐层解包 `ToolBatchExecutionError.cause` | 失败 detail 不可定位 |
 | **tf-code 隔离执行（0.2.0；0.3.0 收口）** | 程序体闭合即派发到宿主 PTC runtime（resolve→run）；返回值无损 JSON 句柄化，中间结果不进上下文；绑定失败对齐 ToolCallError 语义。0.3.0：回合 signal 直通（K4）、cwd 透传与沙箱事实逐次记账（K2）、八类失败 kind + 可重试结论（K3）、三项配额硬限制（K5）、默认关闭显式开启（K1） | 重型数据加工只回结论不回过程；取消/超限/沙箱拒绝都有具名失败与账本记录 |
-| **自写回验 receipt（O7）** | `tf-read` 命中本任务 `tf-write` 已写过的路径（分隔符规范化后比对）→ 回执注入，不回灌全文；`selfReadFeedback: 'full'` 关闭 | 写批任务"写 → 读回验"循环烧 token |
+| **自写回验（O7）** | `tf-read` 命中本任务 `tf-write` 已写过的路径（分隔符规范化后比对）：0.5.1 起默认回灌全文（`selfReadFeedback: 'full'`，对齐上游 `max_content_chars=0`）；`selfReadFeedback: 'receipt'` 为 0.4.x 回退点，命中时注入 `[tf-stream:receipt]`（行数 + sha256） | 写批任务"写 → 读回验"循环：默认让模型看见自己写的原文，需省 token 时切回回执 |
 | **code 结果可见性（F3，0.3.0）** | 仅 tf-code 显式开启时：首成功/变化值 ≤4000 字符完整注入（省一次 tf-peek 往返），超限骨架 + 句柄 | 值可见 ≥95% 而 peek ≤10%；不恢复全量回灌 |
 | **原生通道上限（F4，0.3.0）** | 仅声明 `nativeToolSchemas` 时：原生 tool_call 结果单块 >6000 字符 → 骨架 + 句柄（obs 登记，可 tf-peek） | 原生通道不成为全量回灌后门 |
 | **计划与验收（F5，0.3.0）** | 计划状态在驱动器侧，请求只注差分（新计划全量一次，此后只注变化）；`accepts` 命令回执是唯一验证来源，模型自述不算；有未验证验收项时 tf-final 判过早 | 复合任务"声称完成但无回执"被结构性拦截 |

@@ -1,0 +1,140 @@
+{
+  "id": "U1",
+  "question": "llm/stream 的 messages 是否可与 session 投影不同（裁剪 / 替换 / 重排）",
+  "observation": "3 个连续请求的 messages 快照；最后一个请求与插件投影逐条 diff",
+  "verdict": "supported",
+  "scope": "plugin-seam",
+  "hostVerification": "pending",
+  "reason": "真实驱动器 3 个请求：最后请求的 messages 与插件投影逐条逐字节一致（10 条），2/3 个请求含插件专有块（[tf-stream:…]）——\"这次带什么\"由插件决定，宿主未重建；前两个请求只做快照（驱动器的投影每请求重建，探针无法在请求间隙取快照）；宿主是否允许它与自身 session 投影不同仍需真机确认",
+  "requests": [
+    {
+      "index": 0,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3502,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3502,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 1,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3502,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 a。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=1 上一步动作与结果]\n- r1 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r1@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3502,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 2,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3502,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 a。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=1 上一步动作与结果]\n- r1 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r1@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 b。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=2 上一步动作与结果]\n- r2 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r2@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3502,
+      "hasReasoningBlocks": false
+    }
+  ],
+  "diff": [
+    "消息条数 2 → 6 → 10",
+    "含插件专有块的请求数 2/3",
+    "最后请求与投影逐条一致：是（10 条）"
+  ],
+  "evidence": [
+    {
+      "at": "entry/loop.ts:485",
+      "quote": "stream(options: StreamRequestOptions): AsyncIterable<StreamChunkLike>;"
+    },
+    {
+      "at": "entry/loop.ts:3746",
+      "quote": "messages: toWireMessages(messages),"
+    }
+  ]
+}

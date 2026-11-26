@@ -96,10 +96,11 @@ export function compactItems(items: readonly CompactItem[], opts: CompactOptions
 
   // 摘要总长收敛（§7.6）：超 maxSummaryChars 按"最旧先丢"删行，直到 ≤ 上限
   //（或只剩头部标记行）。被丢行的事实仍在句柄/台账里，摘要不承载全部历史。
+  // 0.5.2：maxSummaryChars = 0 → **不设上限**（用户未定义，插件不替用户决定摘要长度）。
   const header = `[tf-stream:summary] 已压缩 ${toCompact.length} 条旧消息（原文已句柄化，可 tf-peek 取回；只做提取截断拼接，无语义归纳）：`;
   let body = lines;
   const fits = (ls: readonly string[]): number => (ls.length === 0 ? header.length : header.length + 1 + ls.join('\n').length);
-  while (body.length > 0 && fits(body) > opts.maxSummaryChars) {
+  while (opts.maxSummaryChars > 0 && body.length > 0 && fits(body) > opts.maxSummaryChars) {
     body = body.slice(1); // 最旧先丢
   }
   const summaryText = body.length === 0

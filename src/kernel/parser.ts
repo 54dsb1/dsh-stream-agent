@@ -62,6 +62,12 @@
  * - 非正文命令的配对开标签（v0.3.2）：`<tf-read ...>` 少了 `/` 时，0.3.1 会进入 body 模式
  *   一直吞到流末尾（整个后续输出消失）。现在非正文命令一旦出现下一个 `<tf-` / `</tf-`
  *   即视为已闭合（命令照常派发），流末尾仍未闭合也发命令并把剩余文本按 prose 归还。
+ * - 围栏（0.5.1，TF 对齐 2.1）：行首（≤3 空格缩进）的 ``` / ~~~ 围栏内的 `<tf-*>` 只是
+ *   **散文**——模型在示例/补丁片段里写的命令不得被执行（真机最危险的形态：解释协议时
+ *   顺手写一条 `tf-write` 示例，文件被覆盖）。围栏状态机覆盖缩进、不同标记字符、闭合行
+ *   长度 ≥ 开启行；未闭合的围栏延续到流末（CommonMark 语义），整段按正文逐字节保留。
+ *   围栏只在 ground 模式判定——命令正文（tf-write/tf-edit/... 的 body）里的围栏标记
+ *   不改变状态（body 已由闭合标签界定）。
  *
  * 事件类型：text / command / malformed / truncated / cycle / done。
  * 命令闭合立即 emit，不等流结束；"当前可执行集合"用 readyCommands() 查询
@@ -75,7 +81,8 @@
 export type TfCommandName =
   | 'tf-write' | 'tf-read' | 'tf-edit' | 'tf-append' | 'tf-grep' | 'tf-glob'
   | 'tf-bash' | 'tf-peek' | 'tf-final' | 'tf-code' | 'tf-plan'
-  | 'tf-call' | 'tf-ask' | 'tf-skill';
+  | 'tf-call' | 'tf-ask' | 'tf-skill'
+  | 'tf-changes' | 'tf-diff' | 'tf-revert';
 
 interface CommandSchema {
   required: readonly string[];
@@ -93,19 +100,24 @@ const COMMAND_SCHEMAS: Readonly<Record<TfCommandName, CommandSchema>> = {
   // F1：精确替换（body 用 OLD/NEW 标记行分隔两段字面量）与追加（body = 追加正文；
   // anchor 给出插入锚点字面量，缺省 = 追加到文件末尾）。两者都映射宿主 edit/apply_patch，
   // 不自建文件 IO。
-  'tf-edit': { required: ['path'], optional: ['replace_all'], hasBody: true },
+  // v1.1.0（4.1）：offset 声明编辑目标起始行（配合 revision 守卫的范围读覆盖检查）。
+  'tf-edit': { required: ['path'], optional: ['replace_all', 'offset'], hasBody: true },
   'tf-append': { required: ['path'], optional: ['anchor'], hasBody: true },
   // F2：搜索只回匹配行/路径（宿主 fs-search 的 grep/glob 映射），不回全文。
   'tf-grep': { required: ['pattern'], optional: ['path', 'include'], hasBody: false },
   'tf-glob': { required: ['pattern'], optional: ['path'], hasBody: false },
   'tf-bash': { required: ['cmd'], optional: [], hasBody: false },
-  'tf-peek': { required: ['handle'], optional: ['from_line', 'to_line', 'symbol'], hasBody: false },
+  // v1.1.0（2.3）：offset=字符级起点、query=字面续搜串（对齐 thinkflow recall.py:34）。
+  // from_line/to_line/symbol 仍为行/符号定位；offset/query 为字符级，二者可共存但以 offset 优先。
+  'tf-peek': { required: ['handle'], optional: ['from_line', 'to_line', 'symbol', 'offset', 'query'], hasBody: false },
   'tf-final': { required: [], optional: ['summary'], hasBody: false },
   // F5：计划与验收——body 按行声明验收项（`- [id] 描述`）；计划状态在驱动器（宿主侧）持有，
   // 请求只注差分；tf-final 在存在未验证验收项时判定为过早。
   'tf-plan': { required: [], optional: [], hasBody: true },
-  // 程序体 = PTC 的 async TS 函数体（可擦除语法）；description 只进台账，timeout 为毫秒数
-  'tf-code': { required: [], optional: ['timeout', 'description'], hasBody: true },
+  // 程序体 = PTC 的 async TS 函数体（可擦除语法）；description 只进台账，timeout 为毫秒数。
+  // v1.2.0（b 通道 PTC 对齐）：format=function-body|repl|script；state=命名状态域；sandbox=策略名。
+  // v1.3.0（0.5.3）：sandbox_permissions + justification = 单次提权（宿主 run_code 同构，必须成对）。
+  'tf-code': { required: [], optional: ['timeout', 'description', 'format', 'state', 'sandbox', 'release', 'sandbox_permissions', 'justification'], hasBody: true },
   // v0.4.0 通用调用通道（G2：净增 1）：name = 本会话冻结工具面内的宿主工具名；
   // body = JSON 对象（参数原样透传给 ctx.tools.execute）。parser 只做 schema 校验，
   // 工具名/JSON 的语义校验在驱动器（unknown-tool / bad-json-arguments 结构化失败）。
@@ -115,10 +127,16 @@ const COMMAND_SCHEMAS: Readonly<Record<TfCommandName, CommandSchema>> = {
   // 参数刻意极简（JSON 免转义）；复杂形状（多问题/选项描述）走 tf-call body。
   'tf-ask': { required: ['q'], optional: ['header', 'options'], hasBody: false },
   'tf-skill': { required: ['name'], optional: [], hasBody: false },
+  // v1.5.0（0.6.0 正式版，changes 缺口修复）：私有变更回执与守卫式回滚
+  //（对齐 [TF]/changes.py list_changes/diff/revert）。change = 回执 id（32 位十六进制）；
+  // expected = 该回执的 after_hash（tf-changes 输出里给出）——双重校验防覆盖外部后续编辑。
+  'tf-changes': { required: [], optional: ['path'], hasBody: false },
+  'tf-diff': { required: ['change'], optional: [], hasBody: false },
+  'tf-revert': { required: ['change', 'expected'], optional: [], hasBody: false },
 };
 
 const COMMAND_NAMES: readonly TfCommandName[] =
-  ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan', 'tf-call', 'tf-ask', 'tf-skill'];
+  ['tf-write', 'tf-read', 'tf-edit', 'tf-append', 'tf-grep', 'tf-glob', 'tf-bash', 'tf-peek', 'tf-final', 'tf-code', 'tf-plan', 'tf-call', 'tf-ask', 'tf-skill', 'tf-changes', 'tf-diff', 'tf-revert'];
 
 export interface TfCommand {
   name: TfCommandName;
@@ -146,13 +164,28 @@ export type ParserEvent =
 // 流式解析器
 // ---------------------------------------------------------------------------
 
-type Mode = 'ground' | 'header' | 'body' | 'dsml';
+type Mode = 'ground' | 'header' | 'body' | 'dsml' | 'fence';
 type TagProbe = 'tag' | 'prose' | 'tf-unknown' | 'close-tag' | 'need-more' | 'dsml';
+
+/** 围栏状态（0.5.1 / 2.1）：marker 字符 + 开启行长度（闭合行长度必须 ≥ 它）。 */
+interface FenceState {
+  ch: '`' | '~';
+  len: number;
+}
 
 export class TfStreamParser {
   private buf = '';
   private mode: Mode = 'ground';
   private ended = false;
+
+  /** 0.5.1（2.1）：围栏状态；null = 不在围栏内。 */
+  private fence: FenceState | null = null;
+  /** 开启行的剩余部分是否已消费（首个换行之后才开始判闭合行）。 */
+  private fenceBodyStarted = false;
+  /** 下一字符是否处于行首（围栏只在此位置开启；行首判定需要跨 chunk 保持）。 */
+  private atLineStart = true;
+  /** 0.5.2（审计 C-9）：是否处于行内代码（`…`）中——其中的 `<tf-*>` 是示例文本。 */
+  private inlineCode = false;
 
   /** DSML 参数式调用块缓冲（v0.3.2）：从无内联属性的 invoke 开标签起，缓冲到块闭合。 */
   private dsmlBuf = '';
@@ -215,6 +248,13 @@ export class TfStreamParser {
       } else {
         events.push({ type: 'truncated', raw: this.buf, reason: 'unclosed-command-tag' });
       }
+    } else if (this.mode === 'fence') {
+      // 0.5.1（2.1）：围栏未闭合即流终止——CommonMark 语义：围栏延续到流末，
+      // 剩余内容全部是正文（逐字节保留），不发 truncated（它不是命令截断）。
+      if (this.buf !== '') events.push({ type: 'text', text: this.buf });
+      this.buf = '';
+      this.fence = null;
+      this.mode = 'ground';
     } else if (this.mode === 'body') {
       if (!COMMAND_SCHEMAS[this.bodyName!].hasBody) {
         // v0.3.2：非正文命令的配对开标签缺闭合——命令本身是完整的（属性齐），
@@ -294,15 +334,95 @@ export class TfStreamParser {
     if (this.mode === 'ground') return this.stepGround(events);
     if (this.mode === 'header') return this.stepHeader(events);
     if (this.mode === 'dsml') return this.stepDsml(events);
+    if (this.mode === 'fence') return this.stepFence(events);
     return this.stepBody(events);
   }
 
-  private stepGround(events: ParserEvent[]): boolean {
+  /**
+   * 推一块正文，并顺带维护"是否在行内代码里"（0.5.2 / 审计 C-9）。
+   * 行内代码不跨行：遇到换行即重置；同一行里反引号奇偶翻转。
+   * 围栏代码块走 fence 模式（不经过这里），两者互不干扰。
+   */
+  private pushText(events: ParserEvent[], text: string): void {
+    if (text === '') return;
+    events.push({ type: 'text', text });
+    let start = 0;
+    for (;;) {
+      const nl = text.indexOf('\n', start);
+      const seg = nl === -1 ? text.slice(start) : text.slice(start, nl);
+      if ((seg.match(/`/g)?.length ?? 0) % 2 === 1) this.inlineCode = !this.inlineCode;
+      if (nl === -1) break;
+      this.inlineCode = false; // 换行 = 行内代码边界（Markdown 行内代码不跨行）
+      start = nl + 1;
+    }
+  }
+
+  private stepGround(events: ParserEvent[]): boolean {    // 0.5.1（2.1）：围栏只在这一处判定（ground + 行首）。开启行整行是正文；
+    // 进入围栏后 `<tf-*>` 不再进入 header 模式（示例命令 0 执行）。
+    if (this.atLineStart) {
+      const opened = matchFenceOpen(this.buf);
+      if (opened === 'need-more') return false;
+      if (opened !== null) {
+        this.pushText(events, this.buf.slice(0, opened.end));
+        this.buf = this.buf.slice(opened.end);
+        this.fence = { ch: opened.ch, len: opened.len };
+        this.fenceBodyStarted = false;
+        this.mode = 'fence';
+        this.atLineStart = false;
+        this.inlineCode = false;
+        return true;
+      }
+    }
     const lt = this.buf.indexOf('<');
+    // 0.6.0 复查修复（P1）：正文前缀里的围栏开启行。matchFenceOpen 只判 buf 开头——
+    // 同 chunk "正文 + 围栏 + 命令"（生产 SSE 大块/整段重放常见粒度）时，`<` 之前的
+    // 围栏开启行被 pushText 整体吞掉，围栏从未开启、其中的 `<tf-*>` 被真实派发
+    //（示例命令 0 执行的防线失效，且行为随 feed 分块粒度漂移）。在进入 tag 分派前
+    // 先对 `<` 之前（无 `<` 时对全 buf）的完整行扫围栏开启行。
+    const scanEnd = lt === -1 ? this.buf.length : lt;
+    const fenceAt = this.#scanFenceOpenPrefix(scanEnd);
+    if (fenceAt !== null) {
+      this.pushText(events, this.buf.slice(0, fenceAt));
+      this.buf = this.buf.slice(fenceAt);
+      // buf 开头此时必然是完整围栏开启行（行首）——复用既有进入逻辑。
+      const opened = matchFenceOpen(this.buf);
+      if (opened === 'need-more') return false;
+      if (opened !== null) {
+        this.pushText(events, this.buf.slice(0, opened.end));
+        this.buf = this.buf.slice(opened.end);
+        this.fence = { ch: opened.ch, len: opened.len };
+        this.fenceBodyStarted = false;
+        this.mode = 'fence';
+        this.atLineStart = false;
+        this.inlineCode = false;
+        return true;
+      }
+    }
     if (lt === -1) {
-      if (this.buf !== '') events.push({ type: 'text', text: this.buf });
+      if (this.buf !== '') {
+        this.pushText(events, this.buf);
+        this.atLineStart = this.buf.endsWith('\n');
+      }
       this.buf = '';
       return false;
+    }
+    // 0.5.2（审计 C-9）：行内代码隔离——`<tf-read .../>` 写在反引号里是**示例文本**，
+    // 不是命令。此前只隔离了围栏代码块，行内反引号里的文本照样被当成命令执行
+    //（模型解释协议时会无意触发一次真实工具调用）。判据：本行当前位置之前的反引号
+    // 个数为奇数 = 处于行内代码中（行内代码不跨行，遇换行即重置）。
+    // 0.6.0 复查修复（P3）：this.inlineCode 只反映**已 emit** 的文本——同 chunk 中
+    // 反引号与 `<` 相邻时前缀尚未经过 pushText，状态是旧值（行为随分块粒度漂移）。
+    // 现按"当前位置"计算：跨过换行（重置后）取当前行前缀的奇偶；同一行内则翻转基值。
+    const prefix = this.buf.slice(0, lt);
+    const lastNl = prefix.lastIndexOf('\n');
+    const linePrefix = lastNl === -1 ? prefix : prefix.slice(lastNl + 1);
+    const oddTicks = (linePrefix.match(/`/g)?.length ?? 0) % 2 === 1;
+    const inlineAtLt = lastNl >= 0 ? oddTicks : (oddTicks ? !this.inlineCode : this.inlineCode);
+    if (inlineAtLt) {
+      this.pushText(events, this.buf.slice(0, lt + 1));
+      this.buf = this.buf.slice(lt + 1);
+      this.atLineStart = false;
+      return true;
     }
     const probe = probeTag(this.buf.slice(lt));
     if (probe === 'need-more') return false;
@@ -315,21 +435,86 @@ export class TfStreamParser {
       const close = scanHeaderClose(this.buf.slice(lt));
       const gt = close === null ? -1 : lt + close.end;
       const raw = gt === -1 ? this.buf.slice(lt) : this.buf.slice(lt, gt + 1);
-      if (lt > 0) events.push({ type: 'text', text: this.buf.slice(0, lt) });
+      if (lt > 0) this.pushText(events, this.buf.slice(0, lt));
       this.buf = gt === -1 ? '' : this.buf.slice(gt + 1);
       events.push({ type: 'malformed', raw, reason: `stray-close-tag:${closeTagName(raw)}` });
+      this.atLineStart = false;
       return true;
     }
     if (probe === 'prose') {
       // '<' 是普通文本的一部分：原样透传，从 '<' 之后继续扫
-      events.push({ type: 'text', text: this.buf.slice(0, lt + 1) });
+      this.pushText(events, this.buf.slice(0, lt + 1));
       this.buf = this.buf.slice(lt + 1);
+      this.atLineStart = false;
       return true;
     }
     // tag / tf-unknown / dsml：都进入 header 模式（后两者闭合时判 malformed 或改写）
-    if (lt > 0) events.push({ type: 'text', text: this.buf.slice(0, lt) });
+    if (lt > 0) this.pushText(events, this.buf.slice(0, lt));
     this.buf = this.buf.slice(lt);
     this.mode = 'header';
+    this.atLineStart = false;
+    return true;
+  }
+
+  /**
+   * 0.6.0 复查修复（P1）：在正文前缀 [0, hardEnd) 内扫"行首围栏开启行"。
+   * 返回第一个开启行的行首偏移；无则 null。只扫完整行（行末有 `\n` 才可信——
+   * 未闭合的 ` ``` ` 片段可能还在跨 chunk 累积，留给 stepFence/need-more 处理）。
+   * 行首定义：位置 0（且本 parser 处于行首）或任意 `\n` 之后。
+   * 行级判定复用 matchFenceOpen（完整行必然可判定；need-more 只会来自
+   * "仅 ≤3 空格"的空行形态，按非围栏跳过）。
+   */
+  #scanFenceOpenPrefix(hardEnd: number): number | null {
+    let lineStart = 0;
+    if (!this.atLineStart) {
+      const nl = this.buf.indexOf('\n');
+      if (nl === -1 || nl >= hardEnd) return null;   // 首行是续行且无完整行 → 无候选
+      lineStart = nl + 1;
+    }
+    for (;;) {
+      const nl = this.buf.indexOf('\n', lineStart);
+      if (nl === -1 || nl >= hardEnd) return null;   // hardEnd 之后才换行的行不在扫描范围
+      const line = this.buf.slice(lineStart, nl);
+      const verdict = matchFenceOpen(line);
+      if (verdict !== null && verdict !== 'need-more') return lineStart;
+      lineStart = nl + 1;
+    }
+  }
+
+  /**
+   * 0.5.1（2.1）：围栏内推进。开启行的剩余部分先当正文消费（首个换行之后才可能闭合）；
+   * 之后逐行找闭合行（≤3 空格缩进、同标记字符、长度 ≥ 开启行、行内无其它字符）。
+   * 找不到闭合时把"看起来可能是闭合行前缀"的尾巴扣留下来（跨 chunk 的 ``` 不会被判成正文）。
+   */
+  private stepFence(events: ParserEvent[]): boolean {
+    const fence = this.fence!;
+    if (!this.fenceBodyStarted) {
+      const nl = this.buf.indexOf('\n');
+      if (nl === -1) {
+        if (this.buf !== '') {
+          events.push({ type: 'text', text: this.buf });
+          this.buf = '';
+        }
+        return false;
+      }
+      events.push({ type: 'text', text: this.buf.slice(0, nl + 1) });
+      this.buf = this.buf.slice(nl + 1);
+      this.fenceBodyStarted = true;
+      return true;
+    }
+    const close = findFenceClose(this.buf, fence);
+    if (close === null) {
+      const keep = fenceTailKeep(this.buf, fence);
+      const emit = this.buf.slice(0, this.buf.length - keep);
+      if (emit !== '') events.push({ type: 'text', text: emit });
+      this.buf = this.buf.slice(this.buf.length - keep);
+      return false;
+    }
+    events.push({ type: 'text', text: this.buf.slice(0, close.end) });
+    this.buf = this.buf.slice(close.end);
+    this.fence = null;
+    this.mode = 'ground';
+    this.atLineStart = true;
     return true;
   }
 
@@ -568,6 +753,79 @@ export class TfStreamParser {
 }
 
 // ---------------------------------------------------------------------------
+// 围栏（0.5.1 / 2.1）
+// ---------------------------------------------------------------------------
+
+/**
+ * 行首围栏开启判定。返回标记字符与长度（长度 ≥3）以及开启行的消费终点；
+ * 'need-more' = 当前缓冲还不足以判定（只有 ≤3 个空格、或 <3 个同字符标记）；
+ * null = 这一行不是围栏（普通正文）。
+ *
+ * 缩进规则对齐 CommonMark：0–3 个空格算围栏，4 个及以上是缩进代码块（不开启围栏）。
+ * 反引号围栏的 info string 不得再含反引号（否则是行内代码的畸形写法，不当作围栏）。
+ */
+function matchFenceOpen(buf: string): { ch: '`' | '~'; len: number; end: number } | 'need-more' | null {
+  let i = 0;
+  while (i < 3 && buf[i] === ' ') i += 1;
+  if (i === buf.length) return 'need-more'; // 只有 ≤3 个空格：可能还在围栏缩进里
+  const ch = buf[i];
+  if (ch !== '`' && ch !== '~') return null;
+  let j = i;
+  while (buf[j] === ch) j += 1;
+  const len = j - i;
+  if (len < 3) {
+    // 只有标记字符（可能还在跨 chunk 累积）→ 等更多数据；出现其它字符 → 不是围栏
+    const rest = buf.slice(i);
+    return /^[`~]*$/.test(rest) ? 'need-more' : null;
+  }
+  if (ch === '`') {
+    // 反引号围栏的 info string 不允许含反引号——含了就是行内代码的畸形写法
+    const lineEnd = buf.indexOf('\n', j);
+    const info = lineEnd === -1 ? buf.slice(j) : buf.slice(j, lineEnd);
+    if (info.includes('`')) return null;
+  }
+  return { ch, len, end: j };
+}
+
+/** 围栏内找闭合行：≤3 空格缩进 + 同标记字符 + 长度 ≥ 开启行 + 行内无其它字符。 */
+function findFenceClose(buf: string, fence: FenceState): { end: number } | null {
+  let pos = 0;
+  for (;;) {
+    const nl = buf.indexOf('\n', pos);
+    if (nl === -1) return null; // 未完整行：等更多数据（可能正是被拆开的闭合行）
+    const line = buf.slice(pos, nl);
+    if (isFenceCloseLine(line, fence)) return { end: nl + 1 };
+    pos = nl + 1;
+  }
+}
+
+function isFenceCloseLine(line: string, fence: FenceState): boolean {
+  const m = /^( {0,3})([`~]+)[ \t]*$/.exec(line);
+  if (m === null) return false;
+  // 0.6.0 复查修复（P2，CommonMark 闭合规则）：闭合行的标记串必须**全部**由开启字符构成——
+  // 此前 [`~]+ 允许混合串（` ```~~~ ` 整行被一次吃掉判闭合），围栏提前关闭、其后本应
+  // 受保护的 `<tf-*>` 被真实执行。现在逐字符校验与开启字符一致。
+  const run = m[2]!;
+  return run[0] === fence.ch && run.length >= fence.len && run.split('').every((c) => c === fence.ch);
+}
+
+/**
+ * 扣留可能是"闭合行前缀"的尾巴（跨 chunk 的 ``` 不被提前当作正文发出）。
+ * 只扣留最后一行里 ≤3 空格 + 同标记字符（可带尾随空白）的形态；其余一律放行。
+ */
+function fenceTailKeep(buf: string, fence: FenceState): number {
+  const nl = buf.lastIndexOf('\n');
+  const tail = nl === -1 ? buf : buf.slice(nl + 1);
+  if (tail === '') return 0;
+  const m = /^ {0,3}([`~]*)[ \t]*$/.exec(tail);
+  if (m === null) return 0;
+  const markers = m[1]!;
+  if (markers !== '' && markers[0] !== fence.ch) return 0;
+  if (markers.length > fence.len + 3) return 0; // 明显不是闭合行，别无限扣留
+  return tail.length;
+}
+
+// ---------------------------------------------------------------------------
 // 头部扫描与属性解析
 // ---------------------------------------------------------------------------
 
@@ -726,8 +984,17 @@ function decodeXmlEntities(value: string): string {
     .replace(/&(lt|gt|quot|apos|amp);/g, (_, name: string) => (
       name === 'lt' ? '<' : name === 'gt' ? '>' : name === 'quot' ? '"' : name === 'apos' ? '\'' : '&'
     ))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(parseInt(dec, 10)));
+    // 0.6.0 复查修复（P4）：数字实体码点越界（&#x110000; 等）此前直接 String.fromCodePoint
+    // 抛 RangeError——feed() 无兜底，整条流解析中断。解析器纪律是"绝不因畸形输入抛异常"：
+    // 越界/代理区间的引用原样保留（实体不还原，无害不崩溃）。
+    .replace(/&#x([0-9a-fA-F]+);/g, (whole: string, hex: string) => safeCodePoint(whole, parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (whole: string, dec: string) => safeCodePoint(whole, parseInt(dec, 10)));
+}
+
+function safeCodePoint(raw: string, code: number): string {
+  return Number.isFinite(code) && code >= 0 && code <= 0x10FFFF && !(code >= 0xD800 && code <= 0xDFFF)
+    ? String.fromCodePoint(code)
+    : raw;
 }
 
 /** 从 `k="v" k2="v2"` 属性段提取键值（引号内允许 '>'；重复键后者覆盖，交由 schema 兜底）。 */
@@ -1208,8 +1475,17 @@ export interface EditBodySplit {
  * 切分 tf-edit body：`<<<<<<< OLD` 与 `>>>>>>> NEW` 两行之间以 `=======` 行为界，
  * 前段 = old、后段 = new。标记行必须各出现一次且顺序正确；正文换行结构原样保留。
  * 解析失败返回 null（调用方必须回结构化失败，不得静默改成全文重写）。
+ *
+ * 0.5.2（审计 C-8）：同时接受上游 thinkflow 的 `<old>…</old><new>…</new>` 写法——
+ * 上游 47 模块移植过来的提示词与既有会话历史都是这个形状，只认三行标记等于把
+ * 上游存量输入全判成"格式错误"。
  */
 export function splitEditBody(body: string): EditBodySplit | null {
+  return splitEditBodyByMarkers(body) ?? splitEditBodyByTags(body);
+}
+
+/** 三行标记形态（0.3.0 起的原生写法）。 */
+export function splitEditBodyByMarkers(body: string): EditBodySplit | null {
   const lines = body.split('\n');
   const idxOld = lines.indexOf(TF_EDIT_MARKERS.old);
   const idxSplit = lines.indexOf(TF_EDIT_MARKERS.split);
@@ -1221,5 +1497,23 @@ export function splitEditBody(body: string): EditBodySplit | null {
   if (lines.indexOf(TF_EDIT_MARKERS.end, idxEnd + 1) !== -1) return null;
   const old = lines.slice(idxOld + 1, idxSplit).join('\n');
   const $new = lines.slice(idxSplit + 1, idxEnd).join('\n');
+  return { old, new: $new };
+}
+
+/** 上游 tag 形态：`<old>…</old>` + `<new>…</new>`（各自恰好一次，顺序不限）。 */
+export function splitEditBodyByTags(body: string): EditBodySplit | null {
+  const grab = (tag: 'old' | 'new'): string | null => {
+    const open = `<${tag}>`;
+    const close = `</${tag}>`;
+    const from = body.indexOf(open);
+    if (from === -1) return null;
+    const to = body.indexOf(close, from + open.length);
+    if (to === -1) return null;
+    if (body.indexOf(open, from + open.length) !== -1) return null;
+    return body.slice(from + open.length, to);
+  };
+  const old = grab('old');
+  const $new = grab('new');
+  if (old === null || $new === null) return null;
   return { old, new: $new };
 }

@@ -5,10 +5,546 @@
 > **编号说明**：`0.4.0-beta.1 … 0.4.3.2` 是 artifacts 研发线的内部编号；**stable 线对这些
 > 内容统一编号为 `0.4.0`**（本条目）。0.4.3.2 与 0.4.0 的源码等价，唯一差异是版本常量与
 > 本段说明。stable 线上一次发布是 `0.3.3`。
+>
+> **0.5.0 编号说明**：`0.5.0 … 0.6.0` 是 0.5 线研发过程的内部编号（含 `0.5.1-beta`…
+> `0.6.0-beta` 各轮）。**正式发布把这条线的全部内容统一编号为 `0.5.0`**（本条目）；内部
+> 编号的条目保留在下方作为过程记录，不再单独发版。stable 线上一次发布是 `0.4.0`。
 
-## [0.5.0] - 2026-11-22
+## [Unreleased] — 0.5.1 方向（代码级核查 + 预设体系重构 + wire 传输面）
 
-**0.5.0：单插件双通道与正式版。** 一个插件包，一个装载形态；原设想拆两包的两部分能力
+**四件事：① 执行通道「代码」更名「PTC兼容模式」；② 移除 5 套行为预设，默认数值面对齐
+xuxiang-thinkflow 出厂预设，轮数上限（maxSteps）一律不预设；③ wire 传输面对齐 thinkflow
+（max_tokens / stream_options / thinking / tool_choice / retries 五键入 limits，面板随时可改）+
+推理回传策略两实值补全；④ 文档与操作台去版本留痕（README 全量重写）。** 用户自定义权力完整保留。
+
+### Added
+
+- **wire 传输面（对齐 xuxiang-thinkflow provider.py 请求装配语义）**：limits 新增传输组五键——
+  `maxTokens`（max_tokens，0 = 委托给 provider）/ `thinkingBudget`（thinking.budget_tokens，
+  ≥1024 生效）/ `streamUsage`（stream_options.include_usage）/ `maxRetries` + `retryBackoffMs`
+  （建连失败重试，只覆盖建连、不覆盖流中途）。默认 = thinkflow 出厂预设
+  （0/0/0/2/1000），并入 `THINKFLOW_ALIGNED_LIMITS`；每个请求发送前从生效 limits 组装，
+  控制面板 / `limits --set` / 装配 config 改完下一请求即生效。配套字符串设置
+  `thinkingMode`（disabled/enabled/provider type；enabled 且未给 effort 时默认 high）与
+  `tool_choice: 'auto'`（原生工具声明在面内时）。
+- **推理回传策略两实值都真实生效**：`reasoningStrategy` 装配项（默认 `provider-required`，
+  assistant 消息按宿主原样携带 source）——`drop-stale` 保留 source 壳（宿主 LlmRuntime
+  硬要求）但**剥离 replayState**：推理/回放状态绝不回传，请求纯文本、每请求无状态
+  （thinkflow 等价语义）。装配投影与 wire 投影共用该策略；`status --json` 暴露诊断面
+  （strategy / thinkingMode / effort）。
+- **文档与操作台去版本留痕**：README（中英）全量重写——只描述当前版本，无任何
+  "相对 x.x 的增量"/版本对照叙述；docs/limits.md 重写（29 键全表 + 传输组）、
+  docs/channel-matrix.md、preset.yml、PROTOCOL-v1.md 正文清理版本标签（协议规范自身的
+  v1.x 版本史保留）；操作台移除通道卡"行为对照"行与版本字样（`limitsEmpty`、legacy 目录
+  去弃用/移除标注），CLI 帮助不再列出旧 mode 别名（命令保留兼容，仅不再展示）。
+  新增 `test/v062-wire.test.ts`（传输面 7 用例：默认预设 / 用户覆盖 / thinking 形态 /
+  tool_choice / 推理策略 / 建连重试）。
+
+### Changed
+
+- **执行通道更名**：`code` 通道的用户可见名「代码」→「PTC兼容模式」（en `PTC-compat`）。
+  内部 id `code`、配置值 `channel: 'code'`、`channel <standard|code>` CLI 取值全部不变
+  （配置兼容）。同步面：控制栏面板/指南/状态条、桌面控制页（中英）、CLI 帮助、
+  通道不可用告警文案、`preset.yml` 注释、README（中英）、docs/channel-matrix.md。
+- **移除行为预设（`kernel/presets.ts` 删除）**：`light/balanced/deep/raw/unlimited` 五套
+  整组替换入口全部下线——`p` 键循环、CLI `preset [id]`、桌面预设卡、装配 `config.preset`、
+  env `STREAM_AGENT_PRESET`。旧 `control.json` 的 `preset` 标记与 `config.preset`：读取时
+  告警并忽略（红线 5 不静默），写盘不再产生该字段（schema 5 不变）。
+- **默认数值面 = thinkflow 对齐层（`kernel/limits.ts` 新增 `THINKFLOW_ALIGNED_LIMITS`）**，
+  逐项映射 xuxiang-thinkflow `config.example.json`：
+  `keepRecent=30`（keep_recent_messages）/ `maxSummaryChars=16000`（max_summary_chars）/
+  `maxReadChars=200000`（max_read_chars）/ `maxReentries=8`（max_auto_continues，
+  `stallReentries` 由 deriveLimits 跟随）。注入点 = 驱动器 `#limitsFor` 最底层与桌面
+  降级视图 effective 投影；`control.json` 保持**纯用户层**（默认层不物化进盘，随版本可传播）。
+- **前缀不单调处置改为「接受继续」**：wire 承诺前缀断言的三类违约（stable-drift /
+  append-drift / shrink）默认不再 fail-closed/限流——发送前接受为**缓存重置点**，同一份
+  next 照常发送（断言在发送前 → **0 额外请求 / 0 重复计费 / 0 注入文本**），对话不中断；
+  基线随本请求推进，后续请求恢复单调（缓存恢复命中）。物理下限：违约请求本就只有这一版
+  可发，接受即最优；`prefixPolicy='fail'`（显式回退面）保留原 fail-closed + 诊断转储 +
+  最小对账。退役：append-drift 的放行限流（每回合 1 / 每会话 3）、§8.4 换基成本判据
+  （rebaseBudgetRatio，配置字段保留兼容但不再约束）、stable-drift 的"始终 fail"硬规则。
+  同轮自动续跑（`autoContinueOnPrefixFail`）只覆盖 render() 内置 preflight 与显式 fail 面。
+- **PTC 兼容模式来源探测 live 化（修复窗口后开 PTC 被误拒）**：原实现只在插件装载期
+  `detectCodeChannelSource` 探测一次并固化进判据——宿主 PTC preset 按窗口/会话挂载时，
+  装载期探测为空 → `setChannel('code')` 永久拒绝（"写入失败：未检测到 PTC 预设或
+  ptcRuntime"）。0.6.1：`StreamDriverConfig` 新增惰性探针 `codeSourceProbe`（apply 传
+  闭包，每次现取宿主 tools/ptcRuntime 服务重新判定）；驱动器构造与会话级
+  `setChannel('code')` 在判据为空时实时补判，命中即更新缓存来源并放行；控制页状态面
+  `codeSource` 同步 live 化。探测为空仍拒绝进入（不静默降级纪律不变）。
+
+### Removed
+
+- **所有预设中的 maxSteps 上限**：轮数上限从 5 套预设（16/24/40）、参考档位
+  （`REFERENCE_PROFILES` 整体删除）与档位参考值中移除——`maxSteps` 一律不预设（未设 = 不限制），
+  插件永不替用户决定"干到多少轮算够"；需要收紧就显式写 `limits.maxSteps`。
+- 参考档位 `light/standard/deep`（`referenceProfileOf`）——唯一消费方是预设系统，随之移除；
+  档位（tier）参考值改为 thinkflow 对齐数值（`maxSteps=0`，keepRecent 30 / maxSummaryChars 16k），
+  档位差异只剩压缩强度。
+
+### 保留（用户自定义权力）
+
+- 24 键 limits 全量可配：CLI `limits --set/--replace/--reset`、控制栏 `u` 行内编辑、
+  桌面页上限区块、`STREAM_AGENT_LIMITS` 环境变量、装配 `config.limits`（含
+  `limitsByChannel` / `limitsByTier`）；显式 `0` = 该项不限制，压过默认层。
+- 三个行为开关（`contextFold` / `finalCheck` / `contextRaw`）入口不变。
+
+### Tests
+
+- `test/v060-presets.test.ts` → 重写为 `test/v061-defaults.test.ts`（thinkflow 默认层注入、
+  用户覆盖、旧预设痕迹迁移告警、contextRaw 强制面、桌面路由 preset 400）；
+  `limits.test.ts` / `control-bar.test.ts` / `desktop-ui.test.ts` / `v052-fixes.test.ts` /
+  `v060-fixes.test.ts` / `v060-switches.test.ts` / `v050-channel.test.ts` 同步新契约。
+- 前缀契约同步（0.6.1「接受继续」）：`v043-prefix.test.ts` P2/P3 重写 + 新增 P2b
+  （显式 fail 面）、`v050-prefix.test.ts` P3 重写 + B1 重写（预算判据退役钉）、
+  `v060-switches.test.ts` A4/A5 系列显式 `prefixPolicy:'fail'`；
+  `v050-channel.test.ts` 新增 R3（惰性探针：窗口后开 PTC → setChannel 放行）与
+  R4（构造期探针命中 → 不回退）。
+- 全量：615 用例 / 614 通过 / 0 失败 / 1 预置跳过。
+
+## [0.5.0] - 2026-11-27
+
+**0.5.0 正式版（研发线内部编号 `0.6.0`）：行为预设 + 上下文"完全不处理"开放选项 + thinkflow 覆盖核验缺口补齐（changes/security/conversation）+ DSH 标准/PTC 适配面完善。**
+
+本轮在 0.6.0-beta 基础上做四件事：
+① 控制面板加 5 套行为预设（省token/均衡/长任务/原样/无限制），可应用、可逐项修改（改后标记"自定义"）；
+② 上下文加"完全不处理"开放选项（contextRaw）：压缩/折叠/段丢弃/去重抑制/读取与回灌截断全停，内容原样进请求；
+③ 独立覆盖核验（47 模块逐条对照上游源码）发现的实质缺口全部补齐：守卫式回滚与快照回执、默认密钥保护、request:N 别名补登记；
+④ 桌面控制页补齐开关/预设 POST 面与宿主 preset 名册展示（DSH 标准/PTC 适配）。
+
+### Added
+
+- **行为预设（`kernel/presets.ts`）**：`light/balanced/deep`（= 参考档位数值面）、`raw`（清空上限 + 原样档）、
+  `unlimited`（清空上限，插件初始行为面）。应用 = 整组替换 limits + 设置开关 + 落盘标记；
+  终端 `p` 循环、CLI `dsh-stream-agent preset [id]`、桌面页预设卡片、装配 `config.preset` /
+  env `STREAM_AGENT_PRESET`（展开为该层 limits 基值，显式 limits 压过预设）。
+  任何手工修改 limits/开关 → 标记清为"自定义"；通道/档位切换不清标记。
+- **上下文"完全不处理"（`contextRaw`，默认关）**：终端 `x`、CLI `raw on|off|toggle`、桌面页开关、
+  装配 `config.contextRaw` / env `STREAM_AGENT_CONTEXT_RAW`。开启时驱动器强制：
+  `contextFold=false`、`spanLedger=false`、`effectElision=false`、`maxReadChars/readFeedbackLimit/
+  nativeResultLimit/codeValueInjectLimit=0`。预算类 limits 仍生效（那是预算，不是内容处理）。
+- **变更回执与守卫式回滚（`kernel/change-store.ts`，对齐 [TF]/changes.py:157-272）**：
+  tf-write/tf-edit/tf-append 成功后登记私有回执（before/after 快照 + sha256，持久化在
+  `stateDir/changes/<session>/`，模型输入之外）；新命令 `tf-changes`（目录）/`tf-diff`（快照补丁）/
+  `tf-revert`（expected 双重校验 + 原子写回 + undo 回执）。快照可用性判定与 TF 同口径
+  （超大/二进制/敏感内容只存元数据）；新建文件不可回滚删除。命令表 14 → 17（ADR-002，§8.1 流程）；
+  模型可见语法在**可选协议段 v15**（默认不进装配，金样逐字节不变）。
+- **默认密钥保护（`kernel/security.ts`，对齐 [TF]/security.py）**：tf-read 拒读 `.env/*.pem/*.key/
+  id_rsa/.npmrc/credentials.json/secrets.*` 等 15 类 basename 模式（结构化失败 `[secret]` + 装配级出路）；
+  模型可见输出在 obs 登记前脱敏（`api_key/token/secret/password/...` 赋值 → `[REDACTED]`，
+  句柄存储/全文回灌/recall 取回继承）。回退点：`allowSensitivePaths: true` / `redactOutput: false`。
+- **request:N 别名补登记（conversation 缺口）**：任务起点原文经 `obs.registerRequestText` 句柄化
+  （独立登记口，不进工具观测度量）；段边界丢弃段同步登记别名。此前仅压缩路径登记，
+  未压缩回合 `tf-peek handle="request:N"` 解析为空。
+- **桌面控制页开关/预设面（ui/index.js + ui/client.js）**：POST 增 `preset` / `contextFold` /
+  `finalCheck` / `contextRaw`（runtime.applyPreset / setSwitches；降级分支同样不丢开关与预设）；
+  ④ 行为开关区块（代码通道验收闸置灰）+ 宿主 agent preset 名册只读展示（DSH 标准/PTC 适配指引）。
+- **`setLimits` replace 语义**：运行期层整组替换（预设应用与桌面页"整组替换"同一口径）。
+
+### Changed
+
+- `control.json` schema 升 **5**（新增 `contextRaw` / `preset`；v3/v4 文件读入回默认，写回保留未知字段）。
+- `controlStatus()` 增 `contextRaw/contextRawSource/preset/presetSource/presets`；
+  `effectiveParams()` 增 `contextFold/contextRaw/spanLedger` 生效面。
+- 命令表硬上限 14 → 17（check-consistency 检查 5 引用 ADR-002）；README/PROTOCOL-v1 命令表同步。
+- porting-matrix 更正：text_filter 映射证据（parser 围栏状态机，非 gate.ts）、changes §9 旧声明
+  （"唯一缺 diffstat"与上游事实不符）、security/output_capture 整体豁免对脱敏子功能不成立。
+
+### Fixed
+
+- 降级分支/单字段写盘不再丢失 contextRaw/preset（与 0.5.3 的 limits/开关丢失同一类坑）。
+- `tf-changes/tf-diff/tf-revert` 结果进 need_result 回灌通道（此前插件侧命令 output 无注入路径）。
+- **收口维护（0.6.0 复查轮）**：`test/v060-security.test.ts` 整文件解析失败修复——tools 端口块
+  损坏 + 未定义引用，11 个安全用例自入库起从未运行；按 DriverPorts 契约重建端口块后全部通过。
+- **收口维护**：`STREAM_AGENT_MODE`（旧模式别名）在无 `control.json` 的全新安装下被静默忽略
+  （source='default' 不走别名映射）——现在同样映射并记告警；显式 `STREAM_AGENT_CHANNEL` 仍压过
+  mode；file 来源行为不变（回归用例在位）。
+- **收口维护**：工具面守卫——tf- 保留前缀被外部工具占用的检测结果此前算完即焚（`degraded` 被
+  显式抹掉、全仓无消费点）；现在作为第 4 级降级 `reserved` 结构化暴露（状态 / 台账 / 中英文案），
+  fail-open 照常透传，干净面不受影响（回归用例在位）。
+- **收口维护（轻微）**：control-bar 文案表补 `mode` 键（CLI `mode` 命令标签此前靠兜底显示键名）。
+- **收口维护（独立审查轮，loop.ts 0.6.0 面）**：
+  - **预设 replace 对当前会话不生效**：`setLimits(replace)` 只清 session 层，global 层构造期
+    固化的旧 control.limits 继续生效——raw/unlimited 预设应用后当前会话仍被旧上限硬杀。
+    现在 replace 重置 global 层的用户部分（control.json 物化值），装配层（新 `assemblyLimits`
+    传入）保留，"装配 > 面板"层级不因预设破坏。
+  - **applyPreset 半套应用**：开关被 config/env 锁定时只挡了 limits 锁定——limits 已替换落盘、
+    开关被拒、preset 标记照常落盘（混合状态）。现在任一开关锁定 → 整体拒绝，保持原子性。
+  - **tf-changes path 过滤基准分裂**：过滤左侧回执存的相对路径被 resolve 到 process.cwd() 基准，
+    projectDir ≠ cwd 时 `tf-changes path=` 恒返回空目录（回执明明存在）。两侧统一 fileRoot 基准。
+  - **CLI 手工改上限不清预设标记**：`updatePersistedLimits` 把 preset 原样写回，与 presets.ts
+    "手工修改 → 自定义"契约及进程内路径不一致。已对齐（清标记）。
+  - **tf-peek stale 守卫与内容源不对齐**：多句柄候选（request:N 段句柄）下守卫"任一新鲜即放行"，
+    正文却固定取第一个候选——第一个候选 stale 时旧文无标注返回。守卫改为返回新鲜候选集，
+    全部取回点（行段/offset/query/symbol）从新鲜候选取正文（PE-3 fail-closed 承诺恢复）。
+  - **loadChangeReceipts 整批中断**：一个形状不全的回执文件（workspace/snapshots 类型错）抛
+    TypeError 中止整批加载。改为逐条 try，坏条 rejected 计数、好条照常加载。
+  - **工具声明截断先于排序**：两处 `schemas.slice(0, N)` 按宿主数组顺序截断，assembly.ts
+    "按名字典序排序 + 截断"契约被架空；宿主顺序不稳定时 plan 模式声明面漂移。先排序再截断。
+  - **source 类型契约滞后**：contextFold/finalCheck/contextRaw/preset 四个 source 联合类型缺
+    `'runtime'`（运行期写入值，type-stripping 不报错直通展示层）。已补齐。
+- **收口维护（独立审查轮，kernel 解析/观测/渲染面）**：
+  - **围栏开启判定只看 chunk 开头（P1，已复现验证）**：单 chunk"正文 + 围栏 + 命令"时
+    `<` 之前的围栏开启行被当正文吞掉、围栏从未开启、其中 `<tf-*>` 被真实派发——且行为随
+    feed 分块粒度漂移。stepGround 现在在 tag 分派前对前缀完整行扫围栏开启行
+    （`#scanFenceOpenPrefix`），行级判定复用 matchFenceOpen。
+  - **围栏闭合行允许混合标记字符（P2，已复现验证）**：`` ```~~~ `` 整行被 [`~]+ 一次吃掉
+    判闭合，围栏提前关闭、其后命令失去保护。闭合行标记串现在逐字符校验与开启字符一致
+    （CommonMark 规则）。
+  - **行内代码状态使用陈旧值（P3，已复现验证）**：同 chunk 中反引号与 `<` 相邻时状态未
+    推进（只反映已 emit 文本），示例命令被执行——与 F1 拆 chunk 行为互相矛盾（不确定性
+    缺陷）。现在按"当前位置"计算行内反引号奇偶；F6 旧断言（0.5.1 旧行为化石）已同步更新。
+  - **数字实体码点越界抛 RangeError（P4，已复现验证）**：`&#x110000;` 等使 feed() 崩溃、
+    整条流中断。越界/代理区间引用原样保留（不还原、不崩溃）。
+  - **中文符号定位恒失败（O1，已复现验证）**：`\b` 只在 ASCII 词字符边界成立，纯中文
+    symbol 的 `tf-peek symbol=` 100% 返回 unknown-symbol。改用显式 lookaround（两侧不得是
+    ASCII 词字符），ASCII 符号语义不变、中文符号可命中。
+  - **queryCandidates 违反"绝不返回空"契约（O2）**：第一条即超 maxChars 预算时返回 []。
+    现在至少保留一条（裁剪到预算内）。
+  - **freezeDynamics 对空串动态值误抛（R1）**：`''.includes('') === true` 使空值字段误判
+    "动态内容进入稳定前缀"，合法装配中断。空值跳过判定。
+
+### 验证
+
+- `npm test` → **612 用例 / 611 通过 / 0 失败 / 1 跳过**（v060-security 11 用例恢复运行；
+  新增回归 v060-fixes 6 用例：预设 replace 生效面、CLI 清预设标记、tf-changes 路径过滤、
+  畸形回执逐条拒绝）。
+- `npm run check` → 7/7；`npm run gate -- --offline` → 3/3；`npm run build` → 39 文件（src↔dist 一致）。
+- 覆盖核验（独立只读子智能体）：47 模块 = 插件实现 19 + 宿主提供 23 + 豁免成立 3 + 缺口 2（本轮已补齐）。
+- **仍待真机**：tf-revert 写回是否需经宿主工具管线（limitations §七 #21）；RA-0 宿主侧复核；§4.6 API 指标。
+
+## [0.6.0-beta] - 2026-11-25
+
+**0.6.0-beta：行为开关落地（§0 A1–A5）+ TF-PEEK 取回质量（PE-1～PE-4）+ RA-0 探针 + 请求装配契约（RA-1～RA-5）。**
+
+五件事：
+① `contextFold` / `finalCheck` 两个用户开关在位，落盘 schema 升 4，控制面板/桌面页/状态面同源；
+② 前缀 fail-closed 后**同轮自动续跑**（每回合 ≤2 次），零产出也写事实消息，账本可复算；
+③ TF-PEEK 四项：query 未命中给 top-3 候选、行锚间隔可配、句柄 `[stale]` 识别、预算文案含剩余额度；
+④ RA-0 六项接缝探针 + `eval/runs/ra0/*` 产物（结论作用域如实标注 `plugin-seam`）；
+⑤ `AssemblyPlan` 契约与 plan 模式（纯函数投影 / 载荷去重 / 工具惰性声明 / 预算 fail-closed / 自动回退）。
+
+### Added
+
+- **`contextFold` 总开关（§0 A1，默认开）**：`false` 强制 `surfaceCompaction=false`、
+  `effectElisionKeepRecent=0`、`segmentMaxChars=0`（旧内容一律不移出请求）；`true` 沿用用户 limits。
+  面板摘要按**有效状态**渲染：开启但三个阈值都未设时显式写"已开启，未设阈值，不触发"。
+  终端 `f` 键、CLI `dsh-stream-agent fold on|off|toggle`、装配 config 三处同源（桌面控制页本轮只做上限编辑）。
+- **`finalCheck` 独立开关（§0 A2，默认开）**：只控制 `tf-final` 要求、`accepts` 判定、
+  premature-final 拦截、收束 nudge；`false` 时 `tf-plan` 仍解析。代码通道下控制面**灰显**
+  （"代码通道无验收闸，不生效"），不让开关看起来已生效。
+- **同轮自动续跑（§0 A4）**：前缀 fail-closed 后不再要求用户再发消息——记账 + `renderer.rebase()`
+  + 清空 wire 基线 + 注入 `[tf-stream:prefix-recovered]` 事实块，同一回合发下一条请求；
+  每回合最多 2 次（`MAX_PREFIX_AUTO_CONTINUES`），可用 `autoContinueOnPrefixFail: false` 回退。
+- **续跑账本与状态面（§0 A5）**：`prefix-auto-continue`（turn/step/attempt/cause/maxAttempts）与
+  `prefix-auto-exhausted` 落 `plugin:tf-agent/fault`；`runtimeStatus().prefixAuto` 暴露
+  `attempts / max / remaining / enabled`。
+- **TF-PEEK PE-1**：`tf-peek query=` 未命中返回 top-3 候选行段（行号 + 首行，按查询词命中数排序，
+  整条响应 ≤2,000 字符）；零命中也有候选（如实标注"无查询词命中，文件头部行"），不再只能盲试。
+- **TF-PEEK PE-2**：`limits.peekAnchorEvery`（行锚间隔，未设 = 200 保持 0.5.0 行为；可设 100）；
+  索引降级形态增加硬上限（≤2,000 字符，超出按锚截断 + 省略说明）。
+- **TF-PEEK PE-3**：`tf-read` 登记 `handle → {path, mtimeMs, size}`；`tf-peek` 前 stat 校验，
+  文件变更返回 `[stale]` + 新 mtime/size + 重读建议，**不返回旧正文**（不静默替换）。
+- **TF-PEEK PE-4**：预算拒绝文案统一为"已用 / 上限 / 剩余 + 建议窗口"；`[unchanged]` 只计命令数，
+  不占正文预算（去重产物不该反过来惩罚自己）。
+- **RA-0 探针（§2）**：`src/entry/ra0-probe.ts` + `eval/tools/ra0-probe.mjs`，六项（U1–U6）
+  各跑 3 个连续请求，产物 `eval/runs/ra0/U*.json` + `summary.md`；结论只允许
+  supported / unsupported / unknown，每条带 `文件:行` 证据，作用域固定 `plugin-seam`、
+  `hostVerification=pending`。判定路线：`system-tools-only`（U5 不支持历史改写）。
+- **`AssemblyPlan` 契约（§4.3/RA-1）**：`src/kernel/assembly.ts` 纯函数投影——块顺序固定
+  `channel → protocol → tools → invariants → state`、`system.hash` 可外部复算、20 次投影逐字节一致；
+  `reasoning` 显式策略；`budget` 带 `estimatedInputTokens/limit/overBy`。
+- **载荷去重（RA-2，plan 模式生效）**：>2,000 字符载荷同 sha 在单请求内只保留一份，重复项降级为
+  `[tf-payload ref=sha256:… chars=…]` 引用行（原文仍按句柄取回，不是摘要改写）。
+- **工具惰性声明（RA-3，plan 模式生效）**：plan 模式首请求 `tools` 为空（`toolsChars=0`），后续声明名 ≤7；
+  未列出的工具仍按名可调（声明面不是调用面）。
+- **发送前预算（RA-4，plan 模式生效）**：`overBy > 0` 即 fail-closed——0 发送、`[budget]` 文案 + 贡献项
+  （tokens/占比），台账 `assembly-budget` 可复算。
+- **`assemblyPolicy: host|plan` + 自动回退（RA-5）**：默认 `host`（0.5.x 行为逐字节不变）；
+  plan 投影异常或前缀断言失败 → 回退 host 并落 `assembly-fallback` 台账，回退后本会话固定 host。
+
+### Changed
+
+- `control.json` **schema 升 4**（新增 `contextFold` / `finalCheck`）；旧文件缺字段回默认 `true`，
+  非法值丢弃并告警，写回保留未知字段（回滚兼容），优先级 config > env > file > default。
+- `runtimeStatus()` 增 `prefixAuto` 与 `assembly` 两组状态；`controlStatus()` 增两个开关、
+  来源字段、`finalCheckInert`（代码通道置灰）与 `switchSummary`（面板同源摘要行）。
+- 段边界（F7）在丢弃旧段后补注 `[tf-stream:context-rebased]`——0.5.x 只在压缩路径注入，
+  段边界静默重置与"记账 + 显式"纪律不一致。
+- 零产出**前缀失败**收场也写事实消息（"没有产生交付"），其它零产出收场保持 0.3.3 语义（不伪造交付）。
+
+### Fixed（收口轮：独立审查 → 修复）
+
+- **`renderReadIndex` 降级顺序**：2000 字符硬上限此前只挤掉锚点体，已投递区间一多（实测 40 段）
+  就把"索引 + 未投递区间"整段顶掉，读索引失去导航价值。改为：超限时**导航信息优先**
+  （head → 索引 → 未投递区间 → 已投递末位并截断），已投递区间先合并再压缩成"最近 6 段"；
+  未超限时输出字节与 0.5.0 完全一致。
+- **`finalCheck=false` 的静态提示**：运行期闸门/nudge 已关，但 `DEFAULT_SYSTEM_PROMPT` /
+  `DEFAULT_INVARIANTS` 仍要求 `tf-final`。新增 `DEFAULT_SYSTEM_PROMPT_NO_FINAL` /
+  `DEFAULT_INVARIANTS_NO_FINAL` 两个变体，`composeChannelTexts` 按开关选择——开关关掉后
+  模型侧也不该再被要求交一条它不该交的收尾。
+- **写盘丢开关的剩余路径**：`ControlSession.reset()`（`r` 键）与 `applyLimits('reset')` 会重建
+  状态对象、把 `contextFold/finalCheck` 丢掉；桌面页降级分支同样只写 channel/tier/lang。
+  三处全部保留开关，并补三条回归用例（`A3-5` / 桌面页降级用例）。
+- **`maxParallelToolCalls` 运行期不生效**：未进 `#applyLimitValues`（唯一落点），面板改它静默无效；
+  补进落点，`effectiveParams()` 一并曝光（供状态面/断言）。
+- **`budgetContributions` 口径**：一律 `chars/4` 会把中文长段低估 2–3 倍；改为与
+  `estimatedInputTokens` 同一个 `estimateTokensRaw`（CJK 加权）。
+- **peek 预算判定/记账口径**：判定看正文、记账看整块；统一为 `rec.output`（台账拆 `chars/bodyChars`）。
+- **兜底文案**：`autoContinueOnPrefixFail=false` 时不再谎称"已尝试同轮自动续跑"。
+- **面板摘要阈值**：`switchSummaryLine` 增 `effective` 参数，装配 config 设了阈值时不再误报"未触发"。
+- **段边界 `dropAppendHead(0)`**：退化形态（无可丢块）不再追加 rebase 行（否则每回合 +1 行、永远压不下去）。
+- **换基失败留痕**：`#tryPrefixAutoContinue` 的 rebase 异常此前只打日志，现落 `prefix-auto-rebase-failed` 台账。
+- **测试加固**：A2 扩到 2×2 各 5 回合 + 静态提示断言；A1 补 4 组合；A4 补零产出事实消息（`finals` 捕获）
+  与 `awaiting:user` 显式判定；RA-1b 补"0 前缀违规"断言与预算独立复算；RA-2c 补引用行/原文长度；
+  RA-3b 补端到端 `tf-call` 调未声明工具；PE-1c 补驱动端响应 ≤2000；PE-4a 改为按记录数断言。
+- `docs/limitations.md` 增 RA-0 段（#18–#20）：U5 不支持、U3 unknown、全部结论待宿主复核。
+- 旧用例按新契约同步：schema 断言 3→4；v0.4.3 前缀收场面显式 `autoContinueOnPrefixFail: false`
+  （钉 0.4.3 语义，续跑行为由 `v060-switches` 覆盖）。
+
+## [0.5.3-beta] - 2026-11-24
+
+**0.5.3-beta：把"上限"真正交到控制面板 + 0.5.2 遗留缺陷复查修复。**
+
+四件事：
+① 控制面板（终端交互栏 + 桌面控制页）新增 **③ 用户上限** 编辑区——23 个上限键的唯一定义入口；
+② 去掉最后两个插件预设（`stallReentries=6` / `closeOutRequests=2`），收敛改为**结构性**判据；
+③ 修复 0.5.2 引入/遗留的 4 个真缺陷（无界重入、两处运行时 ReferenceError、降级分支抹掉 limits）；
+④ b 通道补 `sandbox_permissions`/`justification` 单次提权（新增可选 v14 协议段）。
+
+### Fixed
+
+- **P0 无界重入（0.5.2 引入）**：`premature-final` 只有 ③④ 内容面（占位/过期）做了去重，
+  ①② 面（依赖未满足/命令未完成/计划验收未验证）每次都重新注入。此前靠 `stallReentries` 缺省 6
+  兜住；上限交给用户（0 = 不限制）后立刻退化成无限重入——实测请求数无界增长、回合永不收敛
+  （`V1.3-1/2/3` 三例挂起，`node --test` 报 `test timed out`）。修复：`#prematureInjected`
+  按"拒绝事由键 + 注入时的生产性 ok 计数"记账，同一事由且零新增产出 → 不重复注入、本步收场
+  `blocked`（新台账 `final-reject-exhausted`）；模型做了新工作则照常重新提示。
+- **P0 两处运行时 ReferenceError（0.5.2 引入）**：① `tf-code` 释放分支写成 `await runtime(owner)`，
+  `owner` 从未在该作用域声明——ReferenceError 被 catch 吞成 `release-failed`，`release="true"`
+  永远释放不了宿主保留态；改为 `runtime(known.owner)`。② 装配处调用不存在的
+  `createHostVerificationRunner(tools)`——真实实现是驱动器私有 `#hostVerificationRunner()`；
+  改为不注入（走驱动器自带实现），避免"装了 ctx.tools 就崩"。
+  （两处均由自建作用域扫描器 `scratch/scopecheck.mjs` 在纯类型擦除构建中抓出；`npm run build`
+  不做类型检查，这类错误只在运行时炸。）
+- **P0 控制面板改上限会丢配置（0.5.2 引入）**：`applyChannel`/`applyTier`/`applyLang` 各自只写
+  三个字段，改一次通道就把用户 `limits` 从 control.json 抹掉；桌面页降级分支同样只写
+  channel/tier/lang。修复：统一 `persistControlState()`（通道/档位/语言/limits 一起写）；
+  UI 降级分支把生效 limits 一并带上（`desktop-ui.test.ts` 有回归用例）。
+- **P1 上限只在部分键上生效**：`setLimits` 之前只落 7 个键，其余 16 个静默不生效。修复：
+  新增私有 `#applyLimitValues(values)` 作为**唯一**落点（18 个 driver 字段 + `codeQuota`），
+  构造期、`setLimits`、档位切换、通道切换四处共用。
+
+### Added
+
+- **控制面板 ③ 用户上限**（终端）：`renderPanel` 新增区块 C（未设时显式打印"全部未设（不限制）"）；
+  `u` 键进入行内编辑，键入 `key=value`（`;` 分隔多项，`reset` 清空）回车生效并落盘；`Esc` 取消、
+  非法键/负数当场拒绝且不落盘；`r` 重置会把上限一起清空（初始状态 = 一项上限都没有）。
+- **控制面板 ③ 用户上限**（桌面页）：`ui/client.js` 新增 `LimitsEditor`——按 6 个分组渲染 23 个
+  数字输入框（空 = 未设 = 不限制），"写入上限 / 清空"两个动作，提交面
+  `{limits:{k:v}, limitsReplace:true}`；`ui/index.js` 路由校验走内核 `sanitizeLimitPatch`，
+  未知键/非整数/负数 → 400，部分键被忽略时在 `warnings` 里回报。
+- **b 通道单次提权**：`tf-code` 新增 `sandbox_permissions` + `justification`（成对校验、白名单
+  `workspace-write|danger-full-access`、经宿主 `dsh-sandbox` 的 `approveEscalation` 审批、只覆盖
+  本次执行、提权时忽略 `stateOwner`）；无策略/无审批服务 → `escalation-unavailable`，拒绝 →
+  `escalation-denied`。新增可选协议段 **v14**（默认不进装配，金样逐字节不变）。
+- `controlStatus()` 增 `limits` / `limitsSource` / `limitCatalog`（23 键结构化投影），
+  `streamAgentRuntime` 增 `setLimits(patch, {replace})` 服务方法。
+- 收束期按**撞墙事由**去重（`steps:<原因>` / `stall` / `no-final`）：未设 `closeOutRequests`
+  时同一事由只收束一次，不再靠缺省 2 次。
+
+### Changed
+
+- 缺省值收敛到"零预设"：`stallReentries` 6 → 未设（不限制）、`closeOutRequests` 2 → 未设
+  （按事由去重）。`K4` 用例随之把请求数从 3 降到 2（去重命中即收场，不再补一条同义 nudge）。
+- 协议版本表新增 **v1.4.0（0.5.3-beta）**；`PROTOCOL_SECTION_IDS` 仍 11 项（8 + v11/v12/v14）。
+- `docs/limits.md` 新增 §7「不预设上限如何保证不无限打转」：把结构性出口写成可核对的表。
+
+### Tests
+
+`npm test` → 522 用例 / 521 通过 / 1 跳过 / 0 失败（新增 `C1–C3` 控制栏上限编辑、
+4 条桌面路由 limits 用例、`K4` 语义更新）。`npm run build` 34 文件、`npm run check` 7/7 全绿。
+
+---
+
+## [0.5.2-beta] - 2026-11-23
+
+**0.5.2-beta：上限全部交给用户 + PTC 契约对齐复核 + thinkflow 缺口补齐。**
+
+两条主线：
+① **插件不再预设任何会截断工作的上限**（轮数/token/取回/压缩/换基/重入/tf-code 配额一律用户定义，
+未定义 = 不限制），档位降级为"参考数值展示"，新增 `limits` 子命令与三层来源合并；
+② 按宿主真实契约复核 b 通道（PTC bridge）与 thinkflow 47 模块覆盖，修复审计确认的
+15 项契约不符与 10 项装配缺口。
+
+### Added
+
+- **`limits` 内核与三层来源（新模块 `src/kernel/limits.ts`）**：23 个键、别名归一、
+  非法规格丢弃并告警；来源优先级 `control.json < STREAM_AGENT_LIMITS < config.limits`，
+  再叠 `limitsByChannel` / `limitsByTier` / 运行期 `setLimits`。`0` = 不限制，
+  换基计数用 `-1` = 不限制（`0` 是"禁止换基"）。详见 `docs/limits.md`。
+- **`dsh-stream-agent limits` 子命令**：无参列出全部键与当前值；`--json`；
+  `--set k=v[,k=v]`（增量）；`--replace`（整体替换）；`--reset`（清空）。
+- **`control.json` schema 3**：持久化 `limits` 字段，坏值告警不静默；新增
+  `updatePersistedLimits()` 读-合并-写。
+- **PTC 运行时描述符消费**：`language` / `programFormat` / `sandboxMode` / `retainsState` /
+  `timeout` / `executionInstructions` 进协议段（宿主运行时事实）与状态面
+  （`runtimeStatus().ptc`）；`language` 非 TS/JS 时关闭 code 通道并告警。
+- **`receipt:N` 引用空间**：写后读回执带 `receipt=N`，可用 `tf-peek handle="receipt:N"` 复读。
+- **审计字段**：`runtimeStatus().limits`（用户上限原样投影）、`ptc`（运行时描述符）、
+  tf-code 失败注入携带 `logsChars`。
+
+### Changed
+
+- **档位不再预设上限**：`light/standard/deep` 的 `values` 全为 0（未设），原 16/24/40
+  移入 `reference`（只展示、不生效）。控制栏数值行改为"生效值 + 参考值"。
+- **0 = 不限制统一语义**：`maxReadChars` / `nativeResultLimit` / `segmentMaxChars` /
+  `codeValueInjectLimit` / `effectElisionKeepRecent` / `readFeedbackBudgetPerRequest`
+  不再回落到 `DEFAULT_*` 常量（常量保留为文档参考值）。
+- **tf-code 输出体裁对齐宿主**：一次运行的结果按 `{logs, sandbox, result}` 并列注入
+  （`logs:` 段 + `result:` 段）；失败不再把 logs 截到 200 字符——程序自己打印的诊断可见。
+- **失败反馈不再硬截断**：`rec.detail` 上限从 800 字符放开（`[tf-stream:error]` 注入
+  原本就不截断，问题在被截断的源头）。
+- **token 估算口径**：ASCII 仍 4 字符/token，CJK 按 0.7 token/字符（旧口径把汉字也按
+  4 字符/token 计，中文会话触顶判定晚 ~2.8 倍）；原生通道 `tools` schema 字节计入。
+- **`query` 未命中不再算命令失败**：改为正常结果正文（原先走 `[tf-stream:error]` 通道，
+  被当成执行错误计账并触发重入判定）。
+- **tf-edit 兼容上游 body 形态**：三行标记与 `<old>…</old><new>…</new>` 均可；
+  `match="file"` 不再被当未知属性丢弃。
+- **tf-code 配额默认交给宿主**：`codeQuota` 由 64 次/256KiB/300s 改为 0（不限制），
+  墙钟跟随 `runtime.timeout.maxMs`；用户可用 `codeMax*` 收紧。
+- **装配样例不再预置上限**：`preset.yml` 删掉 `maxParallelToolCalls: 3`，改为 `limits` 注释示例
+  （写文件仍按同流先写后读隐式串行，并发只影响读/搜索类命令的批量派发）。
+
+### Fixed
+
+- **控制栏把"不限制"显示成"上限 0"**：档位 `values` 归零后，控制页仍拿 `tier.values` 渲染
+  生效值 → 档位卡出现 `maxSteps 0 · maxInputTokens 0k`，降级视图也把 0 当上限。
+  现 `runtimeStatus().effective` 扩为 7 键、由运行时按 cfg 如实报账；`0` 一律渲染为
+  「不限」，档位卡改摆 `tier.reference` 并标注「参考值（未生效）」，降级视图改由用户
+  `limits` 推导（不再用档位顶替）。
+- **控制页其余 5 项恒为 "—"**：`effective` 原先只投影 `maxSteps` / `maxInputTokens`，
+  `peekBudgetChars` / `keepRecent` / `maxSummaryChars` / `compactAggressiveness` /
+  `surfacePolicy` 永远取不到值。已随上条一并修复，并新增 `effectiveParams()`。
+- **`sandbox.denied` 恒丢失**：宿主契约是 boolean，0.5.1 按数组解析（`length>0`）→ 恒 false。
+  改为布尔直读，账本 `denied` 字段与 `sandboxLine()` 渲染同步修正。
+- **`subCallId` 撞 id**：改为宿主规则 `<parentCallId>:ptc:<提交序号>`（原用工具名，
+  同一程序里多次调用同一工具会重复）。
+- **子调用审计串账**：单槽 `let dispatchSink` → `WeakMap<agent, driver>`；删除
+  "构造期事件由缓冲兜住"的错误注释（从未有缓冲）。
+- **exclusive lane 缺失**：非只读绑定与 `parallel` 并发派发；现按宿主
+  `executionMode` 语义分 lane（exclusive 屏障 + fail-closed 默认独占）。
+- **无 abort + drain**：收束期只 abort 不等在飞调用；现 `finally { abort(); await drain(); }`
+  拒绝排队者并等待在飞绑定结算，`runOver()` 守卫避免迟到派发。
+- **生产装配只 3 绑定**：`createCodeExecutor` 未传 `surfaceToolNames` → tf-code 程序只能
+  看 write/read/pwsh；现按会话冻结工具面生成全绑定，`maxParallelBindings`/`classifyBinding`/
+  `onDescriptor` 一并接线。
+- **`revisionFacts` / `deliveryFacts` 从未装配**：版本冲突守卫不可达、`:: exists(...)` 谓词
+  永不开、带谓词的验收项永远 verified 不了（final 被卡到重入上限）。现默认装配
+  （fs 只读事实），`revisionGuard: false` / 显式端口可覆盖。
+- **新建文件被守卫拦死**：`revisionFacts` 在位后，对**不存在**的文件缺少读观察会判
+  `read_required`；改为"目标不存在 + 无读观察 = 新建，放行"。
+- **交付构建校验恒失败**：兜底实现硬编码 `bash + {cmd}`（DSH 没有该工具）→ 只要项目有
+  `package.json` 每次收束都 blocked。现经 `toolMapping` 转成宿主 shell 调用
+  （`tf-bash → pwsh{command,description}`），失败正文放宽到 4000 字符。
+- **可运行脚本清单恒空**：`!name.includes('.')` 与扩展名判据互斥 → 永远筛不出脚本；
+  已修，且清单改为**注入上下文**（此前只写台账，模型看不到）。
+- **`stateOwner` 跨策略复用**：沙箱策略变化后仍复用同一 owner（旧内存 + 新更宽策略）；
+  现策略变化即作废旧身份并记账。
+- **`#codeStateOwners` 只增不减**：会话结束无人释放宿主保留态；新增
+  `driver.dispose()` 逐个 `release`，由 agent dispose 调用。
+- **`sandboxPolicy` 只传 mode**：丢会话级策略（可用比会话约定更宽的沙箱）；改为
+  `resolve({session, mode})`，仅接受白名单三值，`resolve` 失败告警并不传（fail-open，
+  不静默降级为更宽策略）。
+- **bash 成功输出不可见**：`bash` 在低增益回执族，成功只记 ledger → 模型跑完
+  `npm test` / `git status` 看不到任何内容。改为高增益族（首次/变化 full，重复 dedup）。
+- **行内反引号未隔离**：`` `<tf-read .../>` `` 这类示例文本会被当命令执行；现按行内代码
+  边界（奇偶反引号、遇换行重置）隔离，围栏隔离不变。
+- **`maxParallelBindings` 不可运行期调整**：deps 接受数字，改为 `number | (() => number)`。
+
+### Docs
+
+- 新增 `docs/limits.md`（23 键全表 / 三层来源 / 迁移自查）。
+- `docs/channel-matrix.md` 删除"配额 2048 次"（无出处，宿主实为 `maxPendingCalls` 128）。
+- `docs/limitations.md`：修正配额缺省值；补"已知未做"清单（plan 跨 resume 持久化、
+  沙箱模式切换中止在跑程序、`receipt:N` 仅覆盖自写回执）。
+
+## [0.5.1-beta] - 2026-11-23
+
+**0.5.1-beta：按 `0.5.1-beta.txt` 清单落地的第一批（M1 收尾 + M2 解析/回灌）。**
+本版只实现清单里"约束完整、可离线验证"的条目；其余条目（P0 真机门禁、协议加语法项、
+宿主能力依赖项）按下述"未纳入本版"保留，不引入清单未授权的行为。
+
+### Added
+
+- **围栏状态机（清单 2.1，P0）**：`parser.ts` 在 ground 模式按行首开启围栏（反引号 / 波浪线，
+  ≥3 个标记字符并同类闭合，0–3 空格缩进，闭合行长度 ≥ 开启行，未闭合延续到流末）。围栏内 `<tf-*>` 只作散文，
+  **0 执行 / 0 副作用 / 正文逐字节保留**；命令正文里的围栏标记不改变状态。
+- **思考通道协议违规可见（清单 2.1）**：`reasoning-delta` 命中 `<tf-`（含跨 chunk）记
+  `protocol-error:reasoning-channel` 台账，并在下一请求注入一次纠正——思考通道不解析命令，
+  但不再静默丢弃。
+- **`TurnEndReason` 增 `awaiting:user`（清单 1.1）**：`tf-ask` 返回宿主 timed ask 的
+  `{pending:true}` 时，回合以 `awaiting:user` 收束（0 nudge / 0 额外请求），不再被当成未完成收尾。
+- **配置 `requireFinal`（清单 1.1 回退开关）**：`false`（默认）= 无验收项且有生产性产出时
+  流末正文即交付；`true` = 0.4.x 旧语义（流末无 `tf-final` 必 nudge）。装配级
+  `requireFinal: true` 可逐字节回到旧收束行为。
+
+### Changed
+
+- **回合收尾（清单 1.1，P1）**：取消"流末无 `tf-final` 必 nudge"。标准通道下，若本回合
+  无未验证验收项、无重入事由、无 final 被拒、且至少有一条生产性 ok 命令，则流末正文
+  直接作为交付（同轮、0 额外请求）。零产出回合仍走 nudge/blocked（不伪造交付）；
+  有验收项时仍按验收闸提示。
+- **验收证据绑定（清单 1.3，P1）**：证据字符串改为 `cmdId@<验收项文本哈希>(handle=… fp=…)`。
+  计划修订改了验收项文本 ⇒ 旧证据作废（记 `plan-evidence-invalidated`，条目回到未验证）；
+  非 ok 回执不产生验证（`plan-accept-not-ok`）；`accepts` 指向不存在的验收项记
+  `plan-accept-unknown` 台账。**"单个 in_progress"未实现**——见下方未纳入项。
+- **回灌方向与三档命名（清单 2.2，P1）**：`info_gain` 三档由 `high/low/none` 改为
+  `full/dedup/handle`，与 request 记录的 `feedbackBytes{full,dedup,handle}` 逐字一致；
+  `selfReadFeedback` 默认由 `receipt` 改为 `full`（写后读回灌全文，`receipt` 保留为回退点）；
+  dedup 桶接线（`[unchanged]` / 部分重叠 / 效果折叠行），peek 命中已投递区间记 dedup。
+
+### Docs
+
+- PROTOCOL-v1 §7/§8：围栏语义与 0.5.1 变更记录（明确未新增命令/属性，命令表仍 14 条）。
+- 文档口径同步：README.md / README.en.md（用例数 481、`selfReadFeedback` 默认 `full`、`tf-read` 行、
+  `tf-final` 同轮交付）、docs/protocol.md（O7 自写回验）、docs/architecture.md 与
+  docs/upstream-delta.md（三档命名）、docs/limitations.md（0.5.1 回摆如实记录）。
+
+## [v1.2.0] - 2026-11-23（b 通道 PTC 对齐，审查修正版）
+
+按宿主真实契约（ptc-runtime/types.ts:76-110 + index.ts:126-138）对齐 b 通道，审查后修正三处"名字像但不兼容"：
+
+- `tf-code` 加 `state` / `sandbox` / `release` / `format` 属性；仅 `stateOwner` / `sandboxPolicy` 进 resolve，`errorClass` 进 bindings namespace（`memberNameProperty` 必填），`release` 为 runtime async 方法，`format` 不伪装为已对齐（执行形态由宿主 `programFormat` getter 决定）。
+- 装配两个端到端端口：`resolveSandboxPolicy`（宿主注入策略对象，插件不自行构造）与 `ptcRuntimeRelease`（默认从 `ptcRuntime.release` 桥接）。release 只释放不执行程序体；未建立状态域判 `state-not-found`；异步失败可诊断且不丢身份映射。
+- 新增可选 v12 协议段，桥接通道显式开启可达（金样逐字节不变）。
+- 子调用审计只写插件私有 ledger（让位纪律：不冒充宿主 `tool/ptc-dispatch` 事件）。
+- 新测试 `test/v120-ptc-align.test.ts`（6 例，按宿主真实契约断言）；500 用例（499 pass + 1 预置跳过 / 0 fail）、check 7/7。
+- 第 3 轮：`recallText` 对齐上游 query 上下文窗口（回退 ≤200 字符 + 行首对齐 + 行尾截断 + 续搜锚点）；1.2 交付构建校验端到端接线（`buildVerificationPlan` → `runVerification` → final 闸，`projectFacts`/`projectDir` 生产转发，失败持久到任务结束防重发绕过）；`errorClass` 生产赋值；全部取回路径预算耗尽发 `[budget]`。新测试 `test/v110-kernel.test.ts` 增至 13 例。
+
+## [v1.1.0] - 2026-11-23（本轮，未提交）
+
+> 解除清单 A10 阻塞：PROTOCOL-v1 §8.1 定义"加语法评审流程"（规范先行 → 内核纯函数 → 测试向量 → 变更记录 → 双通道声明）。按该流程落地 1.2 / 1.3 / 2.3 / 4.1。
+
+### Added
+
+- **1.2 验收机器判定**：新 `src/kernel/delivery.ts`（零依赖纯函数）——`tf-plan` 验收项尾部 `:: exists|sha256|bytes|regex(...)` 在收束前用注入的 `deliveryFacts.stat` 求值，通过即 verified，失败列原因并拒绝 final；`buildVerificationPlan`/`scriptFeedback` 对齐 `[TF]/delivery.py`（待宿主 `runVerification` 端口接线后启用）。
+- **1.3 单个活动项**：`tf-plan` 的 `> [id]` 声明唯一活动项（对齐上游单个 `in_progress`），重复记 `plan-active-duplicate` fault。
+- **2.3 字符级取回**：`tf-peek` 增 `offset`/`query`（对齐 `[TF]/recall.py`），新 `ObservationLedger.recallText`，带 `next offset=N` 续搜提示；负 offset/预算耗尽 fail-closed；计入 peek 度量。
+- **4.1 文件版本守卫**：新 `src/kernel/changes.ts`（对齐 `[TF]/executor.py:469`），`tf-read` 登记读观察、`tf-edit/append` 派发前检查 `read_required`/`revision_conflict`；`tf-edit` 增 `offset` 属性声明目标行。写后只推进 revision 与平移区间，不升级授权范围。
+- 新测试 `test/v110-kernel.test.ts`（现 13 用例，含反例与边界；v1.1.0 另加可选 v11 协议段——模型可见语法，默认不进装配以保证缓存零回归）。
+
+### 未纳入本版（清单条目与阻塞原因）
+
+- **7.1（P0）四臂真机 L0–L3**：缺 `DEEPSEEK_API_KEY` 与宿主真机环境，`eval/runs/four-arm-*.json`
+  无法产出；G5/G6 真机项仍未勾选，**不得据此宣称"正式版"**。
+- **3.1 / 3.2 / 3.3（b 通道 PTC 对齐）**：`state/format`/`sandboxPolicy`/dispatch 事件依赖宿主 PTC 版本 conformance 与配额口径冲突（A3），尚未施工。
+- **2.4 / 3.2 / 3.3 / 3.4 / 5.x / 6.1 / 7.2 / 7.3**：分别依赖二选一决策、宿主 guard/凭据
+  管线、PTC 配额口径冲突（A3）、宿主 rc.3 挂点实测（A4）、`[TF]` session/executor 参考实现
+  或真机演练；本轮不实现。
+
+## [0.5.0-beta] - 2026-11-22
+
+**0.5.0 研发线起点：单插件双通道与正式版。** 一个插件包，一个装载形态；原设想拆两包的两部分能力
 改为同一控制栏上的两个区块（执行通道 × 上下文档位）。发布判据：架构定稿、有对照数据、
 可逐项回退（数据面见 eval/FOUR-ARM-2026-11-22.md；真机臂完成前不给出省 token 结论）。
 
@@ -62,6 +598,13 @@
   docs/upstream-delta.md、docs/porting-matrix.md；NOTICE（thinkflow 派生 / PTC 依赖分栏）。
 - **评测（P7）**：eval/tools/run-four-arm.mjs 四臂离线结构跑批 + eval/FOUR-ARM-2026-11-22.md
   报表（H1/H2 结论待真机臂）。
+- **四臂真机跑批（P7）**：patches/eval-ptc.yml（L1）与 patches/eval-stream-ptc.yml（L3，
+  `channel=code` / `codeChannelSource=preset`）；eval/tools/four-arm-real.mjs 编排四臂
+  （复用 runner.cjs 的取证管线，新增 `--patch` 覆盖）→ `eval/runs/four-arm-<stamp>.json`
+  （schema `four-arm-real/1`）；判据在 eval/tools/four-arm-verdict.mjs（纯函数 + `--selftest`）。
+  缺凭据时 exit 3 且不写产物——不得把"没跑"写成"数据不足"。
+- **回退开关演练（§12.4）**：eval/tools/rollback-drill.mjs 把九项开关逐项映射到具名用例
+  → `eval/runs/rollback-<stamp>.json`（schema `rollback-drill/1`）；映射失效即判失败。
 
 ### Fixed
 
@@ -72,6 +615,18 @@
 - **D5**：取回不再对同一区间重复付费（span 账本去重）。
 - **D6**：readFeedbackLimit 双旋钮拆分（读取侧/回灌侧各自独立）。
 - **D7**：cacheRead 不再按 1:1 计入预算控制（缓存命中不再加速降级）。
+- **发布门禁自锁（R4）**：`scripts/gate.mjs` 的 G1 曾断言 `6/6 全绿`，而一致性检查已扩到
+  7 项，导致 CI 恒 FAIL、正式版路径被自己的脚本堵死。改为从输出解析 `N/N`（项数不再硬编码）。
+  同批修掉：G5 正则匹配不到带千分位的 `129,178 / 446,410 = 28.9%`；G5 增四臂 `verdict.h1/h2`
+  取证；G6 改为消费 `rollback-<stamp>.json` + 真机勾选；记录文件按版本命名
+  （`eval/GATE-<ver>.md`）并保留人工勾选（原实现每次重跑都会覆盖人工记录）；stamp 不再
+  静默回落到固定历史批次。
+- **文档口径（§5.3/§12.2/附录）**：代码通道"对 system prompt 贡献 0 字符"不成立——协议段
+  确为空串，但稳定前缀内仍有 3 段常量共 263 字符（通道措辞 117 + 工具面说明 33 + 不变量
+  109 + 2 处分隔符），跨请求固定。对外表述收窄为"协议段 0 字符"。
+- **压缩通道（P3，U2）**：`surfaceOp: replace` 未采用（宿主行为未验证），两个通道同走
+  `dropAppendHead` + 确定性摘要 + 句柄化；`surfaceCompaction` 键名保留但语义改为"压缩总开关"。
+  code 通道的不变量文案同步改写（原写"压缩可能替换旧消息为摘要"，与实现不符）。
 
 ## [0.4.0] - 2026-11-22
 

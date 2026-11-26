@@ -88,7 +88,7 @@ test('R5. 0.5.0 两轴目录：旧模式目录变成别名投影（deprecated + 
     { channel: 'standard', tier: 'deep' },
     { channel: 'code', tier: 'standard' },
   ]);
-  for (const m of legacy) assert.equal(m.deprecated, true);
+  for (const m of legacy) assert.equal('deprecated' in m, false, '目录不带版本标注');
   // 新轴目录：通道 2（模型看到什么）× 档位 3（只改数值）
   assert.equal(publicChannelCatalog().length, 2);
   assert.equal(publicTierCatalog().length, 3);

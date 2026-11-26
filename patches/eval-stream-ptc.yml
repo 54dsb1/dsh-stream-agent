@@ -1,0 +1,66 @@
+# 评测臂 L3（本插件 + PTC preset，通道=代码）—— 四臂 benchmark §12.1 的核心实验臂
+#
+# 与 L1 同执行器同工具面（模型侧只有 run_code），只多本插件的上下文治理：
+# 压缩、状态摘要、度量、记账、前缀策略。因此 L3 vs L1 的差值就是治理的净效果。
+#
+#   dsh --profile headless --patch patches/eval-stream-ptc.yml headless "<任务文本>"
+#   env DSH_EVAL_PROBE_DIR=<每任务每臂独立目录>   （runner 设置）
+#   env STREAM_LOOP_EVAL_DUMP=<dir>/driver-      （驱动器 turn-end snapshot）
+#
+# 装配约束（实测，2026-11-23；与 patches/eval-ptc.yml 同源）：
+#   · 执行器单槽：翻 tool-executor-native / tool-executor-ptc 两行的开关，不新增行；
+#   · 运行时由 base 的 ptc-runtime 行提供，不重复插入；
+#   · channel / codeChannelSource 显式钉死（评测臂必须可复算，不随运行期探测漂移）。
+#
+# 本臂不要求插件已安装：entry 直接引用 ../dist/*.js。若插件已安装（bundle 层有
+# stream-agent 行），下面的 insert 会撞 id——此时改用 patches/eval-stream.yml 的覆盖形态。
+
+- id: tool-executor-native
+  disabled: true
+- id: tool-executor-ptc
+  disabled: false
+  config:
+    maxParallelSubCalls: 10
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  config:
+    agents: []
+    maxParallelToolCalls: 10
+  disabled: true
+- insert:
+    - id: stream-agent
+      name: ../dist/entry/loop.js
+      inject: [llm, tools, agents, sessions, sessionProjections]
+      config:
+        announceTakeover: true
+        maxParallelToolCalls: 3
+        streamIdleTimeoutMs: 60000
+        channel: code
+        codeChannelSource: preset
+        tier: standard
+    - id: stream-agent-state
+      name: ../dist/entry/state-handle.js
+      inject: [storage]
+      config:
+        unit: tfAgentState
+        announce: true
+    - id: stream-agent-obs-broker
+      name: ../dist/entry/obs-broker.js
+      inject: [tools, state]
+      config:
+        announce: true
+    - id: stream-agent-action-gate
+      name: ../dist/entry/action-gate.js
+      inject: [tools, storage]
+      config:
+        announce: true
+    - id: stream-agent-context-render
+      name: ../dist/entry/context-render.js
+      inject: []
+      config:
+        announce: true
+    - id: stream-agent-eval-probe
+      name: ../dist/entry/eval-probe.js
+      inject: []
+      config:
+        announce: true

@@ -1,0 +1,46 @@
+# 评测臂 L1（仅 PTC preset，无本插件）—— 四臂 benchmark §12.1
+#
+# 形态：内建 agent-loop 原样运行，工具执行由 PTC 执行器接管（模型侧只有 run_code），
+# 不装本插件。与 L0（原生）的差别只有执行器；与 L3（本插件 + PTC）的差别是"有无治理"。
+#
+#   dsh --profile headless --patch patches/eval-ptc.yml headless "<任务文本>"
+#   env DSH_EVAL_PROBE_DIR=<每任务每臂独立目录>   由 runner 设置
+#
+# 两条硬约束（实测，2026-11-23）：
+#   1. 执行器是单槽（dsh-tools：同作用域只允许一个，重复注册即抛
+#      "Only one tool executor may be registered in each scope"）。base 已声明
+#      tool-executor-native（启用）与 tool-executor-ptc（停用）两行，本臂只翻开关，
+#      **不新增行**——新增行与既有行同 id 或同槽都会失败。
+#   2. 运行时由 base 已声明（id: ptc-runtime，dsh-ptc-runtime-node，无条件挂载）。
+#      再插一行会撞服务槽（"service ptcRuntime has been registered"），所以本臂不插运行时；
+#      执行器 inject ctx.ptcRuntime，运行时缺席时启用执行器会让启动直接失败，不降级。
+#
+# 本包经 dsh plugin add 安装后，bundle 层会停用 agent-loop 并插入生产 entry；
+# 本臂必须把生产 entry 覆盖回停用形态，否则基线会被对照臂实现劫持。
+
+- id: tool-executor-native
+  disabled: true
+- id: tool-executor-ptc
+  disabled: false
+  config:
+    maxParallelSubCalls: 10
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
+  disabled: false
+- id: stream-agent
+  disabled: true
+- id: stream-agent-state
+  disabled: true
+- id: stream-agent-obs-broker
+  disabled: true
+- id: stream-agent-action-gate
+  disabled: true
+- id: stream-agent-context-render
+  disabled: true
+
+- insert:
+    - id: stream-agent-eval-probe
+      name: ../dist/entry/eval-probe.js
+      inject: []
+      config:
+        announce: true

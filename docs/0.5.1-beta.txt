@@ -1,0 +1,84 @@
+**路径缩写**：`[β]` = `dsh/artifacts-v0.5/`（0.5.0，`next/0.5` @ `8ba4c30`）；`[TF]` = `scratch/tf-gh/xuxiang-thinkflow-main/`（0.10.3）；`[PTC]` = 宿主 `@deepseek-ai/*` PTC 包。
+
+**前提与假设**（信息不足处）：① 外层 `v0.5.0beta-test` 只跟踪 0.4.0 子包，0.5.0 在未跟踪的 `[β]` 里，**运行时实际加载哪个包：无法确认**；本清单按 `[β]` 判定。② 假设「β 模式」= 0.5.0 自述的两轴控制 + `standard`/`code` 双通道 + PTC 共存 + 四臂门禁这一整套能力面，而非某个独立模式名。③ 优先级：P0 发布/正确性阻断、P1 主功能缺口、P2 补齐/验证、P3 条件项（结构不可达或需宿主改造）。④ 标签 **【TF】** = 需与上游对齐；**【β】** = β 模式特有；**【补】** = 本轮复核新增、上一轮清单未列的差异。⑤ `[β]/PROTOCOL-v1.md` 已冻结于 0.5.0，凡新增命令/属性须先走其 §8 变更纪律，这会改变多项优先级。
+
+**已落地、不计入**：确定性摘要、双旋钮预算、span 账本/行锚索引/`request:N`、planned-rebase、效果折叠 `[applied pN]`、写前意图 + resume halt、验收闸四类拒绝。
+
+---
+
+## M1 回合收尾与验收
+
+| 编号·归类 | 目标 → 补齐范围 | 优先级 | 对现有流程/兼容性的影响 | 验收标准 |
+|---|---|---|---|---|
+| 1.1【TF】【β】 | 取消「流末无 `tf-final` 必 nudge」→ 同轮交付、无验收项时流末正文即交付；`TurnEndReason` 增 `blocked/awaiting:user`，`tf-ask` 直接收束 | P1 | 改收束状态机；标准通道全变、代码通道本来就无 `tf-final`（`loop.ts:2519`）不受影响；N 与 eval 口径需重算；需留 0.4.x 回退开关 | 纯写 3 文件 ≤2 请求；awaiting 回合 0 nudge/0 额外请求；四类拒绝不回归；W1/C2 不再「exit=1 但产物正确」 |
+| 1.2【TF】 | 交付物由框架校验 → `acceptance` 支持 `exists/sha256/bytes/regex` 机器判定 + 宿主只读校验；补运行级 `npm install`/`npm run build` 校验（`[TF]/delivery.py:120`），满足即 `completed` | P0 | 引入外部构建副作用与超时/沙箱约束；与四类拒绝、`tf-plan` 交互；代码通道验收闸已关闭，须明示不适用 | 校验通过 0 额外请求；失败 `blocked` 并列未完成项；`verified` 可溯源到回执；`[β]/src` 中 `verify_delivery`/`npm run build` 零命中的现状被消除 |
+| 1.3【TF】 | 验收证据绑定真实成功回执 → `evidence` 唯一性、失败回执不可继承、单个 `in_progress`（`[TF]/task_plan.py:38`）；`accepts` 与回执绑定 | P1 | 改 `tf-plan` 证据格式与协议文本；旧会话 resume 需兼容旧 `cmdId(handle=fp)` 字符串 | 伪造/复用/失败 evidence 三类探针全被拒；0 例「自报通过」 |
+| 1.4【TF·条件】 | `need_result` 立即打断/中途回灌（T1）→ **不实现 mid-stream barrier**（宿主 step 信封不允许）；以「流末必回灌 + awaiting」语义对齐 | P3 | 若坚持真打断，必须改宿主 loop 而非插件；现有流末注入边界不变 | 语义替代探针全过；否则标注「结构不可对齐」并列入需补差异（A5） |
+
+## M2 协议解析、回灌与通道
+
+| 编号·归类 | 目标 → 补齐范围 | 优先级 | 对现有流程/兼容性的影响 | 验收标准 |
+|---|---|---|---|---|
+| 2.1【TF】 | 消除围栏内误执行 → `parser.ts` 增 fence 状态机（含缩进、未闭合延续流末），围栏内 `<tf-*>` 只作 prose；`reasoning-delta` 命中 `<tf-` 记 `protocol-error:reasoning-channel` 并注入一次纠正，不静默丢弃 | P0 | 改 parser 行为与正文可见性；与 §7 DSML 宽松解析有冲突面；协议段字节变化 ⇒ 计划性换基 | 围栏内 `tf-write` 0 执行/0 副作用/正文逐字节保留；thinking 内 1 纠正/0 执行；14 条命令回归全绿 |
+| 2.2【TF】【补】 | 回灌方向对齐上游 `max_content_chars=0`（`[TF]/context.py:353,409`）→ `info_gain` 三档改 `full/dedup/handle`，`selfReadFeedback` 默认由 `receipt` 改 `full`，native/code 超限才句柄 | P1 | 注入字节变大（需 ≤1.2× 上限）、N 下降；`feedbackBytes` 口径、`readFeedbackLimit=0`、缓存前缀均需同步 | R2/C1 类任务请求数 ≤基线 +10%；写后读 0 次 peek；`full/dedup/handle` 字节可复算 |
+| 2.3【TF】 | 长原文定位与协议内 Python → `tf-peek` 增字符级 `offset`/字面 `query`（现仅 `handle/from_line/to_line/symbol`，`parser.ts:102`）；补 `tf-python` 或明确由 `tf-code` 承担 | P2 | 命令表 14→15 或属性扩展，触发协议冻结评审；code 通道下 `tf-code` 让位，须定义由谁承担 | 大文件定位请求数 −30%；`request:N` 重启后可解析；字面 query 命中且可续搜 |
+| 2.4【β】 | 明确 PTC 共存契约 → 二选一：维持 code 通道全让位（`tf-*`/`tf-call`/验收闸/回灌全停，注册数 0）并写入控制栏；或按白名单恢复子集 | P1 | 直接改 `channel-matrix.md §3/§4` 的 8 项判据、`code-channel-yield` 丢弃路径、通道切换换基与 `maxRebasesPerSession=8` | 8 项判据真机逐项通过；工具清单与无插件时逐个相等；`none` 回退不静默；切换/回退探针 |
+| 2.5【β】 | 三来源判定可信 → 补齐 U1（`llm/stream` 是否拒绝改写）、U3（不依赖 preset id 判定 PTC）、U10（`systemPrompt.context` 替换语义）、U4（子调用会话事件）探针 | P2 | `detectCodeChannelSource()` 已实现但探测依据缺实测；若 U3 不成立，需退化为显式声明来源 | 四个探针产物落 `eval/runs/`，各带结论与请求序列 diff |
+
+## M3 执行器 / PTC 能力（全部 β 特有）
+
+| 编号·归类 | 目标 → 补齐范围 | 优先级 | 对现有流程/兼容性的影响 | 验收标准 |
+|---|---|---|---|---|
+| 3.1【β】 | `tf-code` 从「默认关 + 单形态」变可用 → `enableCode` 默认 `false` 的策略评审；补 `programFormat` 三态、`stateOwner` + `release`、完整 `sandboxPolicy`、多命名空间 + `errorClass`、描述符全量、8 类错误 kind、`logs/value` 分离 | P1 | `[β]/loop.ts:687,1394` 明写不传三项；新增 `state/format` 属性 + `tf-state` 触碰协议冻结；与宿主 PTC 版本强耦合，需双 provider CI | 十项 conformance 每项 ≥3 例；host/vendored 同程序 `value/logs/kind` 逐字节一致；`state` 跨 5 回合存活、`drop` 报 `state-lost`；包体 +≤400KB、冷启动 +≤150ms |
+| 3.2【β】 | 沙箱策略与单次提权 → 解析 `sandboxPolicy`、`sandbox_permissions` 单次提权；如实标注 Windows `enforcement=partial`、`danger-full-access` 无约束（`limitations.md §5b-1`） | P1 | 绑定须走宿主同一 guard/凭据管线；不得自造策略；需显式拒绝「绝对只读」类任务 | read-only 策略写入被拒且带 sandbox 事实；提权单次生效不残留；`partial` 在台账可见 |
+| 3.3【β】 | 子调用调度与可审计性 → 配额/并发对齐、「parallel/exclusive lane」、宿主可审计 dispatch 事件（现仅插件私有台账，64 次/256KiB/300s、`maxParallelBindings` 默认 4） | P2 | 改配额触顶行为与事件流；跨宿主版本一致性依赖 conformance | 并发/触顶探针；触顶文案与宿主一致；dispatch 事件可复算；见差异 A3 |
+| 3.4【β·条件】 | 宿主 `plan-mode` + `compaction` 两组能力 → 或在 `preset/stream/cordis.patch.yml` insert 两组（对齐 `[PTC]/presets/ptc.patch.yml:48-85`），或正式写为非目标 | P2 | 装配表变化；若宿主在 `llm/stream` 层改写历史，会触发 `PrefixBrokenError` fail-closed；三份文档结论互斥（A4） | `exit_plan_mode`/`/compact`/工具结果裁剪逐项探针；0 前缀违规；装配面无悬空依赖 |
+
+## M4 文件写入与对账
+
+| 编号·归类 | 目标 → 补齐范围 | 优先级 | 对现有流程/兼容性的影响 | 验收标准 |
+|---|---|---|---|---|
+| 4.1【TF】 | 防止覆盖外部改动 → 文件观察 sha256 + 已观察行范围 `covers()`、`tf-edit match="file"` 持锁比较全文、`revision_conflict`/`read_required` 拒绝（`[TF]/executor.py:469`） | P1 | `[β]/src` 中 `revision` 仅用于计划版本/帧序号；改 `tf-edit` schema 与执行器，写前意图账本需记 revision | 外部改动后 edit 安全失败；局部观察不升级为全文授权；条件编辑 ≤2 请求 |
+| 4.2【β】 | 从日志升为状态机 → `committed/unknown/aborted` 终态、`receiptHash`、`tf-final` 前强制 reconcile、ack 语义写死「只解锁不重放」 | P2 | `intent-log.ts` 记录格式变更，旧 JSONL 需迁移；resume 停机路径与 0.4.x 回退开关受影响 | 强杀 10 次 0 重放/0 重复写；`tf-final` 时 pending=0；`unknown` 必须人工 `--ack` |
+
+## M5 会话持久化与段边界
+
+| 编号·归类 | 目标 → 补齐范围 | 优先级 | 对现有流程/兼容性的影响 | 验收标准 |
+|---|---|---|---|---|
+| 5.1【TF】【β】 | 会话可恢复且双账本一致 → 原子快照 fsync + `os.replace`、增量、index v2/fork/discover（`[TF]/session.py:380`）；本地 JSONL 与宿主 zstd session log 互通或定义双写投影；命令记录回放或明确「不回放 + 状态可重建」契约 | P2 | `limitations.md §5,§7` 自述不互通、命令记录刻意不回放；改 resume 行为与 id 命名空间 | resume 后私有账本与宿主一致；跨会话 `tf-*` 状态可重建，或明确标注不可重建；双写幂等 |
+| 5.2【β】 | 丢弃内容可自解释 → `diffstat` 真实接线（现仅 `compaction.ts:207` 字段）、段头 = 命令清单 + `path@sha256` + 未完成项 + 稳定引用 | P3 | 段头改变确定性摘要字节 ⇒ 换基/基线重算；`surfaceOp: replace` 不采用（功能等价，不计入） | 同段两次投影逐字节一致；`diffstat` 与真实 diff 一致；重启后段引用可取回 |
+
+## M6 宿主职责层（结构性分叉）
+
+| 编号·归类 | 目标 → 补齐范围 | 优先级 | 对现有流程/兼容性的影响 | 验收标准 |
+|---|---|---|---|---|
+| 6.1【TF·条件】 | 不逐项移植 Provider/SSE/usage 计费/安全/技能装载/TUI（`porting-matrix.md §5` 18 模块），改为补一份「宿主逐项覆盖对照表」 | P3 | `[β]/package.json` 无 dependencies、全部经 `inject` 取用，脱离宿主不可运行；是否逐项等价目前无法确认 | 每个 `[TF]` 模块对应宿主包名/符号/版本；未覆盖项标「无法确认」并列入 A5 |
+
+## M7 发布门禁与验证面（β 特有）
+
+| 编号·归类 | 目标 → 补齐范围 | 优先级 | 对现有流程/兼容性的影响 | 验收标准 |
+|---|---|---|---|---|
+| 7.1【β】 | 让「候选版」变「正式版」→ 四臂真机 L0–L3（缺 `DEEPSEEK_API_KEY`）、任务集补 4 个长任务 + 2 个 >2000 行大文件任务、G6 真机 5 项勾选；G1 已修，G4 tag 不得先打 | P0 | `§12.3` 三条只满足第 1 条；`eval/runs/four-arm-<stamp>.json` 不存在；README 数据面不得引用旧口径 | G1–G6 全绿；H1/H2 有结论（含被证伪）；成对样本 `\|ΔN\|≤1` 单独列出；七列可外部复算 |
+| 7.2【β】 | 真机数字与 U 项收口 → 静态字符数换真机四分量复算（`limitations.md §13`）、U5/U6/U7/U8/U9/U11 逐项留痕 | P2 | 影响省 token 表述、通道策略、缺陷定级、控制栏一致性；`thinkflow main` 与 0.10.3 未 diff | 每个 U 项有 `eval/runs/` 产物与结论；任一对外数字同表带请求数/二分量/四分量/checks |
+| 7.3【β】 | 可安全升级 → 9 个回退开关真机演练（现仅 `rollback-drill.mjs` 单测 9/9）；补齐构造期冻结、桌面页无 HMR 需重启、正文延迟显示、live attempt 提前收束的兼容说明 | P2 | 协议档位/工具面改配置需新会话；升级插件须重启客户端 | 9/9 真机回退后 `renderHash` 与 0.4.0 一致；U11 双向切换 6 次 `control.json` 一致 |
+
+---
+
+## 需补充的差异与假设（资料不足）
+
+| 编号 | 事项 | 需补什么 |
+|---|---|---|
+| A1 | 运行时加载 `[β]` 还是被跟踪的 0.4.0 子包 | 装配/启动日志取证；否则所有结论只对 `[β]` 成立 |
+| A2 | 「β 模式」定义 | 请在评审时确认是否另有所指 |
+| A3 | PTC 配额数值冲突 | `channel-matrix.md §4` 写 2048 次/64MiB/600s，`[PTC]/config.ts:14-15` 为 1024 次/分、并行 10；需确认是否为不同字段 |
+| A4 | `plan-mode`/`compaction` 是否属缺口 | `disabled-lines-audit.md §2` 判「保留族」、`capability-parity.md §1` 判「tf-plan 语义承担、非严格对等」、宿主 `ptc.patch.yml` 却显式 insert；需宿主 rc.3 挂点实测 |
+| A5 | 中途打断与宿主能力覆盖 | 宿主 step 信封约束、T7 逐项对照均缺实测；若不做语义替代，需标注「结构不可对齐」 |
+| A6 | PTC 共存 8 项判据 | 仅 `test/v050-channel.test.ts` 单测；真机让位行为未验证 |
+| A7 | U1/U3/U4/U10 探针产物 | 计划书 §14 列为 P1 开工前提，`eval/runs/` 无对应文件 |
+| A8 | 上游基线 | `[TF] main` 与本地 0.10.3 快照未 diff（U7） |
+| A9 | 本轮新增三项（2.2 回灌方向、5.2 段头/diffstat、1.1 awaiting） | 上一轮缺失清单未列，需确认纳入对齐范围及是否触碰协议冻结 |
+| A10 | 协议冻结的连锁影响 | 2.3/3.1 都要加命令或属性；`PROTOCOL-v1 §8` 未定义「加语法」的评审流程 |
+
+**明确不计入**：`surfaceOp: replace` 未采用（改走 `dropAppendHead` + 确定性摘要，功能等价）、协议段 263 字符 vs 「0 字符」的措辞差、`workflow`（PTC 侧亦禁用）、控制栏文案与档位命名、双方自称的省 token 百分比。
+
+**排序建议**：7.1 → 1.2/2.1（发布与正确性阻断）→ 1.1/1.3/2.2/2.4/3.1（收益最大但改协议/收束）→ 4.1/5.1/5.2/3.2~3.4（长会话与执行器）→ 6.1/7.2/7.3（验证收口）。2.3 与 3.1 同批改协议快照，避免两次换基；1.1 与 2.4 共用一套收束/让位回归探针。

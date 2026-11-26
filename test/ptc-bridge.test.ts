@@ -96,12 +96,12 @@ describe('tf-code：parser 与 obs 内核层', () => {
     assert.equal(classifyTool('tf-code'), 'code');
     const obs = new ObservationLedger();
     const first = obs.observe({ tool: 'tf-code', ok: true, key: 'code:统计', content: '{"n":1}', callId: 'c1' });
-    assert.equal(first.info_gain, 'high', '首个 code 观测应 high');
+    assert.equal(first.info_gain, 'full', '首个 code 观测应 high');
     assert.ok(first.handle.startsWith('obs:code:c1@v'), `句柄族应为 code：${first.handle}`);
     const dup = obs.observe({ tool: 'tf-code', ok: true, key: 'code:统计', content: '{"n":1}', callId: 'c2' });
-    assert.equal(dup.info_gain, 'none', '重复内容应 none');
+    assert.equal(dup.info_gain, 'dedup', '重复内容应 none');
     const fail = obs.observe({ tool: 'tf-code', ok: false, key: 'code:统计', content: 'exception: boom', callId: 'c3' });
-    assert.equal(fail.info_gain, 'high', '失败一律 high');
+    assert.equal(fail.info_gain, 'full', '失败一律 high');
   });
 });
 

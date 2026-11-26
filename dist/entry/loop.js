@@ -7,7 +7,7 @@
 //   ② SingleStreamDriver —— 单流协议驱动器（纯异步控制流，零宿主依赖）。
 //      状态机：REQUEST → STREAMING（parser 事件循环，命令闭合即 gate.admit 派发）
 //      → 流终止 → 等 drain（F8 普通异步等待）→ 收束判定 → FINISH 或 INJECTING。
-//      重入条件仅三种：info_gain=high 观测 / need_result（tf-peek）/ 执行失败。
+//      重入条件仅三种：info_gain=full 观测 / need_result（tf-peek）/ 执行失败。
 //      成功路径零注入，只写 ledger。
 //   ③ StreamLoopAgent + createStreamAgentFactory + apply —— Cordis 适配壳。
 //      createAgent/resume 按 dsh-agent-loop/lib/index.js:1668-1775（rc.3 实测行号，
@@ -23,15 +23,29 @@
 // （不因记账毁掉任务本身，但绝不无声）。
 
 import { createHash, randomUUID } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { writeFileSync, existsSync, readdirSync, readFileSync, statSync, renameSync, mkdirSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { TfStreamParser, splitEditBody } from '../kernel/parser.js';
                                                                   
 import { ContextRenderer, assertRequestPrefix, PrefixBrokenError, renderHash, contextRebasedLine } from '../kernel/render.js';
                                                                           
-import { ObservationLedger, renderReadIndex } from '../kernel/obs.js';
-                                                          
+import { ObservationLedger, renderReadIndex, isBindingStale, queryCandidates as queryCandidateLines, staleLine } from '../kernel/obs.js';
+                                                                       
 import { checkFinalSummary } from '../kernel/final.js';
+import { MAX_DECLARED_TOOLS, budgetContributions, budgetRefusal, projectAssembly } from '../kernel/assembly.js';
+                                                                            
+import {
+  parseAcceptancePredicate,
+  evaluatePredicate,
+  describePredicate,
+  buildVerificationPlan,
+  scriptFeedback,
+} from '../kernel/delivery.js';
+                                                                 
+import { RevisionGuard } from '../kernel/changes.js';
+import { ChangeStore, MAX_GUARDED_FILE_BYTES, planRevert, receiptMetadata, samePath, snapshotReason, unifiedDiff } from '../kernel/change-store.js';
+                                                             
+import { isSecretPath, secretReadRefusalDetail, redactSecrets, PATH_ARG_KEYS } from '../kernel/security.js';
 import {
   compactItems,
   renderStateDigest,
@@ -62,7 +76,9 @@ import {
   publicLegacyModeCatalog,
 } from '../kernel/modes.js';
                                                                         
-import { isLang } from '../kernel/control-bar.js';
+import { limitOf, mergeLimits, publicLimitCatalog, sanitizeLimitPatch, THINKFLOW_ALIGNED_LIMITS } from '../kernel/limits.js';
+                                                       
+import { isLang, switchSummaryLine } from '../kernel/control-bar.js';
 import {
   appendLedgerRecord,
   createJsonlPersistence,
@@ -72,16 +88,17 @@ import {
   withEventCapture,
 } from './json-persistence.js';
                                                                 
-import { createCodeExecutor, DEFAULT_CODE_QUOTA, looksLikePtcRuntime } from './ptc-bridge.js';
-                                                                             
+import { createCodeExecutor, DEFAULT_CODE_QUOTA, HOST_DEFAULT_MAX_PARALLEL_BINDINGS, looksLikePtcRuntime } from './ptc-bridge.js';
+import { defaultBindingLane, describePtcRuntime } from './ptc-bridge.js';
+                                                                                                                     
 import { asPluginEffect, getService } from './cordis-compat.js';
-import { readPersistedControl, resolveControlState, writePersistedControl } from './control-state.js';
+import { parseSwitchValue, readPersistedControl, resolveControlState, writePersistedControl } from './control-state.js';
                                                                  
 import { appendIntentRecord, intentFileOf, loadIntentRecords, pendingIntents, reconcilePendingIntents } from './intent-log.js';
 import { clearTakeover, markTakeover, markDegrade, takeover } from './takeover-registry.js';
 import { ToolSurfaceHolder, degradedLine } from './tool-surface.js';
                                                                                                       
-import { composeProtocolText, asProtocolLevel, PROTOCOL_SECTION_IDS } from '../kernel/protocol.js';
+import { composeProtocolText, asProtocolLevel, PROTOCOL_SECTION_IDS, enhancedSectionTexts } from '../kernel/protocol.js';
                                                                               
 import { VERSION } from '../version.js';
 
@@ -130,7 +147,10 @@ export function finishMessage(finish                  )         {
                                                                                                                                 
                                                  
 
-/** 镜像 types.d.ts:538-580 GenerateOptions（驱动器发出的请求形状） */
+/** 镜像 types.d.ts:538-580 GenerateOptions（驱动器发出的请求形状）+ wire 传输面。
+ *  传输字段对齐 xuxiang-thinkflow provider.py 的请求装配语义（max_tokens / stream_options /
+ *  thinking / tool_choice / retries）——由 limits 传输组（THINKFLOW_ALIGNED_LIMITS 默认，
+ *  用户可随时覆盖）逐请求组装；宿主 llm 服务可识别即落到 HTTP body，不识别则忽略（透传面）。 */
                                        
                    
                 
@@ -143,6 +163,17 @@ export function finishMessage(finish                  )         {
                                                                                
                                                            
                                                                                                 
+                                                                                       
+                               
+                                                            
+                     
+                                                                
+                                            
+                                                                                         
+                                                     
+                                                                           
+                      
+                          
                        
                      
  
@@ -197,7 +228,9 @@ export const DEFAULT_TOOL_MAPPING              = {
       }
       case 'tf-edit': {
         // F1：精确替换映射宿主 edit（old → new；replace_all=false 时宿主要求恰好出现一次）。
-        // body 用 OLD/NEW 标记行分隔两段字面量；解析失败回结构化失败，绝不静默改成全文重写。
+        // body 支持两种形态：三行标记（`<<<<<<< OLD` / `=======` / `>>>>>>> NEW`）与
+        // 上游 thinkflow 的 `<old>…</old><new>…</new>`（0.5.2 兼容，审计 C-8）。
+        // 解析失败回结构化失败，绝不静默改成全文重写。
         const split = splitEditBody(cmd.body ?? '');
         if (split === null) return null;
         const args                          = {
@@ -205,6 +238,8 @@ export const DEFAULT_TOOL_MAPPING              = {
           old_string: split.old,
           new_string: split.new,
         };
+        // match="file"（上游语义）：OLD 必须与整个文件一致——宿主 edit 的 old_string
+        // 就是"整个文件字面量"时该语义自然成立，这里只需不再把它当未知属性丢掉。
         if (cmd.attrs['replace_all'] === 'true') args['replace_all'] = true;
         return { name: 'edit', arguments: args };
       }
@@ -283,7 +318,24 @@ export const DEFAULT_TOOL_MAPPING              = {
                    
                 
                            
-                                           
+     
+                                         
+                                                                
+                                           
+     
+                       
+     
+                                                                      
+                                                                
+                                     
+                                                           
+     
+                               
+                                                                
+                                                            
+                                                 
+                                                      
+                                               
                                 
                                                 
                                                                
@@ -310,6 +362,8 @@ export const DEFAULT_TOOL_MAPPING              = {
                            
                                                                  
                            
+                                                    
+                           
                                                      
                             
                           
@@ -317,8 +371,10 @@ export const DEFAULT_TOOL_MAPPING              = {
                                    
                                                      
                         
-                                                        
-                                                            
+                                                         
+                                                                   
+                                                                    
+                                                   
                               
                                                                     
                        
@@ -329,9 +385,10 @@ export const DEFAULT_TOOL_MAPPING              = {
                                                        
                                       
                              
-                                                               
-                                                                            
-                                                                          
+                                                                        
+                                                                 
+                                                   
+                                                               
                                             
                                            
                              
@@ -352,6 +409,20 @@ export const DEFAULT_TOOL_MAPPING              = {
                                                                    
                                             
                                                    
+                                                             
+                                                             
+                                                       
+                                                     
+                              
+                                                                        
+                                                             
+                                                         
+                   
+                                                         
+                                                                          
+                                                                       
+                                       
+                        
                                                          
                  
                       
@@ -394,10 +465,10 @@ export const DEFAULT_TOOL_MAPPING              = {
                               
                           
                             
-                                                 
-                                                     
-                                       
-                                           
+                                                     
+                                                         
+                                                             
+                                                 
                                         
                                                          
                                                             
@@ -410,8 +481,12 @@ export const DEFAULT_TOOL_MAPPING              = {
                                                         
                                                 
                         
-                                                   
-                        
+                                                              
+                                                             
+                                       
+                                   
+                                               
+                                              
                                                                         
                             
                                                                              
@@ -428,6 +503,10 @@ export const DEFAULT_TOOL_MAPPING              = {
                                                                
                                                                     
                        
+                                                                 
+                                                       
+                                                       
+                         
                                                  
                                                                        
                            
@@ -437,7 +516,26 @@ export const DEFAULT_TOOL_MAPPING              = {
                                                                        
                                                               
                                       
-                                                                          
+                                                                                                      
+                                                 
+                        
+                                                                              
+                       
+                                                      
+                                                                      
+                                             
+                                     
+                                                           
+                                                  
+                                                             
+                       
+                                                                      
+                                
+                                                 
+                         
+                                                               
+                                                      
+                           
  
 
                               
@@ -471,6 +569,38 @@ export const DEFAULT_TOOL_MAPPING              = {
                                   
                                        
                                                           
+                                                              
+                                          
+                   
+                                                                                                   
+                                                          
+                                                                                                                                                                   
+    
+                                                                         
+                                                            
+                                                                       
+                                                  
+                                                 
+                                                                    
+                                                   
+                                                                                                                                                                     
+                                                                         
+                                                                                                                      
+                                                                           
+                                                
+                                                           
+                                                    
+                                                                                                  
+                                                       
+                                                                          
+                                                                                   
+                       
+                                                                                                         
+                                                                                        
+                       
+                                                                       
+                                                                 
+                                       
  
 
 /**
@@ -531,6 +661,9 @@ export const DEFAULT_TOOL_MAPPING              = {
                            
                          
                                         
+                                                                  
+                                                                                    
+                                              
                           
                                         
                                                                 
@@ -548,7 +681,8 @@ export const DEFAULT_TOOL_MAPPING              = {
  *  - resetCount = 记录序列里 resetSeq 相对上一条递增的次数（= 最后一条的 resetSeq）。
  * 命名映射：cacheRead = dsh-llm Usage.cacheReadTokens；cacheWrite = cacheWriteTokens；
  * output = outputTokens；providerInputTokens = inputTokens + cacheRead + cacheWrite。
- * prefixTokensEst 是本地估算（Σcontent 字符 / 4 上取整，与 #injectedChars 同一启发式），
+ * prefixTokensEst 是本地估算（0.5.2 起：ASCII 按 4 字符/token、CJK 按 0.7 token/字符，
+ * 另加 tools schema 字节/4；与 estimatePromptTokens 同一启发式），
  * 只做交叉校验——权威值是 providerInputTokens（E9：估算与 provider 回报差 10-20%）。
  * feedbackBytes：本请求注入的**反馈类**字节（full=全量回灌 / dedup=字节级去重（P0-4 前恒 0）/
  * handle=句柄+骨架/回执）；指令类块（nudge/error/degraded/truncated）与计划差分不计入。
@@ -589,7 +723,7 @@ export const DEFAULT_TOOL_MAPPING              = {
                                                                               
                                                                                                          
                                              
-                                                                                                             
+                                                                                                         
                                     
                                                                                 
                                        
@@ -597,7 +731,7 @@ export const DEFAULT_TOOL_MAPPING              = {
                                                              
 
 /** plugin record 通道（真实宿主）。类型语法 plugin:tf-agent/<record>（dsh-session types.d.ts:527）。 */
-                                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                                              
 
                              
                                                        
@@ -619,6 +753,10 @@ const NON_RETRYABLE_STREAM_CODES                      = new Set([
 
 export const DEFAULT_SYSTEM_PROMPT = '你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回复流中完成任务：先简短思考，然后连续输出全部 tf-* 命令，最后输出 tf-final。';
 
+/** 0.6.0（§0 A2）：`finalCheck=false` 的 system 变体——静态提示也不能再要求 tf-final，
+ *  否则"开关关掉了"只是运行期不检查，模型侧仍被要求交一条它不该交的收尾。 */
+export const DEFAULT_SYSTEM_PROMPT_NO_FINAL = '你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回复流中完成任务：先简短思考，然后连续输出全部 tf-* 命令；本轮已关闭流末验收，不需要 tf-final——工作完成后直接在流末尾写出最终答案正文。';
+
 export const DEFAULT_PROTOCOL_TEXT = composeProtocolText();
 
 /**
@@ -628,6 +766,9 @@ export const DEFAULT_PROTOCOL_TEXT = composeProtocolText();
  */
 
 export const DEFAULT_INVARIANTS = '不变量：历史消息只增不改（任何"压缩/摘要历史"的请求都会被拒绝）；写文件成功不会有结果回灌（只记台账），失败一定会以 [tf-stream:error] 注入下一请求；tf-read 自己刚写过的文件只会得到回执（[tf-stream:receipt]，行数+指纹），不会回灌全文；不要用原生 tool_call 写文件。回合必须以 <tf-final .../> 收尾：所有命令输出完毕后立即输出 tf-final，不带 tf-final 的回合视为未完成——即使全部工作已做完。';
+
+/** 0.6.0（§0 A2）：`finalCheck=false` 的不变量变体（去掉"必须 tf-final"的要求）。 */
+export const DEFAULT_INVARIANTS_NO_FINAL = '不变量：历史消息只增不改（任何"压缩/摘要历史"的请求都会被拒绝）；写文件成功不会有结果回灌（只记台账），失败一定会以 [tf-stream:error] 注入下一请求；tf-read 自己刚写过的文件只会得到回执（[tf-stream:receipt]，行数+指纹），不会回灌全文；不要用原生 tool_call 写文件。本轮已关闭流末验收：不要求 tf-final，直接把最终答案与未完成项写在流末尾即可。';
 
 /**
  * tf-code 通道的协议段（PTC 桥接）：仅在 executeCode 端口在位时追加到协议文本之后
@@ -652,8 +793,11 @@ return { total: lines.length, errorCount: errors.length, samples: errors.slice(0
 - 程序失败会以 [tf-stream:code-error] 注入（kind + 可重试结论，kind: exception/timeout/abort/
   worker-exit/invalid-output/output-limit/protocol/sandbox-unavailable/quota-exceeded），
   修复代码后换新 id 重发；timeout 属性为毫秒数，可省略（用宿主默认）。
-- 每次运行的子调用次数、输出字节、墙钟有插件级配额（超限结构化终止 kind: quota-exceeded）；
-  沙箱事实（mode/enforcement）逐次记账，enforcement=partial 只覆盖文件效果、不是隔离。`;
+- 子调用次数、输出字节、墙钟默认**不设限**（交给宿主）；需要收紧时由用户在控制面板定义上限
+  （超限结构化终止 kind: quota-exceeded）。沙箱事实（mode/enforcement）逐次记账，
+  enforcement=partial 只覆盖文件效果、不是隔离。
+- 单次提权：sandbox_permissions="workspace-write|danger-full-access" 必须与 justification="一句理由"
+  成对使用；只覆盖本次程序执行，提权时 state= 会被忽略；宿主未提供审批服务时命令直接失败。`;
 
 /** v0.4.0（G2/P2）：tf-call 通用调用通道的协议段——命令表净增 1 的全部协议成本（§6.2 方案 C）。
  *  规则刻意短：一条语法 + 一条判断规则 + 一条失败处置；不逐工具展开说明（工具描述由宿主
@@ -688,17 +832,68 @@ export const DEFAULT_CODE_BRIDGE_PROTOCOL_SECTION = `## tf-code（内置窄桥�
 程序内：await tools.read({file_path}) / tools.write({file_path, content}) / tools.pwsh({command, description})。
 只 return 最终值（中间结果不进上下文）；失败会以 [tf-stream:code-error] 注入。`;
 
-/** F3：tf-code 首成功/变化结果完整注入的默认上限（字符）。4000 ≈ 2k tokens：
- *  上限内值直接可见（省一次 tf-peek 往返），超限转骨架 + 句柄（中间结果不回灌的红线不破）。 */
+/** F3：tf-code 首成功/变化结果完整注入的**参考**上限（字符）。4000 ≈ 2k tokens。
+ *  0.5.2：**不再作为默认值生效**——未设 limits.codeValueInjectLimit 即 0 = 不限制
+ *  （值总注入、logs 不截断）；本常量只出现在文档示例与控制栏参考档位里。 */
 export const DEFAULT_CODE_VALUE_INJECT_LIMIT = 4000;
 
-/** F4：原生 tool_call 结果单块注入的默认上限（字符），仅声明 nativeToolSchemas 时生效。
- *  6000 ≈ 3k tokens：首成功/短结果完整注入，超限转骨架 + 句柄，杜绝原生通道全量回灌。 */
+/** F4：原生 tool_call 结果单块注入的**参考**上限（字符），仅声明 nativeToolSchemas 时相关。
+ *  0.5.2：不再作为默认值生效（未设 = 0 = 不限制）；参考值见 docs/limits.md。 */
 export const DEFAULT_NATIVE_RESULT_LIMIT = 6000;
 
-/** F7：长会话段边界阈值（追加区字符数）。160k 字符 ≈ 40k tokens：超过即在新回合开始处
- *  整块丢弃旧段（ADR-001：整块丢弃路线，显式缓存重置点，原文句柄化可回取）。 */
+/** F7：长会话段边界阈值的**参考**值（追加区字符数）。160k 字符 ≈ 40k tokens。
+ *  0.5.2：不再作为默认值生效（未设 = 0 = 不限制，不做段边界换基）。 */
 export const DEFAULT_SEGMENT_MAX_CHARS = 160_000;
+
+/**
+ * 0.5.2（审计 M10）：把一次运行输出渲染成宿主 `{logs, result}` 的并列体裁。
+ *
+ * 为什么必须并列：宿主 tool-executor-ptc 回给模型的结果块就是三元组
+ * `{logs, sandbox, result}`，渲染时 `logs.join("\n")` 与 `result` 同块出现
+ *（HOST/dsh-tool-executor-ptc/lib/index.js:370-379 / 657-661）。插件 0.5.1 只把
+ * `result.value` 序列化回注、logs 最多留 200 字符尾——于是"console.log 型"程序对
+ * 模型完全不可见：程序成功，模型看到 0 信息，只能重跑或瞎猜。
+ *
+ * @param valueJson 返回值序列化（`undefined` / 空 = 没有 result 段）
+ * @param logs 捕获输出（宿主 logs 展平）
+ * @param fallback result 段缺失时的替代正文（失败路径传诊断）
+ * @param logsLimit logs 段字符上限；0 = 不限制（用户未设 limits.codeValueInjectLimit）
+ */
+export function joinCodeOutput(
+  valueJson                    ,
+  logs                    ,
+  fallback         ,
+  logsLimit = 0,
+)         {
+  const parts           = [];
+  const logsBody = codeLogsBody(logs, logsLimit);
+  if (logsBody !== null) parts.push(logsBody);
+  const value = valueJson === undefined || valueJson === 'undefined' ? '' : valueJson;
+  if (value.trim() !== '') parts.push(`result:\n${value}`);
+  else if (fallback !== undefined && fallback !== '') parts.push(fallback);
+  return parts.join('\n');
+}
+
+/** logs 段（宿主体裁：`logs:` 前缀 + 正文；超预算只截 logs，并说明去哪儿看剩下的）。 */
+export function codeLogsBody(logs                    , limit        )                {
+  const text = logs ?? '';
+  if (text.trim() === '') return null;
+  if (limit > 0 && text.length > limit) {
+    return `logs（前 ${limit} 字符／共 ${text.length} 字符）：\n${text.slice(0, limit)}\n`
+      + `…（logs 已截断；需要剩下的部分请把关键值 return 出来，或写入文件后 tf-peek 取回）`;
+  }
+  return `logs:\n${text}`;
+}
+
+/**
+ * 0.5.2：零产出打转护栏（协议收敛常量，**不是任务轮数上限**）。
+ *
+ * 为什么它可以在"不预设任何上限"的前提下保留：判据是"本步有没有新增 ok 命令"，
+ * 有产出就清零——所以它只可能终止"反复输出同一个被拒 final / 反复做失败的同一步"
+ * 这类协议层打转，永远不会截断正在干活的长任务。
+ * 用户仍可用 `limits.stallReentries = 0` 关闭它（或设成任意值）。
+ */
+export const DEFAULT_STALL_GUARD = 6;
 
 /** v0.3.2：单步正文落追加区的上限（字符）。prose 通常很短；超长只截断历史摘要，
  *  当期 assistant/message 仍完整落盘（不改变可读输出）。 */
@@ -707,6 +902,13 @@ export const STEP_PROSE_COMMIT_LIMIT = 4000;
 /** v0.3.2：同一回合内"输出被截断 → 要求续写"的最大次数。超过即如实 blocked，
  *  不无限重试（真机 max-tokens 截断的恢复路径需要重发完整命令，次数有界）。 */
 export const MAX_TRUNCATION_RETRIES = 4;
+
+/** 0.6.0：前缀 fail-closed 后同轮自动续跑上限（每回合）。 */
+export const MAX_PREFIX_AUTO_CONTINUES = 2;
+
+/** 0.6.0（PE-2）：read 索引行锚的默认间隔（行）。用户可用 limits.peekAnchorEvery 收紧
+ *  （例如 100）；未设时保持 0.5.0 的 200——默认行为逐字节不变。 */
+export const DEFAULT_PEEK_ANCHOR_EVERY = 200;
 
 /** v0.4.2：可转正进追加区的易变尾前缀（事实类）。瞬态指令（nudge/degraded/error）不转正。
  *  v0.4.2 新增 plan / plan-diff / receipt：计划清单与验证回执都是"发生过的事实"，
@@ -739,10 +941,23 @@ export function normalizeProse(text        )         {
  * （同输入同字节）；只做交叉校验，权威值是 providerInputTokens（升级清单 E9：估算与
  * provider 回报差 10-20%，跨 provider 不可比）。
  */
-export function estimatePromptTokens(messages                          )         {
-  let chars = 0;
-  for (const m of messages) chars += m.content.length;
-  return Math.ceil(chars / 4);
+export function estimatePromptTokens(messages                          , extraChars = 0)         {
+  let ascii = 0;
+  let wide = 0;
+  for (const m of messages) {
+    for (const ch of m.content) {
+      // 0x2E80 起为 CJK 区（汉字/假名/全角标点）：主流分词器里 1 字符 ≈ 0.7~1 token，
+      // 与 ASCII 的 4 字符/token 差 3~4 倍，混为一个口径会让中文会话的触顶判定整体偏乐观。
+      if (ch.codePointAt(0)  >= 0x2e80) wide += 1;
+      else ascii += 1;
+    }
+  }
+  // 纯 ASCII 输入保持 0.4.x 口径（Σcontent/4 上取整）——既有换基/压缩基线不变；
+  // 汉字按 0.7 token/字符（DeepSeek 分词器实测区间 0.67~0.83，取中位偏保守）；
+  // 旧口径把汉字也按 4 字符/token 计，中文会话的触顶判定因此晚 ~2.8 倍才生效。
+  // extraChars = 请求里不落在 content 上的字节（tools schema JSON），按同口径 /4 折算。
+  const base = Math.ceil(ascii / 4 + wide * 0.7);
+  return extraChars > 0 ? base + Math.ceil(extraChars / 4) : base;
 }
 
 /**
@@ -766,9 +981,18 @@ export function malformedCloserNudge(raw        )         {
   ].join('\n');
 }
 
+/**
+ * 0.5.1（2.1）：思考通道命中 `<tf-` 的一次性纠正。
+ * 思考通道（reasoning-delta）不参与协议解析——命令只认正文通道；这里把"错误沉默"
+ * 变成一次可见的纠正，避免模型在思考区写完命令后以为已执行。
+ */
+const REASONING_CHANNEL_NUDGE = [
+  '[tf-stream:error kind=protocol-error:reasoning-channel] 检测到思考通道（reasoning）里出现 `<tf-*>` 命令文本——思考通道不解析、不执行任何命令。',
+  '请把命令写在**正文**通道（与普通回复同一段文本）：`<tf-write path="a.txt" id="w1">…</tf-write>` / `<tf-read path="a.txt" id="r1"/>`，然后继续未完成的工作。',
+].join('\n');
+
 /** 截断到上限（保留尾部标记，便于台账核对）。 */
-function capText(text        , limit        )         {
-  return text.length <= limit ? text : `${text.slice(0, limit)}…（截断 ${text.length - limit} 字符）`;
+function capText(text        , limit        )         {  return text.length <= limit ? text : `${text.slice(0, limit)}…（截断 ${text.length - limit} 字符）`;
 }
 
 /**
@@ -798,29 +1022,59 @@ function truncationNudge(truncation                                 )         {
 function composeChannelTexts(
   channel           ,
   codeSource                                          ,
-  cfg                                                                                           ,
+  cfg                                                                                                                ,
   config                    ,
+  descriptor                       ,
 )                                                                                {
-  // 显式覆盖（测试注入）永远压过通道缺省
-  const system = config.systemPrompt;
-  const invariants = config.invariants === false ? '' : config.invariants ?? DEFAULT_INVARIANTS;
+  // 显式覆盖（测试注入）永远压过通道缺省。
+  // 0.6.0：finalCheck=false 的标准通道用"不要求 tf-final"的变体；**代码通道不套这个变体**
+  // ——它的系统提示本来就不提 tf-*，套上去反而会把"连续输出全部 tf-* 命令"塞进代码通道。
+  const systemOverride = config.systemPrompt;
+  const systemStandard = systemOverride
+    ?? (cfg.finalCheck ? undefined : DEFAULT_SYSTEM_PROMPT_NO_FINAL);
+  const invariants = config.invariants === false
+    ? ''
+    : config.invariants ?? (cfg.finalCheck ? DEFAULT_INVARIANTS : DEFAULT_INVARIANTS_NO_FINAL);
   const toolSchemas = config.nativeToolSchemas
     ?? (config.nativeTools
       ? '（本请求的原生工具 schema 见 tools 字段；未列出的宿主工具一律走 tf-call）'
       : undefined);
   if (channel === 'code') {
     // 代码通道：preset 来源协议段 0 字符（§5.3 完全让位）；bridge 来源只写 tf-code 用法
-    const base = codeSource === 'bridge'
+    let base = codeSource === 'bridge'
       ? (config.protocolText ?? config.codeProtocolText ?? DEFAULT_CODE_BRIDGE_PROTOCOL_SECTION)
       : (config.protocolText ?? '');
+    // b 通道 PTC 对齐（第 2 轮，审查修正）：v12 段默认不进装配（金样/让位不变），
+    // 但显式 sections.v12=true 时必须能到 code+bridge 通道的模型——原实现 base 不走
+    // composeProtocolText，导致 v12 完全不可达。这里在 bridge 来源下按需追加。
+    // 再评估修正：只追加 v12 段本身，不把默认 8 段整段注入（保持 bridge 窄桥语义）。
+    const requestedEnhancements = (['v11', 'v12', 'v14', 'v15']         )
+      .filter((id) => config.protocolSections?.[id] === true);
+    if (requestedEnhancements.length > 0 && config.protocolText === undefined) {
+      const enhanced = enhancedSectionTexts(requestedEnhancements);
+      if (enhanced !== '') base += `\n\n${enhanced}`;
+    }
+    // 0.5.2（审计 M17）：消费宿主运行时描述符——programFormat / language / sandboxMode /
+    // retainsState / executionInstructions 决定"程序体该写成什么样"。不写进协议段时，
+    // 模型按 function-body 写、宿主按 repl 执行 → 每段程序都语法报错（且错误信息只指向宿主）。
+    const hostNotes           = [];
+    if (descriptor?.programFormat !== undefined) {
+      hostNotes.push(`- 宿主执行形态：format=${descriptor.programFormat}（程序体按该形态书写；tf-code 的 format 属性只做本地校验，不改写宿主形态）。`);
+    }
+    if (descriptor?.language !== undefined) hostNotes.push(`- 程序语言：${descriptor.language}。`);
+    if (descriptor?.sandboxMode !== undefined) hostNotes.push(`- 默认沙箱：${descriptor.sandboxMode}（sandbox 属性可按策略收窄，不在白名单内会被拒绝）。`);
+    if (descriptor?.retainsState === false) hostNotes.push('- 宿主不保留跨调用内存态：state 属性不会带来跨调用变量。');
+    if (descriptor?.timeout !== undefined) hostNotes.push(`- 单次运行超时：默认 ${descriptor.timeout.defaultMs}ms、上限 ${descriptor.timeout.maxMs}ms。`);
+    if (descriptor?.executionInstructions !== undefined) hostNotes.push(`- 宿主执行约束：${descriptor.executionInstructions}`);
+    if (hostNotes.length > 0) base += `\n\n（宿主运行时事实，来自 runtime 描述符）\n${hostNotes.join('\n')}`;
     return {
-      system: system ?? DEFAULT_CODE_CHANNEL_SYSTEM_PROMPT,
+      system: systemOverride ?? DEFAULT_CODE_CHANNEL_SYSTEM_PROMPT,
       protocol: base,
       toolSchemas: toolSchemas ?? (codeSource === 'bridge'
         ? '（本通道只声明 tf-code 程序体；其余操作走会话原生工具）'
         : '（工具面由会话 preset 决定；本插件不注册、不裁剪任何工具）'),
       invariants: config.invariants === false ? '' : config.invariants
-        ?? '不变量：工具面由会话 preset 决定，本插件不注册不裁剪；上下文压缩（surface replace）可能替换旧消息为摘要，原文按句柄保留可取回。',
+        ?? '不变量：工具面由会话 preset 决定，本插件不注册不裁剪；上下文超限时旧段整块移出请求并折叠为确定性摘要（原文转句柄保留，折叠点以 [tf-stream:context-rebased] 标注），不做逐条消息改写。',
     };
   }
   // 标准通道：0.4.x 组装 + 0.5.0 peek 段（kernel/protocol.ts LEVEL_SECTIONS 已含）
@@ -835,7 +1089,7 @@ function composeChannelTexts(
     + (cfg.callCommand ? `\n\n${config.callProtocolText ?? DEFAULT_CALL_PROTOCOL_SECTION}` : '')
     + (config.protocolAppend ? `\n\n${config.protocolAppend}` : '');
   return {
-    system: system ?? DEFAULT_SYSTEM_PROMPT,
+    system: systemStandard ?? DEFAULT_SYSTEM_PROMPT,
     protocol: protocolText,
     toolSchemas: toolSchemas ?? '（本回合未启用原生工具；一切文件与命令操作走 tf-* 协议）',
     invariants,
@@ -862,16 +1116,38 @@ function composeChannelTexts(
 /** F5：验收项（计划状态放驱动器=宿主侧；请求只注差分）。 */
                           
                
-                              
-                                             
+                                               
+                                                
+                   
+                                                              
+                                                            
+                                              
+                                                   
+                   
+                                                  
+                                  
+                                                     
+                                                 
+                                                      
                     
  
 
-/** F5：解析 tf-plan body 的验收项行（`- [id] 描述`；无有效行时调用方判结构化失败）。 */
-export function parsePlanItems(body        )                                      {
-  const items                                      = [];
+/**
+ * F5：解析 tf-plan body 的验收项行（`- [id] 描述`；无有效行时调用方判结构化失败）。
+ * 1.3：行首 `> [id]` 声明当前活动项（对齐上游 task_plan 的单个 in_progress 约束）——
+ * 活动项必须引用已声明的验收 id，且全 plan 至多一个；多余声明按出现顺序取第一个，
+ * 其余记入 activeDuplicates 供调用方台账告警（不静默吞掉）。
+ */
+export function parsePlanItems(body        )                                                        {
+  const items                                                        = [];
   const seen = new Set        ();
+  const activeIds           = [];
   for (const line of body.split('\n')) {
+    const activeMatch = line.match(/^\s*>\s*\[([A-Za-z0-9_-]{1,64})\]\s*$/);
+    if (activeMatch !== null) {
+      activeIds.push(activeMatch[1] );
+      continue;
+    }
     const m = line.match(/^\s*[-*]?\s*\[([A-Za-z0-9_-]{1,64})\]\s+(.+?)\s*$/);
     if (m === null) continue;
     const id = m[1] ;
@@ -879,7 +1155,19 @@ export function parsePlanItems(body        )                                    
     seen.add(id);
     items.push({ id, text: m[2]  });
   }
+  if (activeIds.length > 0) {
+    // 只认第一条活动声明；其余交由 planActiveDuplicates 记 fault，不在 item 上留 active=false
+    // （避免"被忽略的声明"污染计划快照的语义）。
+    const active = activeIds[0] ;
+    for (const item of items) if (item.id === active) item.active = true;
+  }
   return items;
+}
+
+/** 1.3：计划活动项唯一性诊断——返回被忽略的重复 `> [id]` 声明数（0 = 合规）。 */
+export function planActiveDuplicates(body        )         {
+  const lines = body.split('\n').filter((l) => /^\s*>\s*\[[A-Za-z0-9_-]{1,64}\]\s*$/.test(l));
+  return Math.max(0, lines.length - 1);
 }
 
                            
@@ -912,6 +1200,21 @@ export function parsePlanItems(body        )                                    
 
 let DRIVER_SEQ = 0;
 
+/**
+ * 0.5.2（审计 M4）：tf-code 子调用审计的**会话级**出口——agent 对象 → 它的驱动器。
+ *
+ * 0.5.1 用单个 `let dispatchSink`，多 agent 场景（父子 agent、并行会话、桌面端多标签）
+ * 共用同一槽位：事件会串账到"最后创建的那个驱动器"，前一个会话的子调用凭空消失。
+ * 而装配处那句"构造期产生的事件由 dispatchSink 的缓冲兜住"是**假的**——根本没有缓冲。
+ * 用 WeakMap 按 agent 身份路由：键随 agent 回收，天然不串账、不泄漏。
+ */
+const DISPATCH_TARGETS = new WeakMap                            ();
+
+/** 取某 agent 的派发账本目标（未知 agent = undefined，事件丢弃但不抛错）。 */
+export function dispatchTargetOf(agent         )                                 {
+  return typeof agent === 'object' && agent !== null ? DISPATCH_TARGETS.get(agent) : undefined;
+}
+
 /** 0.5.0（§5.6(1)）：效果账条目（效果压缩的数据源）。 */
                        
                    
@@ -934,6 +1237,8 @@ export class SingleStreamDriver {
                      
                   
                              
+                                                  
+                        
                                  
                          
                                               
@@ -950,14 +1255,22 @@ export class SingleStreamDriver {
                             
                                    
                             
+                                              
+                            
                                                 
                            
                                   
                                     
                                     
                          
-                                                                
+                                                   
                                
+                                           
+                         
+                                           
+                        
+                           
+                                      
                                                     
                         
                                                      
@@ -1007,6 +1320,10 @@ export class SingleStreamDriver {
                                     
                                                                     
                       
+                                                                     
+                      
+                                                                           
+                        
                                  
                           
                            
@@ -1014,20 +1331,30 @@ export class SingleStreamDriver {
                        
                                    
                        
+                                               
+                                  
+                                
+                                              
                                                                       
                                
                            
                                                                       
-                                                                          
+                                                                                                      
+                                                                       
+                                                        
+                                                                  
+                       
    ;
            #renderer                 ;
            #obs                   ;
+  /** 0.6.0（PE-3）：文件句柄 stat 校验的解析根（config.projectDir 或进程 cwd）。 */
+           #fileRoot        ;
   /** v0.4.0 工具面（P1）：会话首请求冻结；tf-call 校验面 + nativeTools 声明面。 */
            #surface                   ;
   /** 本请求冻结的工具面快照（undefined = L2 protocol-only / toolSurface=off）。 */
   #currentSurface                          = undefined;
   /** 上一次注入的降级级别（同级别不重复注入；级别变化或恢复时重新注入）。 */
-  #lastSurfaceDegraded                                            = 'ok';
+  #lastSurfaceDegraded                                                         = 'ok';
   // ---- 0.5.0 执行通道（§3.2/§5.2）：请求值 + 生效值 + 来源判定 + 回退原因 ----
   /** 用户/装配请求的通道（可能因来源不可用被拒绝）。 */
   #requestedChannel           ;
@@ -1051,8 +1378,11 @@ export class SingleStreamDriver {
   #taskRequestCount = 0;
   /** 本任务换基次数（控制栏"换基"；pushUserTask 清零）。 */
   #rebasesTask = 0;
-  /** 装配层探测到的代码通道可用来源（null = 不可用；setChannel('code') 的判据）。 */
+  /** 代码通道可用来源（null = 暂不可用；setChannel('code') 的判据——0.6.1 起空值时会走
+   *  惰性探针实时补判，非定死）。 */
   #availableCodeSource                             = null;
+  /** 0.6.1：代码通道来源惰性探针（config 透传；装载期探测早于 PTC preset 挂载时实时补判）。 */
+           #codeSourceProbe                                                ;
   /** 任务起点取回度量快照（重复取回 0/0 的任务级口径）。 */
   #peekMetricsBase = { hits: 0, total: 0 };
   /** 本任务起点计量快照（D1 修复：budgetLevel 用任务级差值，不再用会话累计）。 */
@@ -1060,6 +1390,23 @@ export class SingleStreamDriver {
   #injectedCharsBase = 0;
   /** 任务级预算指令（[tf-budget: 8steps/20k] 解析结果；只覆盖本任务的 N/C 两旋钮）。 */
   #taskBudget                                                        = null;
+  /**
+   * 0.5.2：用户上限的三层来源（全局 / 档位 / 通道）+ 运行期补丁。
+   * 合并顺序（后者覆盖前者）：global → byTier → byChannel → sessionPatch。
+   */
+  #limitLayers   
+                        
+                                                       
+                                                 
+    = { global: {}, byChannel: {}, byTier: {} };
+  /**
+   * 0.6.0 复查修复（BUG：预设 replace 对当前会话不生效）：`limits` 中装配层的独立快照。
+   * `setLimits(replace)` 把 global 层重置为本值（清掉 control.json / 运行期累计的用户层），
+   * 装配层保留。构造期与 `#limitLayers.global` 的合并结果一致（assembly ⊆ global）。
+   */
+  #globalAssembly              = {};
+  /** 运行期 `setLimits` 补丁（不落盘；落盘由 control-state 的 CLI/控制页负责）。 */
+  #sessionLimits              = {};
   /** 本任务预算下限检查结果（runTurn 启动时判定一次）。 */
   #taskBudgetBlocked                = null;
   /** 任务级观测告警已发（同任务只告警一次）。 */
@@ -1085,6 +1432,9 @@ export class SingleStreamDriver {
   #streamWrites                                     = [];
   /** unknown-handle 的 peek（同流乐观 peek）：流末 drain 后重试一次，仍无此句柄才失败 */
   #deferredPeeks                                                            = [];
+  /** 0.5.2（审计 C-6）：回执引用空间——receipt:N → 回执正文（`tf-peek handle="receipt:N"`）。 */
+  #receipts = new Map                ();
+  #receiptSeq = 0;
   /** 本任务内 tf-write 已成功写过的路径（规范化分隔符；修复限制 1 的自写回验判定） */
            #writtenPaths = new Set        ();
   /** F5 计划与验收：计划状态放驱动器（宿主侧）；请求只注差分。
@@ -1113,6 +1463,8 @@ export class SingleStreamDriver {
   #closeOutActive = false;
   /** 本回合已用掉的收束请求数。 */
   #closeOutRequests = 0;
+  /** 0.5.3：本回合已收束过的撞墙事由（结构性去重；closeOutRequests 未设时不靠数值收敛） */
+  #closeOutReasons = new Set        ();
   #finalOnlyRequests = 0;
   #deltaCursor = 0; // O3 directoryDelta 游标（obs seq 空间）
   /** v0.4.2：口径对齐宿主 dsh-llm Usage（types.d.ts:160-179）——inputTokens 只是**未命中缓存的
@@ -1126,6 +1478,20 @@ export class SingleStreamDriver {
   #ledger                        ;
   #warn                                             ;
   #gate                      ;
+  /** 4.1：文件读版本守卫（revisionFacts 在位时启用；缺省不启用 = 0.4.x 行为）。 */
+  #revisionGuard = new RevisionGuard();
+  /** 0.6.0 正式版（changes 缺口）：私有变更回执账本（快照 + 守卫回滚；对齐 [TF]/changes.py）。 */
+           #changeStore = new ChangeStore();
+  /** 写前 before 快照暂存（cmdId → 快照事实）；写成功后结算为回执，失败则丢弃。
+   *  崩溃窗口（写已发生但回执未落盘）由 F6 意图日志覆盖——回执是写后确认，不是事务。 */
+           #pendingChanges = new Map                                                                                                           ();
+  /** b 通道 PTC 对齐（第 2 轮）：tf-code state 名 → 稳定 stateOwner 对象（宿主按身份保留内存态）。
+   *  0.5.2：附带建立时的 sandbox 模式——策略变化即作废旧身份（审计 M5）。 */
+  #codeStateOwners = new Map                                          ();
+  /** 1.2：交付构建校验的任务游标（每个任务最多跑一次，避免重入重复构建）。 */
+  #buildVerifiedTask = -1;
+  /** 1.2：构建校验失败状态——持久化到任务结束，防止"重发 final"绕过闸（再评估修正）。 */
+  #buildFailure                    ;
   #taskId = 'task';
   #sessionId                    ;
   /** 已上报的结构化问题（同一失败只注入一次） */
@@ -1136,6 +1502,9 @@ export class SingleStreamDriver {
   #reportedPeeks = new Set        ();
   /** 当前 agent 引用（executeTools 带上 agent；fs 工具 session 解析依赖，见 ToolBatchInputLike） */
   #agentRef          = undefined;
+  /** 0.5.2：PTC 运行时描述符（language / programFormat / sandboxMode / 超时上限）——
+   *  装配层从 createCodeExecutor 的 onDescriptor 取得，回填给状态面与诊断。 */
+  #ptcDescriptor                                   = undefined;
   /** K2：会话工作区（factory 从 session header / workingDirectory 服务解析后回填；
    *  tf-code resolve 透传，与 tf-write/tf-read 的路径解析语义一致）。 */
   #sessionCwd                     = undefined;
@@ -1151,8 +1520,20 @@ export class SingleStreamDriver {
   #cmdOrder = 0;
   #lastFinalOrder = 0;
   #lastNonFinalOrder = 0;
-  /** 已提示过的 final 拒绝（key = 拒绝 kind）；同类问题只注入一次，二次不放行也不重复烧注入 */
-  #reportedFinalRejects = new Set        ();
+  /**
+   * 0.5.3：premature-final 注入记账（key = 拒绝事由文本，value = 注入时的生产性 ok 计数）。
+   *
+   * 为什么需要它（真 bug，0.5.2 遗留）：旧实现 `#reportedFinalRejects` 只覆盖 ③④ 内容面
+   *（占位/过期），①② 面（depends_on 未满足 / 命令未完成 / 计划验收未验证）**每次都重新
+   * 注入**。此前靠 `stallReentries` 缺省 6 这个"数值护栏"兜住——上限交给用户后
+   *（0 = 不限制）就退化成**无界重入**：模型每步重发同一条 premature final，插件每步重新
+   * 注入同一段拒绝文本，回合永不收敛（V1.3-1/2/3 实抓：请求数无限增长）。
+   *
+   * 结构性收敛（不是新增数值上限）：同一事由**已经注入过**且此后**没有任何新增产出的
+   * ok 命令**（信息面零增量）→ 不再重复注入，本步如实收场 blocked。反之，模型只要做了
+   * 新工作（新 ok 命令），同一事由仍会重新提示——生产性回合不受影响。
+   */
+  #prematureInjected = new Map                ();
   /** 重复命令的原结果回灌队列（幂等重发不重执行，但把内容回灌给丢失上下文的模型） */
   #pendingReplays                                                         = [];
   #replays = 0;
@@ -1181,10 +1562,17 @@ export class SingleStreamDriver {
    *  解耦（v0.4.3.1：混合尾 error 前置不再误报 append-drift，核查 §2）。
    *  段边界（dropAppendHead）显式重置为 null（唯一合法的历史收缩通道）。 */
   #lastRequest                         = null;
-  /** P0-6④：append-drift 一次放行预算——每回合 1 次、每会话 3 次；超限降级 stable-drift 处置。
-   *  （断言在发送前，"放行"= 记账后照常发送同一份 next，0 额外请求——核查 §4.2 用词。） */
+  /** P0-6④：前缀违约接受计数（纯观测——0.6.1 起接受不产生任何额外请求/计费，限流退役）。
+   *  （断言在发送前，"接受"= 记账后照常发送同一份 next，0 额外请求——核查 §4.2 用词。） */
   #prefixResendsTurn = 0;
   #prefixResendsSession = 0;
+  /** 0.6.0：本回合前缀失败后的自动续跑次数（每回合清零）。 */
+  #prefixAutoContinues = 0;
+  /** 0.6.0（RA-5）：装配 plan 模式回退次数与最后一次原因（回退后本会话固定 host）。 */
+  #assemblyFallbacks = 0;
+  #assemblyFallbackReason                     = undefined;
+  /** 0.6.0（RA-1）：最近一次成功投影的 plan（状态面可读；不影响发送）。 */
+  #lastPlan                      = null;
   /** P0-6⑤：兜底交付一次性标记（同回合只写一次；零产出回合不写——不伪造"已完成"）。 */
   #fallbackFinalDelivered = false;
   /** P0-6⑤：本回合命令 id 集（兜底交付的"台账事实"清单来源；回合开始清零）。 */
@@ -1203,6 +1591,13 @@ export class SingleStreamDriver {
    *  见 malformedCloserNudge）。只注入一次：同一会话重复犯错不重复烧注入。 */
   #strayCloseNudge                = null;
   #strayCloseGuided = false;
+  /** 0.5.1（2.1）：思考通道（reasoning-delta）命中 `<tf-` 的一次性纠正注入。
+   *  思考通道不进协议解析（0 执行），但也不能静默丢弃——记
+   *  `protocol-error:reasoning-channel` 并注入一次纠正（每回合最多一次）。 */
+  #reasoningNudge                = null;
+  /** reasoning-delta 的协议探测尾巴（`<tf-` 可能被拆在两个 chunk 里）。 */
+  #reasoningProbeTail = '';
+  #reasoningHit = false;
   #truncationRetries = 0;
   /** 本步命令 id 与原生调用（摘要用；流开始时重置） */
   #stepCommandIds           = [];
@@ -1211,6 +1606,9 @@ export class SingleStreamDriver {
    *  0.3.0 落盘的是整段原文（含 tf-* 标记与 DSML 噪声）——桌面端过程区把协议标记渲染成乱码，
   *  本版起落盘纯 prose：命令事实在台账（plugin:tf-agent/*），会话日志只留用户可读内容。 */
   #streamProse = '';
+  /** 0.5.1（1.1）：本回合成功发出的阻塞式提问（tf-ask）。非空即"等待用户回答"——
+   *  回合以 awaiting 收束，0 nudge / 0 额外请求（不把提问当成未完成的收尾）。 */
+  #askPending                                             = null;
   /** v0.3.1 实时帧状态：agent 生命周期内的 attempt 序号与帧序号（revision 逐帧 +1，
    *  契约见 dsh-api-session-controller SessionAssistantStreamAccumulator.accept）。 */
   #attemptCounter = 0;
@@ -1287,11 +1685,17 @@ export class SingleStreamDriver {
   constructor(ports             , config                    , renderer                  , obs                    ) {
     this.#ports = ports;
     this.#configRef = config;
+    // 0.5.2（审计 M17）：PTC 运行时描述符（装配层构造执行器时取得）——进协议段与状态面。
+    this.#ptcDescriptor = ports.ptcDescriptor;
+    // 0.6.1：惰性探针透传（setChannel('code') 与构造期补判用）。
+    this.#codeSourceProbe = config.codeSourceProbe;
     // ---- 0.5.0 档位数值（§4.2 表；tier 只改数值）----
     const tierSpec = getTier(config.tier ?? DEFAULT_TIER);
     const tv = tierSpec.values;
     // ---- 0.5.0 代码通道三来源判定（§5.2）：装配层探测结果经 config.codeSource 注入；
-    // 显式 codeChannelSource 绕过探测；来源皆无 → 拒绝进入，回退标准（不静默降级）。----
+    // 显式 codeChannelSource 绕过探测；来源皆无 → 拒绝进入，回退标准（不静默降级）。
+    // 0.6.1：装载期探测可能早于宿主 PTC preset 挂载（preset 按窗口/会话选择）——
+    // config.codeSource 缺失时先调惰性探针（codeSourceProbe）现判一次再定回退。----
     let requestedChannel            = config.channel ?? DEFAULT_CHANNEL;
     let codeSource                                          ;
     if (requestedChannel === 'code') {
@@ -1300,12 +1704,18 @@ export class SingleStreamDriver {
       } else if (config.codeSource !== undefined) {
         codeSource = config.codeSource;
       } else {
-        codeSource = 'none';
+        const live = config.codeSourceProbe?.() ?? null;
+        if (live !== null) {
+          codeSource = live;
+          (ports.onWarning ?? (() => {}))(`[stream-loop] 代码通道来源惰性探针命中 = ${live}（装载期探测为空——PTC 预设/ptcRuntime 后到，0.6.1）`);
+        } else {
+          codeSource = 'none';
+        }
       }
       if (codeSource === 'none') {
         // §5.2 第三分支：拒绝进入代码通道，回退标准通道（warn + 台账 + 控制栏状态，
         // 绝不静默降级）。控制状态由 takeover/控制页读取 runtimeChannel 看到回退事实。
-        const reason = '代码通道不可用：未检测到 PTC 预设或 ptcRuntime（来源判定 none）——回退标准通道';
+        const reason = 'PTC兼容模式不可用：未检测到 PTC 预设或 ptcRuntime（来源判定 none）——回退标准通道';
         (ports.onWarning ?? (() => {}))(`[stream-loop] ${reason}`);
         this.#channelFallback = reason;
         requestedChannel = DEFAULT_CHANNEL;
@@ -1315,82 +1725,158 @@ export class SingleStreamDriver {
     this.#requestedChannel = config.channel ?? DEFAULT_CHANNEL;
     this.#channel = requestedChannel;
     this.#codeSource = codeSource;
-    // 装配层探测结果（apply() 注入）：setChannel('code') 的可用性判据。
-    this.#availableCodeSource = config.codeSource === 'preset' || config.codeSource === 'bridge'
-      ? config.codeSource
-      : null;
+    // 代码通道可用来源（setChannel('code') 判据）：装配层探测结果 + 构造期惰性探针补判。
+    // 两者皆空时**不定死**——setChannel 时还会走惰性探针（0.6.1：PTC 后到可进入）。
+    this.#availableCodeSource = config.codeChannelSource === 'preset' || config.codeChannelSource === 'bridge'
+      ? config.codeChannelSource
+      : config.codeSource === 'preset' || config.codeSource === 'bridge'
+        ? config.codeSource
+        : this.#codeSource === 'preset' || this.#codeSource === 'bridge'
+          ? this.#codeSource
+          : null;
     const codeChannel = requestedChannel === 'code';
+    // ---- 0.5.2：用户定义的行为上限（三层：全局 → 档位 → 通道；未定义 = 不限制）----
+    // 0.6.0 复查修复：装配层原始值单独留存（preset replace 只清用户层，装配层保留）。
+    this.#globalAssembly = mergeLimits(config.assemblyLimits);
+    this.#limitLayers = {
+      global: mergeLimits(config.limits),
+      byChannel: {
+        ...(config.limitsByChannel?.standard === undefined ? {} : { standard: mergeLimits(config.limitsByChannel.standard) }),
+        ...(config.limitsByChannel?.code === undefined ? {} : { code: mergeLimits(config.limitsByChannel.code) }),
+      },
+      byTier: {
+        ...(config.limitsByTier?.light === undefined ? {} : { light: mergeLimits(config.limitsByTier.light) }),
+        ...(config.limitsByTier?.standard === undefined ? {} : { standard: mergeLimits(config.limitsByTier.standard) }),
+        ...(config.limitsByTier?.deep === undefined ? {} : { deep: mergeLimits(config.limitsByTier.deep) }),
+      },
+    };
+    const activeLimits = this.#limitsFor(requestedChannel, config.tier ?? DEFAULT_TIER);
+    // 显式字段（config.maxSteps 等）压过 limits 层；两者都没定义 = 0（不限制）。
+    const pickLimit = (explicit                    , key                               )         =>
+      explicit ?? (activeLimits[key] !== undefined ? limitOf(activeLimits, key) : 0);
+    // 0.6.0：总开关先于 limits 生效——关掉折叠 = 三个阈值一起失效，避免"关了还在偷偷丢段"。
+    // 0.6.0 正式版：contextRaw（完全不处理）是更开放的一档——折叠强制关，且去重抑制、
+    // 效果折叠、读取/回灌/注入截断全部停用（内容原样进请求；预算类 limits 仍生效）。
+    const contextRaw = config.contextRaw === true;
+    const contextFold = !contextRaw && config.contextFold !== false;
     this.#cfg = {
       provider: config.provider,
       model: config.model,
       reasoningEffort: config.reasoningEffort,
-      maxParallelToolCalls: config.maxParallelToolCalls ?? 3,
-      // v0.4.2：兜底值与 balanced 模式默认一致（12）——直构驱动器的调用方
-      // （离线评测/测试）与桌面装配保持一致上限。
-      maxReentries: config.maxReentries ?? 12,
-      // v0.4.0（自 0.3.3 回流）：生产性重入与停滞重入分账——旧实现把"继续干活"和"原地
-      // 打转"都算进 maxReentries，13 步的真实任务（读文件/改文件/跑检查）会在干到一半时
-      // 被硬杀，桌面端只剩最后一句 prose（真机 session-6bb805db / 27876fd9）。
-      stallReentries: config.stallReentries ?? config.maxReentries ?? 12,
-      // 0.5.0（§4.5.2）：maxSteps 接管 maxRequests（N 上限，档位值 16/24/40）。
-      // 显式 maxReentries（无 maxSteps/maxRequests）时保留旧派生 max(4, maxReentries*2)，
-      // 兼容 0.4.x 装配；0 = 无上限（仅观测）。
+      limits: activeLimits,
+      // 调度常量（不是任务上限）：并行度缺省 3 与宿主 single-agent 调度一致，可用 limits 覆盖。
+      maxParallelToolCalls: pickLimit(config.maxParallelToolCalls, 'maxParallelToolCalls') || 3,
+      // 重入护栏：maxReentries 默认 0 = 不限制（用户未定义就不介入）。
+      // stallReentries 是**零产出打转护栏**而不是任务轮数上限：生产力步骤会把它清零。
+      // 0.5.3：缺省改为 0（不限制）——用户没有定义就不介入（此前缺省 6 是插件预设的
+      // 行为上限，与"上限全部交给用户"的要求冲突）。要护栏请在 limits 里显式写。
+      maxReentries: pickLimit(config.maxReentries, 'maxReentries'),
+      stallReentries: config.stallReentries
+        ?? config.maxReentries
+        ?? (activeLimits.stallReentries !== undefined
+          ? limitOf(activeLimits, 'stallReentries')
+          : (activeLimits.maxReentries !== undefined ? limitOf(activeLimits, 'maxReentries') : 0)),
+      // 0.5.0（§4.5.2）：maxSteps 接管 maxRequests（N 上限）。0.5.2 起默认 0 = 不限制；
+      // 显式 maxReentries（无 maxSteps/maxRequests/limits）时保留旧派生 max(4, maxReentries*2)。
       maxSteps: config.maxSteps
         ?? config.maxRequests
-        ?? (config.maxReentries !== undefined ? Math.max(4, config.maxReentries * 2) : tv.maxSteps),
-      maxInputTokens: config.maxInputTokens ?? tv.maxInputTokens,
+        ?? (activeLimits.maxSteps !== undefined
+          ? limitOf(activeLimits, 'maxSteps')
+          : (config.maxReentries !== undefined ? Math.max(4, config.maxReentries * 2) : 0)),
+      maxInputTokens: pickLimit(config.maxInputTokens, 'maxInputTokens'),
       compactAggressiveness: config.compactAggressiveness ?? tv.compactAggressiveness,
-      keepRecent: config.keepRecent ?? tv.keepRecent,
-      maxSummaryChars: config.maxSummaryChars ?? tv.maxSummaryChars,
-      peekBudgetChars: config.peekBudgetChars ?? tv.peekBudgetChars,
-      effectElision: config.effectElision !== false,
-      effectElisionKeepRecent: Math.max(0, config.effectElisionKeepRecent ?? 3),
+      keepRecent: pickLimit(config.keepRecent, 'keepRecent'),
+      maxSummaryChars: pickLimit(config.maxSummaryChars, 'maxSummaryChars'),
+      peekBudgetChars: pickLimit(config.peekBudgetChars, 'peekBudgetChars'),
+      // 0.6.0（PE-2）：锚点间隔可配（默认 200 = 0.5.0 行为不变；100 = 更密）。
+      peekAnchorEvery: pickLimit(config.peekAnchorEvery, 'peekAnchorEvery') || DEFAULT_PEEK_ANCHOR_EVERY,
+      effectElision: !contextRaw && config.effectElision !== false,
+      // 0.5.2：折叠门槛不预设——未设（0）= 不折叠已验收效果（保留全部）。
+      effectElisionKeepRecent: contextFold ? pickLimit(config.effectElisionKeepRecent, 'effectElisionKeepRecent') : 0,
       stateDigest: config.stateDigest !== false,
-      surfaceCompaction: config.surfaceCompaction !== false,
-      spanLedger: config.spanLedger !== false,
+      surfaceCompaction: contextFold && config.surfaceCompaction !== false,
+      contextFold,
+      contextRaw,
+      autoContinueOnPrefixFail: config.autoContinueOnPrefixFail !== false,
+      spanLedger: !contextRaw && config.spanLedger !== false,
       peekIndex: config.peekIndex !== false,
-      maxReadChars: config.maxReadChars ?? DEFAULT_MAX_READ_CHARS,
+      // 0.5.2：单次读取上限不预设（0 = 不限制，只投全文）；参考 32000（旧默认）。
+      maxReadChars: pickLimit(config.maxReadChars, 'maxReadChars'),
       prefixPolicy: config.prefixPolicy ?? 'auto',
+      reasoningStrategy: config.reasoningStrategy === 'drop-stale' ? 'drop-stale' : 'provider-required',
+      thinkingMode: typeof config.thinkingMode === 'string' && config.thinkingMode.trim() !== '' ? config.thinkingMode.trim() : 'disabled',
       rebaseBudgetRatio: config.rebaseBudgetRatio ?? 1.5,
-      maxRebasesPerTurn: Math.max(0, config.maxRebasesPerTurn ?? 2),
-      maxRebasesPerSession: Math.max(0, config.maxRebasesPerSession ?? 8),
+      // 换基计数：-1 = 不限制（未定义），>=0 = 上限（0 = 本回合/本会话禁止换基）。
+      maxRebasesPerTurn: config.maxRebasesPerTurn
+        ?? (activeLimits.maxRebasesPerTurn !== undefined ? limitOf(activeLimits, 'maxRebasesPerTurn') : -1),
+      maxRebasesPerSession: config.maxRebasesPerSession
+        ?? (activeLimits.maxRebasesPerSession !== undefined ? limitOf(activeLimits, 'maxRebasesPerSession') : -1),
       surfacePolicy: config.surfacePolicy ?? 'reserved-only',
       channel: requestedChannel,
       tier: config.tier ?? DEFAULT_TIER,
       tierValues: tv,
-      observeBudgetTokens: config.observeBudgetTokens ?? config.budgetTokens ?? DEFAULT_BUDGET_TOKENS_OBSERVE,
-      closeOutRequests: Math.max(0, config.closeOutRequests ?? 2),
+      observeBudgetTokens: config.observeBudgetTokens ?? config.budgetTokens ?? limitOf(activeLimits, 'observeBudgetTokens'),
+      // 0.5.3：缺省 0 = 不预设次数——收束期只按**撞墙事由去重**（同一事由只收束一次，
+      // 重复收束指令信息面零增量），用户显式设 >0 才是硬次数上限。
+      closeOutRequests: config.closeOutRequests
+        ?? (activeLimits.closeOutRequests !== undefined ? limitOf(activeLimits, 'closeOutRequests') : 0),
       readFeedbackBudgetPerRequest: config.readFeedbackBudgetPerRequest
-        ?? DEFAULT_READ_FEEDBACK_BUDGET_PER_REQUEST,
+        ?? limitOf(activeLimits, 'readFeedbackBudgetPerRequest'),
       streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? 30_000,
       budgetTokens: config.budgetTokens,
       // 0.5.0（§7.5 双旋钮）：回灌侧默认 0 = 不截断（读取侧 maxReadChars 已控住）；
       // 8000 = 0.4.x 行为回退点。
-      readFeedbackLimit: config.readFeedbackLimit ?? 0,
-      selfReadFeedback: config.selfReadFeedback ?? 'receipt',
+      readFeedbackLimit: config.readFeedbackLimit ?? limitOf(activeLimits, 'readFeedbackLimit'),
+      selfReadFeedback: config.selfReadFeedback ?? 'full',
       // 0.5.0：tf-code 通道 = channel==='code'（bridge 来源，本插件执行）或显式 enableCode。
       // preset 来源下执行器是宿主 tool-executor-ptc，本插件不执行 tf-code（让位，§5.3）。
       codeEnabled: ((codeChannel && codeSource === 'bridge') || config.enableCode === true)
         && ports.executeCode !== undefined,
       codeTimeoutMs: config.codeTimeoutMs,
-      codeQuota: { ...DEFAULT_CODE_QUOTA, ...(config.codeQuota ?? {}) },
-      codeValueInjectLimit: config.codeValueInjectLimit ?? DEFAULT_CODE_VALUE_INJECT_LIMIT,
-      nativeResultLimit: config.nativeResultLimit ?? DEFAULT_NATIVE_RESULT_LIMIT,
+      // 0.5.2：tf-code 配额不再预设（0 = 不限制，交给宿主 PTC 的 output-limit/超时）；
+      // 用户可用 limits.codeMax* 收紧。
+      codeQuota: {
+        ...DEFAULT_CODE_QUOTA,
+        ...(config.codeQuota ?? {}),
+        maxSubcalls: config.codeQuota?.maxSubcalls ?? limitOf(activeLimits, 'codeMaxSubcalls'),
+        maxOutputBytes: config.codeQuota?.maxOutputBytes ?? limitOf(activeLimits, 'codeMaxOutputBytes'),
+        maxWallMs: config.codeQuota?.maxWallMs ?? limitOf(activeLimits, 'codeMaxWallMs'),
+      },
+      // 0.5.2：tf-code 值注入上限不预设（0 = 不限制）；参考 4000（旧默认）。
+      codeValueInjectLimit: pickLimit(config.codeValueInjectLimit, 'codeValueInjectLimit'),
+      // 0.5.2：原生结果单块上限不预设（0 = 不限制）；参考 6000（旧默认）。
+      nativeResultLimit: pickLimit(config.nativeResultLimit, 'nativeResultLimit'),
       nativeToolSchemasEnabled: config.nativeToolSchemas !== undefined,
       enablePlan: config.enablePlan ?? true,
-      segmentMaxChars: config.segmentMaxChars ?? DEFAULT_SEGMENT_MAX_CHARS,
+      finalCheck: config.finalCheck !== false,
+      requireFinal: config.requireFinal ?? false,
+      // 0.5.2：段边界阈值不预设（0 = 不限制）；参考 160000（旧默认）。
+      segmentMaxChars: contextFold ? pickLimit(config.segmentMaxChars, 'segmentMaxChars') : 0,
       toolMapping: config.toolMapping ?? DEFAULT_TOOL_MAPPING,
       nativeTools: config.nativeTools === true,
       callCommand: config.callCommand !== false && ports.toolsService !== undefined,
+      // 0.6.0（RA-5）：装配策略（缺省 host = 0.5.x 行为逐字节不变）
+      assemblyPolicy: config.assemblyPolicy === 'plan' ? 'plan' : 'host',
+      ...(config.assemblyFaultInject === undefined ? {} : { assemblyFaultInject: config.assemblyFaultInject }),
       strictAdmission: config.strictAdmission === true,
       // v0.4.3（P0-6 探针）：离线探针专用（生产不得设置）；undefined = 关闭，零开销。
       ...(config.faultPrefixDrift === undefined ? {} : { faultPrefixDrift: config.faultPrefixDrift }),
     };
+    // 0.5.3：上限字段统一由 #applyLimitValues 落位（构造期与运行期同一条路径，
+    // 避免"字面量里一套、setLimits 里另一套"——上一版正是因此导致面板改不动多数键）。
+    this.#applyLimitValues(activeLimits);
+    if (Object.keys(activeLimits).length === 0) {
+      // 不限制是**用户的选择**，不是插件的默认值——装载时明确告知一次（不阻断）。
+      (ports.onWarning ?? (() => {}))(
+        '[stream-loop] 未设置任何行为上限（轮数/token/取回预算等）：任务不会被插件截断；'
+        + '如需限制请用 limits（如 limits: { maxSteps: 40, maxInputTokens: 48000 }）或 `dsh-stream-agent limits --set maxSteps=40`',
+      );
+    }
     // ---- 0.5.0 协议面按通道组装（§3.2 能力矩阵；稳定前缀构造期冻结）----
     // standard：基座协议（full/lean/minimal）+ code 段（bridge 时）+ call 段 + append；
     // code+preset：协议段 0 字符（§5.3 完全让位）；system 也换成代码通道措辞（不引导 tf-*）；
     // code+bridge：只写 tf-code 用法（约 200 字符；不传 stateOwner/programFormat/sandboxPolicy）。
-    const texts = composeChannelTexts(requestedChannel, codeSource, this.#cfg, config);
+    const texts = composeChannelTexts(requestedChannel, codeSource, this.#cfg, config, ports.ptcDescriptor);
     this.#renderer = renderer ?? new ContextRenderer({
       system: texts.system,
       protocol: texts.protocol,
@@ -1409,13 +1895,25 @@ export class SingleStreamDriver {
     this.#obs = obs ?? new ObservationLedger({
       starvationThreshold: config.starvationThreshold,
       spanLedger: this.#cfg.spanLedger,
+      // 0.6.0 正式版：模型可见输出脱敏（默认开；redactOutput:false 是显式回退点）。
+      redact: config.redactOutput !== false,
     });
+    // 0.6.0（PE-3）：文件句柄 stat 校验的解析根（未注入 projectDir = 进程 cwd）。
+    // 0.6.0 收口（核验 P2）：resolve 归一（相对 projectDir / 尾分隔符 / `..` 段）——
+    // #changePath、回执 workspace、绑定 path 共用同一根形态。
+    this.#fileRoot = resolve(config.projectDir ?? process.cwd());
     this.#warn = ports.onWarning ?? (() => {});
     this.#gate = ports.gate;
-    // 0.5.0（附录 A）：taskBudget 配置 = 会话级预算初始值（任务指令可收窄，不可突破装配上限）
+    // 0.5.0（附录 A）：taskBudget 配置 = 会话级预算初始值（任务指令可收窄）
     if (config.taskBudget !== undefined && config.taskBudget !== null) {
-      if (typeof config.taskBudget.maxSteps === 'number') this.#sessionBudget.maxSteps = config.taskBudget.maxSteps;
-      if (typeof config.taskBudget.maxInputTokens === 'number') this.#sessionBudget.maxInputTokens = config.taskBudget.maxInputTokens;
+      if (typeof config.taskBudget.maxSteps === 'number') {
+        this.#sessionLimits = { ...this.#sessionLimits, maxSteps: config.taskBudget.maxSteps };
+      }
+      if (typeof config.taskBudget.maxInputTokens === 'number') {
+        this.#sessionLimits = { ...this.#sessionLimits, maxInputTokens: config.taskBudget.maxInputTokens };
+      }
+      this.#cfg.maxSteps = this.#sessionLimits.maxSteps ?? this.#cfg.maxSteps;
+      this.#cfg.maxInputTokens = this.#sessionLimits.maxInputTokens ?? this.#cfg.maxInputTokens;
     }
   }
 
@@ -1492,11 +1990,18 @@ export class SingleStreamDriver {
   /** Agent 构造完成后回填引用：工具批的 agent 字段（fs 工具 session 解析依赖）。 */
   setAgent(agent         )       {
     this.#agentRef = agent;
+    // 0.5.2（审计 M4）：登记 agent → 驱动器，供 tf-code 子调用审计按会话路由。
+    if (typeof agent === 'object' && agent !== null) DISPATCH_TARGETS.set(agent, this);
   }
 
   /** K2：回填会话工作区（tf-code resolve 透传用；factory 在 createDriver 闭包里解析）。 */
   setSessionCwd(cwd                    )       {
     this.#sessionCwd = cwd;
+  }
+
+  /** 0.5.2：回填 PTC 运行时描述符（装配层在 createCodeExecutor 构造时取得）。 */
+  setPtcDescriptor(descriptor                                  )       {
+    this.#ptcDescriptor = descriptor;
   }
 
   /** F6：置位 resume 停机核对（"有意图无回执"；零注入——只阻断，不进上下文）。 */
@@ -1515,18 +2020,27 @@ export class SingleStreamDriver {
    * 会话级通道切换（§4.6）。排队到下一个用户任务边界生效（§3.3 约束 5：任务进行中提交
    * 的切换请求排队，不中断当前任务）。切换 = 工具面 + 协议段变化 = 计划性换基（§8.3），
    * 受 maxRebasesPerSession 限流（超限拒绝并要求确认——R1）。
-   * 代码通道需要装配层探测到来源（preset/bridge）；皆无时拒绝进入并如实返回原因。
+   * 代码通道需要装配层探测到来源（preset/bridge）；0.6.1：判据走**惰性探针**实时补判——
+   * 装载期探测早于宿主 PTC preset 挂载时（窗口后开 PTC），这里现取 tools/ptcRuntime 再判，
+   * 命中即更新缓存来源并放行；仍为空才拒绝进入并如实返回原因。
    */
   setChannel(channel           )                                                  {
     if (!isChannelId(channel)) return { ok: false, code: 'invalid-channel' };
     if (channel === this.#channel && this.#pendingChannel === null) return { ok: true };
     if (channel === 'code' && this.#availableCodeSource === null) {
-      const detail = '代码通道不可用：未检测到 PTC 预设或 ptcRuntime——拒绝进入，不静默降级（§5.2）';
+      const live = this.#codeSourceProbe?.() ?? null;
+      if (live !== null) {
+        this.#availableCodeSource = live;
+        this.#warn(`[stream-loop] setChannel('code')：惰性探针命中来源 ${live}（装载期探测为空——PTC 预设/ptcRuntime 后到，0.6.1）`);
+      }
+    }
+    if (channel === 'code' && this.#availableCodeSource === null) {
+      const detail = 'PTC兼容模式不可用：未检测到 PTC 预设或 ptcRuntime——拒绝进入，不静默降级（§5.2）';
       this.#warn(`[stream-loop] setChannel('code') 被拒：${detail}`);
       this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'channel-refused', detail });
       return { ok: false, code: 'code-unavailable', detail };
     }
-    if (this.#rebasesSession >= this.#cfg.maxRebasesPerSession && channel !== this.#cfg.channel) {
+    if (this.#cfg.maxRebasesPerSession >= 0 && this.#rebasesSession >= this.#cfg.maxRebasesPerSession && channel !== this.#cfg.channel) {
       const detail = `本会话换基已达上限 ${this.#cfg.maxRebasesPerSession}（maxRebasesPerSession）：通道切换需要确认（R1）`;
       this.#warn(`[stream-loop] setChannel 排队被拒：${detail}`);
       return { ok: false, code: 'rebase-limit', detail };
@@ -1543,36 +2057,135 @@ export class SingleStreamDriver {
   }
 
   /**
-   * 会话级预算调整（§4.6 runtime.setBudget）。maxSteps/maxInputTokens 两旋钮；
-   * undefined = 恢复档位默认；0 = 无上限（仅观测）。装配级显式上限（config）优先——
-   * 这里只能收窄，不能突破装配上限（§4.6：装配级作为不可逾越上限）。
+   * 合并生效上限（纯查表，无副作用）：thinkflow 对齐默认层 → global → 档位 → 通道 → 运行期补丁。
+   * 通道比档位更具体，因为"模式"首先指执行通道（标准/PTC兼容模式）。
+   * 0.6.1：THINKFLOW_ALIGNED_LIMITS 是最底层默认（无 maxSteps——轮数一律不设上限）；
+   * 用户/装配层显式写 0 = 主动"不限制"，同样压过默认层。
    */
-  setBudget(budget                                                )                                                  {
-    if (budget.maxSteps !== undefined) {
-      const ceiling = this.#configRef.maxSteps ?? this.#configRef.maxRequests ?? this.#cfg.tierValues.maxSteps;
-      if (ceiling > 0 && budget.maxSteps > ceiling) {
-        return { ok: false, code: 'exceeds-assembly-limit', detail: `maxSteps ${budget.maxSteps} 超过装配上限 ${ceiling}` };
-      }
-      this.#sessionBudget.maxSteps = budget.maxSteps;
-    }
-    if (budget.maxInputTokens !== undefined) {
-      const ceiling = this.#configRef.maxInputTokens ?? this.#cfg.tierValues.maxInputTokens;
-      if (ceiling > 0 && budget.maxInputTokens > ceiling) {
-        return { ok: false, code: 'exceeds-assembly-limit', detail: `maxInputTokens ${budget.maxInputTokens} 超过装配上限 ${ceiling}` };
-      }
-      this.#sessionBudget.maxInputTokens = budget.maxInputTokens;
-    }
-    return { ok: true };
+  #limitsFor(channel           , tier        )              {
+    return mergeLimits(
+      THINKFLOW_ALIGNED_LIMITS,
+      this.#limitLayers.global,
+      this.#limitLayers.byTier[tier],
+      this.#limitLayers.byChannel[channel],
+      this.#sessionLimits,
+    );
   }
 
-  /** 会话级预算（setBudget 落点；与档位值合成生效值）。构造时从 config.taskBudget 初始化。 */
-  #sessionBudget                                                 = {};
+  /** 运行期生效上限（控制栏/状态面/`limits` 子命令读取同一份投影）。 */
+  limitsSnapshot()              {
+    return this.#cfg.limits;
+  }
+
+  /**
+   * 0.5.3：把一份上限投影写进生效配置（**唯一**落点）。
+   *
+   * 此前 `setLimits` 只更新 7 个字段，其余（重入/收束/回灌/tf-code 配额/段阈值…）
+   * 要等下一次构造才生效——用户在控制面板改完看不到任何变化，等于"面板只能改两个数"。
+   * 构造期与运行期共用本方法，保证两条路径逐字段一致。
+   *
+   * 纪律：显式装配字段（config.maxSteps 等）永远压过 limits（装配 > 用户面板），
+   * 这是 0.5.0 就定下的层级；其余全部取 limits 或 0（不限制）。
+   */
+  #applyLimitValues(values             )       {
+    const cfg = this.#cfg;
+    const config = this.#configRef;
+    const pick = (explicit                    , key                               )         =>
+      explicit ?? (values[key] !== undefined ? limitOf(values, key) : 0);
+    cfg.limits = values;
+    cfg.maxReentries = pick(config.maxReentries, 'maxReentries');
+    cfg.stallReentries = config.stallReentries
+      ?? config.maxReentries
+      ?? (values.stallReentries !== undefined
+        ? limitOf(values, 'stallReentries')
+        : (values.maxReentries !== undefined ? limitOf(values, 'maxReentries') : 0));
+    cfg.maxSteps = config.maxSteps
+      ?? config.maxRequests
+      ?? (values.maxSteps !== undefined
+        ? limitOf(values, 'maxSteps')
+        : (config.maxReentries !== undefined ? Math.max(4, config.maxReentries * 2) : 0));
+    cfg.maxInputTokens = pick(config.maxInputTokens, 'maxInputTokens');
+    cfg.keepRecent = pick(config.keepRecent, 'keepRecent');
+    cfg.maxSummaryChars = pick(config.maxSummaryChars, 'maxSummaryChars');
+    cfg.peekBudgetChars = pick(config.peekBudgetChars, 'peekBudgetChars');
+    // 0.6.0（PE-2）：行锚间隔也走同一条落点（未设 = 200 默认，0 不是合法间隔）。
+    cfg.peekAnchorEvery = pick(config.peekAnchorEvery, 'peekAnchorEvery') || DEFAULT_PEEK_ANCHOR_EVERY;
+    // 0.6.0（审查 P1）：并行度也必须落在这里——否则面板改 maxParallelToolCalls 静默无效
+    //（构造期用 3 兜底，运行期改不了）。
+    cfg.maxParallelToolCalls = pick(config.maxParallelToolCalls, 'maxParallelToolCalls') || 3;
+    cfg.effectElisionKeepRecent = cfg.contextFold ? pick(config.effectElisionKeepRecent, 'effectElisionKeepRecent') : 0;
+    // 0.6.0 正式版：原样档 = 读取/回灌/注入截断全部停用（内容原样进请求）。
+    cfg.maxReadChars = cfg.contextRaw ? 0 : pick(config.maxReadChars, 'maxReadChars');
+    cfg.segmentMaxChars = cfg.contextFold ? pick(config.segmentMaxChars, 'segmentMaxChars') : 0;
+    cfg.maxRebasesPerTurn = config.maxRebasesPerTurn
+      ?? (values.maxRebasesPerTurn !== undefined ? limitOf(values, 'maxRebasesPerTurn') : -1);
+    cfg.maxRebasesPerSession = config.maxRebasesPerSession
+      ?? (values.maxRebasesPerSession !== undefined ? limitOf(values, 'maxRebasesPerSession') : -1);
+    cfg.observeBudgetTokens = config.observeBudgetTokens
+      ?? config.budgetTokens
+      ?? limitOf(values, 'observeBudgetTokens');
+    // 0.5.3：缺省 0（结构性去重，不预设次数上限）
+    cfg.closeOutRequests = config.closeOutRequests
+      ?? (values.closeOutRequests !== undefined ? limitOf(values, 'closeOutRequests') : 0);
+    cfg.readFeedbackBudgetPerRequest = config.readFeedbackBudgetPerRequest
+      ?? limitOf(values, 'readFeedbackBudgetPerRequest');
+    cfg.readFeedbackLimit = cfg.contextRaw ? 0 : (config.readFeedbackLimit ?? limitOf(values, 'readFeedbackLimit'));
+    cfg.codeValueInjectLimit = cfg.contextRaw ? 0 : pick(config.codeValueInjectLimit, 'codeValueInjectLimit');
+    cfg.nativeResultLimit = cfg.contextRaw ? 0 : pick(config.nativeResultLimit, 'nativeResultLimit');
+    cfg.codeQuota = {
+      ...DEFAULT_CODE_QUOTA,
+      ...(config.codeQuota ?? {}),
+      maxSubcalls: config.codeQuota?.maxSubcalls ?? limitOf(values, 'codeMaxSubcalls'),
+      maxOutputBytes: config.codeQuota?.maxOutputBytes ?? limitOf(values, 'codeMaxOutputBytes'),
+      maxWallMs: config.codeQuota?.maxWallMs ?? limitOf(values, 'codeMaxWallMs'),
+    };
+  }
+
+  /**
+   * 会话级上限调整（0.5.2）。允许任意 ≥0 的整数：插件不再预设装配上限，
+   * 因此不存在"超过装配上限"的拒绝；0 = 该会话不限制。
+   * 返回被接受/忽略的键，调用方据此展示（不静默）。
+   */
+  setLimits(patch         , options                        = {})                                                            {
+    const sanitized = sanitizeLimitPatch(patch, 'setLimits');
+    for (const message of sanitized.warnings) this.#warn(`[stream-loop] ${message}`);
+    // 0.6.0 正式版：replace = 整组替换运行期层（预设应用 / 控制页"整组替换"同一语义）。
+    // 0.6.0 复查修复：replace 同时清掉 global 层的**用户部分**（control.json 物化值）——
+    // 此前只清 #sessionLimits，global 层构造期固化的旧 control.limits 继续生效，
+    // raw/unlimited 预设应用后当前会话仍被旧上限硬杀（落盘正确但运行面残留）。
+    // 装配层（assemblyLimits）保留：显式装配配置压过面板选择的层级不变。
+    if (options.replace === true) this.#limitLayers.global = mergeLimits(this.#globalAssembly);
+    const accepted = options.replace === true ? sanitized.values : mergeLimits(this.#sessionLimits, sanitized.values);
+    this.#sessionLimits = accepted;
+    const next = this.#limitsFor(this.#cfg.channel, this.#cfg.tier);
+    // 0.5.3：所有上限字段共用同一个落点（此前只改 7 项，其余要重启才生效）。
+    this.#applyLimitValues(next);
+    this.#ledgerWrite('plugin:tf-agent/surface', { event: 'limits', limits: next, source: 'setLimits' });
+    this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'limits', detail: `上限更新（${Object.keys(sanitized.values).length} 项）：maxSteps=${this.#cfg.maxSteps} maxInputTokens=${this.#cfg.maxInputTokens}` });
+    return { ok: sanitized.warnings.length === 0, accepted, ignored: [...sanitized.warnings] };
+  }
+
+  /**
+   * 会话级预算调整（§4.6 runtime.setBudget；0.5.2 起等价于 setLimits）。
+   * maxSteps/maxInputTokens 两旋钮；undefined = 不改；0 = 不限制。
+   * 保留旧方法名与返回形状（桌面页/CLI 已在用）。
+   */
+  setBudget(budget                                                )                                                  {
+    const patch              = {};
+    if (budget.maxSteps !== undefined) patch.maxSteps = budget.maxSteps;
+    if (budget.maxInputTokens !== undefined) patch.maxInputTokens = budget.maxInputTokens;
+    const result = this.setLimits(patch);
+    return {
+      ok: result.ok,
+      ...(result.ok ? {} : { code: 'invalid-limit', detail: result.ignored.join('; ') }),
+    };
+  }
 
   /** 旧模式别名（0.5.x 保留，0.6.0 移除）：legacy mode → (channel, tier) 两路排队。 */
   setMode(mode        )                                                                     {
     if (!isLegacyModeId(mode)) return { ok: false, code: 'invalid-mode' };
     const mapped = resolveLegacyMode(mode);
-    this.#warn(`[stream-loop] setMode("${mode}") 是旧模式值，已按别名映射为 channel=${mapped.channel}/tier=${mapped.tier}（0.5.x 保留别名，0.6.0 移除）`);
+    this.#warn(`[stream-loop] setMode("${mode}") 是旧模式值，已按别名映射为 channel=${mapped.channel}/tier=${mapped.tier}`);
     const tierResult = this.setTier(mapped.tier);
     const channelResult = this.setChannel(mapped.channel);
     return {
@@ -1595,14 +2208,10 @@ export class SingleStreamDriver {
         const tv = getTier(tier).values;
         this.#cfg.tier = tier;
         this.#cfg.tierValues = tv;
-        this.#cfg.compactAggressiveness = tv.compactAggressiveness;
-        this.#cfg.keepRecent = tv.keepRecent;
-        this.#cfg.maxSummaryChars = tv.maxSummaryChars;
-        this.#cfg.peekBudgetChars = tv.peekBudgetChars;
-        // N/C 两旋钮：会话级 setBudget 显式值优先；否则档位值；装配显式值为不可逾越上限
-        // （§4.6 优先级：任务指令 > 会话默认 > 装配上限）。
-        this.#cfg.maxSteps = this.#sessionBudget.maxSteps ?? tv.maxSteps;
-        this.#cfg.maxInputTokens = this.#sessionBudget.maxInputTokens ?? tv.maxInputTokens;
+        // 0.5.2：档位不再携带预设上限——切换档位只换"该档位用户定义的那一层"。
+        const limits = this.#limitsFor(this.#cfg.channel, tier);
+        this.#applyLimitValues(limits);
+        this.#cfg.compactAggressiveness = this.#configRef.compactAggressiveness ?? tv.compactAggressiveness;
         this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'tier-switch', detail: `档位 → ${tier}（只改数值，不换基）：maxSteps=${this.effectiveLimits().maxSteps} maxInputTokens=${this.effectiveLimits().maxInputTokens}` });
         this.#ledgerWrite('plugin:tf-agent/surface', { event: 'tier-switch', tier, maxSteps: this.effectiveLimits().maxSteps, maxInputTokens: this.effectiveLimits().maxInputTokens });
       }
@@ -1619,6 +2228,11 @@ export class SingleStreamDriver {
       const previous = this.#cfg.channel;
       this.#channel = next;
       this.#cfg.channel = next;
+      // 0.5.2：通道维度的上限（"各个模式"各自的轮数/token 上限）随通道切换生效。
+      {
+        const limits = this.#limitsFor(next, this.#cfg.tier);
+        this.#applyLimitValues(limits);
+      }
       this.#codeSource = next === 'code' ? this.#availableCodeSource  : undefined;
       const texts = composeChannelTexts(next, this.#codeSource, this.#cfg, this.#configRef);
       const contextTokens = estimatePromptTokens(this.#renderer.stableMessages());
@@ -1682,7 +2296,12 @@ export class SingleStreamDriver {
     // "下一请求的真实体积"，只看 stable 会漏掉刚注入的大块观测（真机形态）。
     const stable = this.#renderer.stableMessages();
     const pendingTail = this.#deliveredTail?.blocks ?? [];
-    const estimated = estimatePromptTokens([...stable, ...pendingTail]);
+    // 0.5.2（审计 C-11）：原生通道的 tools schema 也占上下文，却不在 messages 里——
+    // 不计入会让"上下文有多大"永远低估（大工具面下压缩触发太晚）。
+    const toolsChars = this.#cfg.nativeTools
+      ? JSON.stringify(this.#currentSurface?.schemas ?? []).length
+      : 0;
+    const estimated = estimatePromptTokens([...stable, ...pendingTail], toolsChars);
     const decision = shouldCompact(estimated, {
       maxInputTokens: maxInput,
       maxSteps: this.effectiveLimits().maxSteps,
@@ -1698,15 +2317,15 @@ export class SingleStreamDriver {
       this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'compaction-skipped', detail: `${decision.reason}，但可压缩块为 0（keepFloor=${keepFloor} ≥ 总块数 ${totalBlocks}）——不压缩，照常发送` });
       return;
     }
-    if (this.#rebasesTurn >= this.#cfg.maxRebasesPerTurn || this.#rebasesSession >= this.#cfg.maxRebasesPerSession) {
+    if ((this.#cfg.maxRebasesPerTurn >= 0 && this.#rebasesTurn >= this.#cfg.maxRebasesPerTurn)
+      || (this.#cfg.maxRebasesPerSession >= 0 && this.#rebasesSession >= this.#cfg.maxRebasesPerSession)) {
       this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'compaction-skipped', detail: `换基限流（turn ${this.#rebasesTurn}/${this.#cfg.maxRebasesPerTurn}，session ${this.#rebasesSession}/${this.#cfg.maxRebasesPerSession}）——跳过压缩` });
       return;
     }
-    // 注：§8.4 换基成本判据（rebaseBudgetRatio）只约束 append-drift 受限换基
-    // （#assertWirePrefix）——计划性压缩不适用：压缩恰恰在**降低**后续每个请求的
-    // 未缓存输入，套"剩余预算 > rebase_cost × 1.5"会让压缩永远无法触发（触发点
-    // 0.7×maxInput > max/2.5）。计划性换基走 maxRebases 限流 + 记账（§8.3 判定表：
-    // planned-rebase = 正常执行并记账）。
+    // 注：0.6.1 起 rebaseBudgetRatio / §8.4 换基成本判据随"受限换基"一并退役——前缀违约
+    // 统一为发送前接受（0 额外请求，无重发成本可言）。计划性压缩仍走 maxRebases 限流 +
+    // 记账（§8.3 判定表：planned-rebase = 正常执行并记账）。压缩恰恰在**降低**后续每个
+    // 请求的未缓存输入，套"剩余预算 > rebase_cost × 1.5"只会让压缩永远无法触发。
     // 折叠被丢弃块为确定性摘要（纯函数；原文块转 CompactItem——role 自块类型，内容原样；
     // 0.5.0 §5.6(1)：携带已折叠效果的块（观测/回灌/digest 行含该效果句柄）→ 先行折叠为
     // [applied pN] 一行（压缩是追加区唯一合法改写点，效果压缩在此生效）。
@@ -1741,7 +2360,7 @@ export class SingleStreamDriver {
       this.#record({
         seq: ++DRIVER_SEQ, kind: 'observation',
         handle: observation.handle, key: `compact:turn${turn}:${i}`,
-        infoGain: 'low', reason: 'compaction-handleized',
+        infoGain: 'handle', reason: 'compaction-handleized',
       });
     }
     // 摘要落追加区（压缩产物；确定性，同输入同字节）
@@ -1768,11 +2387,46 @@ export class SingleStreamDriver {
     this.#ledgerWrite('plugin:tf-agent/cache', { cause: 'compaction', turn, droppedBlocks: dropped.length, summaryChars: compacted.summaryChars, estimated, triggerRatio: decision.triggerRatio });
   }
 
-  /** 生效的双旋钮值（任务指令 > 会话默认 > 档位值；§4.6）。 */
+  /** 生效的双旋钮值（任务指令 > 用户上限 > 0=不限制；§4.6）。 */
   effectiveLimits()                                               {
     return {
-      maxSteps: this.#taskBudget?.maxSteps ?? this.#sessionBudget.maxSteps ?? this.#cfg.maxSteps,
-      maxInputTokens: this.#taskBudget?.maxInputTokens ?? this.#sessionBudget.maxInputTokens ?? this.#cfg.maxInputTokens,
+      maxSteps: this.#taskBudget?.maxSteps ?? this.#cfg.maxSteps,
+      maxInputTokens: this.#taskBudget?.maxInputTokens ?? this.#cfg.maxInputTokens,
+    };
+  }
+
+  /**
+   * 0.5.2：控制栏「生效参数」的完整投影（7 键）。
+   *
+   * 与 effectiveLimits() 的区别：那个只给双旋钮、给预算判定用；本方法给**展示**用，
+   * 把 cfg 里真正生效的数值原样说出来。档位不再预设上限后，控制栏若继续拿
+   * `tier.values` 当"生效值"会把 0（不限制）显示成"上限 0"，因此这一层必须由
+   * 运行时自己报账：数值 0 一律表示**不限制**（与 limits 同义），由展示侧翻译。
+   */
+  effectiveParams()   
+                                                                                           
+                                                                                                  
+                                                                                           
+                          
+                                              
+                                                                   
+    {
+    const budget = this.effectiveLimits();
+    return {
+      maxSteps: budget.maxSteps,
+      maxInputTokens: budget.maxInputTokens,
+      compactAggressiveness: this.#cfg.compactAggressiveness,
+      peekBudgetChars: this.#cfg.peekBudgetChars,
+      peekAnchorEvery: this.#cfg.peekAnchorEvery,
+      keepRecent: this.#cfg.keepRecent,
+      maxSummaryChars: this.#cfg.maxSummaryChars,
+      segmentMaxChars: this.#cfg.segmentMaxChars,
+      effectElisionKeepRecent: this.#cfg.effectElisionKeepRecent,
+      maxParallelToolCalls: this.#cfg.maxParallelToolCalls,
+      surfacePolicy: this.#cfg.surfacePolicy,
+      contextFold: this.#cfg.contextFold,
+      contextRaw: this.#cfg.contextRaw,
+      spanLedger: this.#cfg.spanLedger,
     };
   }
 
@@ -1785,7 +2439,7 @@ export class SingleStreamDriver {
   stateDigestLine()                {
     if (!this.#cfg.stateDigest) return null;
     if (this.#cfg.channel === 'standard' && !this.#cfg.enablePlan) return null;
-    const open = this.#plan === null ? [] : [...this.#plan.items.entries()].filter(([, item]) => item.status === 'open');
+    const open = this.#plan === null ? [] : [...this.#plan.items.entries()].filter(([, item]) => item.status !== 'verified');
     const failed = [...this.#commands.values()].filter((r) => r.status === 'failed').length;
     return renderStateDigest({
       goals: this.#plan?.items.size,
@@ -1795,13 +2449,62 @@ export class SingleStreamDriver {
     });
   }
 
-  /** 控制栏运行状态（§3.3 底部状态行数据源；ControlStatsFace）。 */
-  runtimeStatus()   
+  /**
+   * 0.5.2（审计 M12）：释放本会话在宿主侧保留的全部 PTC 状态域。
+   *
+   * 0.5.1 的 `#codeStateOwners` **只增不减**——每个 `state="名"` 在宿主侧占一份内存态，
+   * 会话结束/被替换后无人释放（长会话进程内持续泄漏，且同名 state 在新会话里复用旧内存）。
+   * 由 StreamLoopAgent.dispose() 在 agent 生命周期结束时调用；单次失败不阻断其余释放。
+   */
+  async dispose()                                                                                    {
+    const release = this.#ports.ptcRuntimeRelease;
+    const released           = [];
+    const failed                                           = [];
+    for (const [state, entry] of [...this.#codeStateOwners.entries()]) {
+      if (release === undefined) {
+        failed.push({ state, detail: 'release-unavailable（宿主未提供 ptcRuntimeRelease）' });
+        continue;
+      }
+      try {
+        await release(entry.owner);
+        this.#codeStateOwners.delete(state);
+        released.push(state);
+      } catch (error) {
+        failed.push({ state, detail: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    if (released.length > 0 || failed.length > 0) {
+      this.#ledgerWrite('plugin:tf-agent/code', { dispose: true, released, failed: failed.map((f) => f.state) });
+    }
+    return { released, failed };
+  }
+
+  /** 控制栏运行状态（§3.3 底部状态行数据源；ControlStatsFace）。 */  runtimeStatus()   
                                                                                            
                                                                      
                                                                                        
                                                          
-                                                            
+                
+                                                                                             
+                                                                                                    
+                                                                                      
+                                                                     
+      
+                                      
+                        
+                                                                
+                               
+                                                 
+                               
+                                                                                       
+                                                  
+               
+                              
+                        
+                                       
+                                
+                                          
+      
     {
     const peek = this.#obs.peekMetrics();
     const executor = this.#cfg.channel === 'code'
@@ -1816,6 +2519,12 @@ export class SingleStreamDriver {
       codeSource: this.#cfg.channel === 'code' ? this.#codeSource : undefined,
       channelFallback: this.#channelFallback,
       requestedChannel: this.#requestedChannel,
+      // wire 推理/思考诊断面（面板/CLI status 可见）：
+      reasoning: {
+        strategy: this.#cfg.reasoningStrategy,
+        thinkingMode: this.#cfg.thinkingMode,
+        ...(this.#cfg.reasoningEffort === undefined ? {} : { reasoningEffort: this.#cfg.reasoningEffort }),
+      },
       requests: this.#taskRequestCount,
       rebases: this.#rebasesTask,
       redundantPeeks: {
@@ -1825,7 +2534,22 @@ export class SingleStreamDriver {
       summaries: this.#summaryBlocks,
       executor,
       surface,
-      effective: this.effectiveLimits(),
+      effective: this.effectiveParams(),
+      limits: this.#cfg.limits,
+      ...(this.#ptcDescriptor === undefined ? {} : { ptc: this.#ptcDescriptor }),
+      assembly: {
+        policy: this.#cfg.assemblyPolicy,
+        fallbacks: this.#assemblyFallbacks,
+        lastFallback: this.#assemblyFallbackReason,
+        systemHash: this.#lastPlan === null ? null : this.#lastPlan.system.hash,
+        estimatedInputTokens: this.#lastPlan === null ? null : this.#lastPlan.budget.estimatedInputTokens,
+      },
+      prefixAuto: {
+        attempts: this.#prefixAutoContinues,
+        max: MAX_PREFIX_AUTO_CONTINUES,
+        remaining: Math.max(0, MAX_PREFIX_AUTO_CONTINUES - this.#prefixAutoContinues),
+        enabled: this.#cfg.autoContinueOnPrefixFail === true,
+      },
     };
   }
 
@@ -1840,21 +2564,84 @@ export class SingleStreamDriver {
     return this.#currentSurface?.names ?? [];
   }
 
+  /** 0.6.0（RA-1）：最近一次成功投影的 AssemblyPlan（dry-run 对账用；null = 尚未投影）。
+   *  返回不可变快照语义：调用方只读，不得改写（内部对象不对外暴露写路径）。 */
+  lastAssemblyPlan()                      {
+    return this.#lastPlan;
+  }
+
+  /** 0.6.0（RA-1）：dry-run —— 用当前状态投影一次但不发送、不改变任何状态。
+   *  与真实请求逐字段 diff 用它（同一状态两次投影必须逐字节一致）。 */
+  assemblyDryRun()                      {
+    const snap = this.#renderer.assemblySnapshot();
+    const firstRequest = this.#taskRequestCount === 0;
+    const surface = this.#currentSurface;
+    const decls                            = this.#cfg.nativeTools && !firstRequest && surface !== undefined && surface.schemas.length > 0
+      // 0.6.0 复查修复（assembly.ts 契约）：先按名字典序排序、再截断——此前按宿主 schemas
+      // 数组顺序截前 N 个，projectToolDecls 内部的第二次截断成为空操作；宿主返回顺序
+      // 不稳定时声明面（进而 system 前缀）漂移，触发前缀断言 → plan 模式整体回退。
+      ? [...surface.schemas]
+          .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+          .slice(0, MAX_DECLARED_TOOLS)
+          .map((d) => ({ name: d.name, description: d.description, parameters: d.parameters }))
+      : null;
+    const asRole = (role        )                                  => (role === 'assistant' ? 'assistant' : role === 'system' ? 'system' : 'user');
+    return projectAssembly({
+      channel: snap.parts.system,
+      protocol: snap.parts.protocol,
+      toolsBlock: snap.parts.toolSchemas,
+      tools: decls,
+      invariants: snap.parts.invariants,
+      state: '',
+      history: snap.append.map((b) => ({
+        role: asRole(b.role),
+        content: b.content,
+        ...(b.source === undefined ? {} : { source: b.source }),
+      })),
+      tail: snap.tail.map((b) => ({ role: asRole(b.role), content: b.content })),
+      reasoning: this.#cfg.reasoningStrategy,
+      budgetLimit: this.effectiveLimits().maxInputTokens,
+    });
+  }
+
+  /** 0.6.0（RA-3）：工具名可达性（声明面之外的按名调用仍应可用）。 */
+  toolReachable(name        )          {
+    return this.#surface.validateCallName(name) === null;
+  }
+
   /**
    * F5：命令成功回执 → 标记其 accepts 声明的验收项为已验证。
-   * 证据 = `cmdId(handle=…,fp=…)`——模型自述"已完成"不产生任何条目（无回执不验证）。
-   * 每次标记落台账；注入差分在 #buildInjections 里统一生成。
+   * 0.5.1（1.3）收紧三处：
+   *  ① 只认**成功**回执——记录不是 ok 一律不验证（失败回执不可继承）；
+   *  ② 证据绑定"命令 id + 回执指纹 + 验收项文本哈希"——同一回执不能挪用到另一条
+   *     （或改过文本的）验收项上，evidence 字符串逐项唯一；
+   *  ③ accepts 指向不存在的验收项时记台账（`plan-accept-unknown`），不静默吞掉。
+   * 模型自述"已完成"不产生任何条目（无回执不验证）。
    */
   #markAccepts(cmd           , handle                    , fingerprint        )       {
     const accepts = cmd.attrs['accepts'];
-    if (accepts === undefined || this.#plan === null || !this.#cfg.enablePlan) return;
+    if (accepts === undefined || this.#plan === null || !this.#cfg.enablePlan || !this.#cfg.finalCheck) return;
+    const rec = this.#commands.get(cmd.id);
+    if (rec === undefined || rec.status !== 'ok') {
+      this.#record({
+        seq: ++DRIVER_SEQ, kind: 'fault', fault: 'plan-accept-not-ok',
+        detail: `accepts 只能由成功回执验证：${cmd.id} 当前状态 ${rec?.status ?? 'missing'}`,
+      });
+      return;
+    }
     for (const rawId of accepts.split(',')) {
       const id = rawId.trim();
       if (id === '') continue;
       const item = this.#plan.items.get(id);
-      if (item === undefined || item.status === 'verified') continue;
+      if (item === undefined) {
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'plan-accept-unknown', detail: `${cmd.id} 声明的验收项不存在：${id}` });
+        this.#ledgerWrite('plugin:tf-agent/plan', { revision: this.#plan.revision, rejected: id, cmdId: cmd.id, reason: 'unknown-accept' });
+        continue;
+      }
+      if (item.status === 'verified') continue;
       item.status = 'verified';
-      item.evidence = `${cmd.id}(handle=${handle ?? '-'} fp=${fingerprint})`;
+      // 证据三元组：命令 id + 回执指纹 + 验收项文本哈希（截 8 位，可外部复算）
+      item.evidence = `${cmd.id}@${item.textHash.slice(0, 8)}(handle=${handle ?? '-'} fp=${fingerprint})`;
       this.#record({ seq: ++DRIVER_SEQ, kind: 'plan-accept', acceptId: id, cmdId: cmd.id, evidence: item.evidence });
       this.#ledgerWrite('plugin:tf-agent/plan', { revision: this.#plan.revision, verified: id, cmdId: cmd.id, evidence: item.evidence });
     }
@@ -1871,7 +2658,7 @@ export class SingleStreamDriver {
     const accepts = cmd.attrs['accepts'];
     let verify                                 = 'pass';
     let acceptId                    ;
-    if (accepts !== undefined && this.#plan !== null && this.#cfg.enablePlan) {
+    if (accepts !== undefined && this.#plan !== null && this.#cfg.enablePlan && this.#cfg.finalCheck) {
       const ids = accepts.split(',').map((s) => s.trim()).filter((s) => s !== '');
       const allVerified = ids.length > 0 && ids.every((id) => this.#plan .items.get(id)?.status === 'verified');
       verify = allVerified ? 'pass' : 'unverified';
@@ -2012,6 +2799,8 @@ export class SingleStreamDriver {
    *  - F7：记录当前任务块的起始下标——段边界只丢弃它之前的旧段。
    */
   pushUserTask(text        , message          )       {
+    this.#buildVerifiedTask = -1; // 1.2：新任务重置交付构建校验状态
+    this.#buildFailure = undefined;
     // —— 任务边界切换（先于任务块落位）——
     this.#applyPendingSwitches();
     // —— 任务级预算指令（§4.6：文本指令 + 结构化 source.tfBudget；文本指令优先剥除）——
@@ -2046,6 +2835,11 @@ export class SingleStreamDriver {
     this.#peekMetricsBase = { hits: peekMetricsBase.redundantHits, total: peekMetricsBase.peekRequests };
     this.#segmentKeepFrom = this.#renderer.appendBlockCount;
     this.#renderer.appendHistory({ role: 'user', content: parsed.text });
+    // 0.6.0 正式版（conversation 缺口）：任务起点原文句柄化 + request:N 别名登记——
+    // 对齐 [TF]/conversation.py:25-36（每个用户请求登记 request:N，recall 随时可用）。
+    // 此前只有压缩路径登记别名，未压缩回合 tf-peek handle="request:N" 解析为空。
+    // 走独立登记口（不进工具观测度量——请求原文不是工具产出）。
+    this.#obs.registerRequestText(this.#turnCounter + 1, parsed.text);
   }
 
   /** 运行中回合的 steer 入口（修复限制 2）：下一请求装配时进追加区（对齐内建
@@ -2160,18 +2954,21 @@ export class SingleStreamDriver {
       for (const [i, text] of dropped.entries()) {
         // 句柄化登记（obs：first observation → high，但不在命令通道上，永不自动注入；
         // tf-peek 按句柄取回原文——"原文可按 request:N 回取"的落地形态）
-        this.#obs.observe({
+        const segObs = this.#obs.observe({
           tool: 'tf-read',
           ok: true,
           key: `segment:turn${turn}:${i}`,
           content: text,
           callId: `seg-t${turn}-${i}`,
         });
+        // 0.6.0 正式版（conversation 缺口）：段边界丢弃的原文也登记 request:N 别名
+        //（此前注释声称"可按 request:N 回取"但从未登记——审计实证 unknown-handle）。
+        if (segObs.handle !== null) this.#obs.registerRequestHandle(turn, segObs.handle);
       }
       this.#record({
         seq: ++DRIVER_SEQ, kind: 'observation',
         handle: dropped.length > 0 ? `obs:read:seg-t${turn}-0@v1` : null,
-        key: `segment:turn${turn}`, infoGain: 'low', reason: 'segment-drop-handleized',
+        key: `segment:turn${turn}`, infoGain: 'handle', reason: 'segment-drop-handleized',
       });
       // v0.4.3（P0-7①）：段边界 = 显式缓存重置点，重置纪元 +1（request 记录携带 resetSeq/resetCause）；
       // wire 全文基线同步作废（dropAppendHead 是唯一合法的历史收缩通道，不走断言）。
@@ -2180,6 +2977,13 @@ export class SingleStreamDriver {
       this.#lastRequest = null;
       this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'segment-drop', detail: `dropped ${dropped.length} blocks (${before} chars) at turn ${turn} boundary; originals handleized (obs:read:seg-t${turn}-*)` });
       this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'segment-drop', turn, droppedBlocks: dropped.length, chars: before });
+      // 0.6.0（§0 A1）：段边界是显式缓存重置点，必须模型可见（与压缩同一条纪律：
+      // 「记账 + 显式」，不能只在台账里重置）。0.5.x 只在压缩路径注入了这一行。
+      // 只在**真的丢了块**时注入：dropAppendHead(0) 是"无可丢"的退化形态，此时再追加一行
+      // 只会把 appendChars 推得更高（每回合 +1 行，永远压不下去）。
+      if (dropped.length > 0) {
+        this.#renderer.appendHistory({ role: 'user', content: contextRebasedLine('段边界（追加区超限，旧段整块移出）') });
+      }
       this.#segmentKeepFrom = 0;
     }
     debugTrace('turn.start', { turn });
@@ -2230,15 +3034,21 @@ export class SingleStreamDriver {
     this.#cmdOrder = 0;
     this.#lastFinalOrder = 0;
     this.#lastNonFinalOrder = 0;
-    this.#reportedFinalRejects.clear();
+    this.#prematureInjected.clear();
     this.#pendingReplays = [];
     this.#replays = 0;
     this.#replayCapped = false;
     this.#truncationRetries = 0;
     this.#truncation = null;
-    // v0.4.3（P0-6）：回合级状态清零——append-drift 的每回合放行预算、兜底交付一次性标记、
+    // 0.5.1（2.1）：思考通道纠正每回合最多注入一次
+    this.#reasoningNudge = null;
+    this.#reasoningHit = false;
+    this.#reasoningProbeTail = '';
+    this.#askPending = null;
+    // v0.4.3（P0-6）：回合级状态清零——前缀违约接受计数（0.6.1 观测用）、兜底交付一次性标记、
     // 本回合命令集（兜底交付的"台账事实"来源）。
     this.#prefixResendsTurn = 0;
+    this.#prefixAutoContinues = 0;
     this.#fallbackFinalDelivered = false;
     this.#turnCommandIds.clear();
     // v0.4.0（自 0.3.3 回流）：收束改造的回合级状态（停滞预算 / 收束期 / 产出水位）
@@ -2246,6 +3056,7 @@ export class SingleStreamDriver {
     this.#progressOkMark = 0;
     this.#closeOutActive = false;
     this.#closeOutRequests = 0;
+    this.#closeOutReasons.clear();
     let reason                = { kind: 'blocked', detail: 'turn loop exited without convergence' };
 
     while (true) {
@@ -2286,7 +3097,7 @@ export class SingleStreamDriver {
       this.#currentSurface = surface;
       // 降级判定：有宿主服务面且解析失败/缺席才是降级；headless 无服务面 = 稳态
       // protocol-only（0.3.x 行为），不注行不记账（避免对离线路径制造永久噪声）
-      const degradedLevel                                            =
+      const degradedLevel                                                         =
         surface?.degraded
         ?? (surface === undefined && this.#surface.hasService && this.#cfg.toolSurface !== 'off' ? 'protocol-only' : 'ok');
       if (degradedLevel !== 'ok' && degradedLevel !== this.#lastSurfaceDegraded) {
@@ -2313,8 +3124,17 @@ export class SingleStreamDriver {
         // 用户可见终态（旧实现直接炸出 runTurn，用户侧只剩半截输出）。
         if (!(error instanceof PrefixBrokenError)) throw error;
         const detail = this.#prefixFailClosed(error, turn, step, 'render() 内置 preflight');
+        // 0.6.0：先尝试同轮自动续跑；成功则关闭本步、直接进入下一请求，不再等用户消息。
+        if (this.#tryPrefixAutoContinue(turn, step, detail)) {
+          try {
+            this.#ports.events?.stepEnd(turn, step);
+          } catch (stepError) {
+            this.#warn('step/end 事件写入失败', stepError);
+          }
+          continue;
+        }
         // v0.4.0：兜底交付必须先于 step/end（assistant/message 需落在打开的 turn+step 内）
-        this.#deliverFallbackFinal(turn, step, detail);
+        this.#deliverFallbackFinal(turn, step, detail, 'prefix');
         try {
           this.#ports.events?.stepEnd(turn, step);
         } catch (stepError) {
@@ -2324,17 +3144,70 @@ export class SingleStreamDriver {
         this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'turn-blocked', detail: reason.detail });
         break;
       }
+      // ---- 0.6.0（RA-1/RA-4/RA-5）：AssemblyPlan 投影（assemblyPolicy='plan'）----
+      // plan 模式 = 请求内容由纯函数投影生成（可 dry-run 对账）；超预算在此 fail-closed，
+      // 投影异常 → 回退 host 并记账（回退后本会话固定 host，不来回抖动）。
+      let planTailLen = 0;
+      let planApplied = false;
+      if (this.#cfg.assemblyPolicy === 'plan') {
+        const projection = this.#projectAssembly(turn, step);
+        if (projection.kind === 'budget') {
+          this.#deliverFallbackFinal(turn, step, projection.detail, 'prefix');
+          try {
+            this.#ports.events?.stepEnd(turn, step);
+          } catch (error) {
+            this.#warn('step/end 事件写入失败', error);
+          }
+          reason = { kind: 'blocked', detail: projection.detail };
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'turn-blocked', detail: projection.detail });
+          break;
+        }
+        if (projection.kind === 'plan') {
+          messages = projection.messages;
+          planTailLen = projection.tailLen;
+          planApplied = true;
+        }
+      }
       // v0.4.3（P0-6①②）：wire 边界承诺前缀断言——比较对象是**上一请求收尾后的稳定段**
       // （#lastRequest.promised：转正之后的 stableMessages() 逐字节快照）。render() 内置
       // preflight 只守装配时的 stable；本断言补上两个盲区：转正块与已发文本逐字节一致、
       // 追加区不被代码改写。v0.4.3.1：基线从"上一请求前 N 条（horizon）"改为 promised——
       // 与易变尾块序完全解耦（混合尾 error 前置不再误报 append-drift，核查 §2）。
-      // 失败按三类处置（P0-6③④）：append-drift 预算内放行一次；其余 fail-closed。
+      // 0.6.1：三类违约（stable-drift / append-drift / shrink）默认全部**接受为缓存重置
+      // 点**——同一份 next 照常发送，0 额外请求 0 注入，对话不中断；仅 prefixPolicy='fail'
+      // 显式回退面走 fail-closed（P0-6③④ 的原收场面，自动续跑仍覆盖该路径与 preflight）。
       if (this.#cfg.faultPrefixDrift !== undefined) this.#faultDriftBaseline(turn);
-      const wire = this.#assertWirePrefix(messages, turn, step);
+      // 探针 kind='shrink'：把"下一请求"截掉 1 条尾块再断言——模拟"历史被销毁但未走
+      // dropAppendHead 通道"。**离线探针专用**（生产不设置 faultPrefixDrift）：0.6.1 默认
+      // 策略下截断副本会被"接受"并发出——探针只用于复演分类，不用于生产行为验证。
+      const wireNext = this.#cfg.faultPrefixDrift?.kind === 'shrink'
+        ? messages.slice(0, Math.max(1, Math.min(this.#lastRequest?.stableLen ?? messages.length - 1, messages.length - 1)))
+        : messages;
+      const wire = this.#assertWirePrefix(wireNext, turn, step);
       if (wire.verdict === 'fail') {
+        // 0.6.0（RA-5）：plan 模式的前缀失败先回退 host（装配形态本身有问题，换基只会
+        // 掩盖根因）——回退后重新渲染并重发，不消耗续跑预算。
+        if (this.#cfg.assemblyPolicy === 'plan') {
+          this.#assemblyFallback(`前缀断言失败：${capText(wire.detail, 120)}`);
+          this.#lastRequest = null;
+          try {
+            this.#ports.events?.stepEnd(turn, step);
+          } catch (error) {
+            this.#warn('step/end 事件写入失败', error);
+          }
+          continue;
+        }
+        // 0.6.0：同轮自动续跑优先——失败已记账/对账，这里只重置基线与注入恢复事实。
+        if (this.#tryPrefixAutoContinue(turn, step, wire.detail)) {
+          try {
+            this.#ports.events?.stepEnd(turn, step);
+          } catch (error) {
+            this.#warn('step/end 事件写入失败', error);
+          }
+          continue;
+        }
         // P0-6⑤：有产出时才有交付。顺序固定：receipt 最小对账（#prefixFailClosed 内）→ 兜底交付 → step/end → blocked。
-        this.#deliverFallbackFinal(turn, step, wire.detail);
+        this.#deliverFallbackFinal(turn, step, wire.detail, 'prefix');
         try {
           this.#ports.events?.stepEnd(turn, step);
         } catch (error) {
@@ -2352,7 +3225,14 @@ export class SingleStreamDriver {
       // 缓存读零损失；有 transient 时前缀在该 index 断裂，损失 bounded 一块）。
       // 本步的 digest 在流结束时就地落史（见 consumeStream 之后），时序：转正 → digest。
       this.#commitDeliveredTail();
-      this.#lastRequest = { promised: this.#renderer.stableMessages(), stableLen };
+      // 0.6.0（RA-1）：plan 模式的承诺前缀 = 实际发送的投影内容（去掉易变尾）；
+      // host 模式保持 0.5.x 的"转正后稳定段"，行为逐字节不变。
+      this.#lastRequest = planApplied
+        ? (() => {
+            const promised = messages.slice(0, Math.max(0, messages.length - planTailLen));
+            return { promised, stableLen: promised.length };
+          })()
+        : { promised: this.#renderer.stableMessages(), stableLen };
       const stableHash = this.#renderer.stableHash();
       this.#stableHashes.push(stableHash);
       const fullHash = renderHash(messages);
@@ -2416,7 +3296,7 @@ export class SingleStreamDriver {
       // 每条注入被双倍支付）。
       this.#commitStepDigest();
 
-      // ---- 收束判定（仅三种重入事由：失败/拒绝、high 观测、peek 需求）----
+      // ---- 收束判定（仅三种重入事由：失败/拒绝、full 观测、peek 需求）----
       const issues = this.#collectIssues();
       const injections = this.#buildInjections(issues, level);
       // v0.3.2 截断修复：输出在命令中途被截断（max-tokens / 流异常终止 / DSML 块未闭合）时，
@@ -2436,8 +3316,13 @@ export class SingleStreamDriver {
         injections.blocks.push({ role: 'user', content: this.#strayCloseNudge });
         this.#strayCloseNudge = null;
       }
+      // 0.5.1（2.1）：思考通道协议违规的定向纠错（一次性；final-only 档不注入）。
+      if (this.#reasoningNudge !== null && level !== 'final-only') {
+        injections.blocks.push({ role: 'user', content: this.#reasoningNudge });
+        this.#reasoningNudge = null;
+      }
       // 饥饿防线（07 号结果 §3.6 上报的断链，08 号评测前按其建议修复）：
-      // 升格骨架接入注入通路（按 high 观测同款格式；final-only 档不注入——预算已枯竭）。
+      // 升格骨架接入注入通路（按 full 观测同款格式；final-only 档不注入——预算已枯竭）。
       // v0.4.0（自 0.3.3 回流）：**先只算块、不挂块**——升格是"补充上下文"，不是重入事由。
       // 此前它无条件挂进 injections.blocks，只要本步有一条升格就必然 needsReentry=true：
       // 模型已经给出合法 tf-final，却被一块"补充观测"顶掉 completed，回合继续烧请求直到撞墙。
@@ -2457,6 +3342,62 @@ export class SingleStreamDriver {
         this.#ledgerWrite('plugin:tf-agent/fault', { fault: `stream-${streamOutcome.finish.kind}`, detail: finishDetail(streamOutcome.finish), turn });
       }
 
+      // ---- 1.2：机器谓词求值（在收束闸之前，final 与 proseDelivery 共用最新状态）----
+      // 每个 open 且带谓词的验收项，用注入的只读事实求值；通过 → verified（带机器证据），
+      // 失败 → 记 verification.false 供 final 拒绝并注入可执行原因。无端口 = 0.4.x 回退。
+      const facts = this.#ports.deliveryFacts;
+      if (facts !== undefined && this.#cfg.enablePlan && this.#cfg.finalCheck && this.#plan !== null) {
+        for (const [id, item] of this.#plan.items) {
+          if (item.status === 'verified' || item.predicate === undefined) continue;
+          const result = evaluatePredicate(item.predicate, facts);
+          item.verification = result;
+          if (result.ok) {
+            item.status = 'verified';
+            item.evidence = `machine:${describePredicate(item.predicate)}`;
+            this.#record({ seq: ++DRIVER_SEQ, kind: 'plan-accept', acceptId: id, cmdId: `machine:${turn}`, evidence: item.evidence });
+            this.#ledgerWrite('plugin:tf-agent/plan', { revision: this.#plan.revision, verified: id, by: 'predicate', evidence: item.evidence });
+          } else {
+            this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'acceptance-predicate-failed', detail: `${id}: ${result.detail}` });
+            this.#ledgerWrite('plugin:tf-agent/plan', { revision: this.#plan.revision, rejected: id, reason: 'predicate-failed', detail: result.detail });
+          }
+        }
+      }
+
+      // ---- 1.2：交付构建校验（对齐 [TF]/delivery.py verify_delivery）----
+      // 仅在 runVerification + projectFacts 双端口在位时启用；每次收束尝试最多跑一次
+      // （记 #buildVerifiedTask，每任务最多一次，避免重入重复构建）。失败 → blocked + 未完成项说明。
+      // 1.2（审计 D1）：runner 缺省 = 用宿主 shell 工具跑（命令经 toolMapping 转换），
+      // 不再要求装配层注入一个"硬编码 bash + {cmd}"的实现（那个工具在 DSH 不存在）。
+      const runner = this.#ports.runVerification ?? this.#hostVerificationRunner();
+      const proj = this.#ports.projectFacts;
+      if (runner !== undefined && proj !== undefined && this.#buildVerifiedTask !== this.#turnCounter) {
+        this.#buildVerifiedTask = this.#turnCounter;
+        this.#buildFailure = undefined; // 本任务首次校验：清空上一回合状态
+        const plan = buildVerificationPlan({
+          hasPackageJson: proj.hasPackageJson(),
+          hasNodeModules: proj.hasNodeModules(),
+          cwd: proj.cwd,
+        });
+        if (plan.length > 0) {
+          try {
+            const result = await runner(plan);
+            this.#ledgerWrite('plugin:tf-agent/final', { verification: 'build', ok: result.ok, detail: result.detail.slice(0, 300), steps: plan.map((p) => p.cmd) });
+            if (!result.ok) this.#buildFailure = result.detail;
+          } catch (error) {
+            this.#buildFailure = `verify-delivery-error: ${error instanceof Error ? error.message : String(error)}`;
+            this.#warn('交付构建校验执行异常', error);
+          }
+        }
+        // 1.2（审计 D1）：可运行脚本提示此前**只写台账、从不进上下文**——模型看不到，
+        // 等于功能不存在。这里挂到下一请求的注入块（脚本清单是"该跑没跑"的事实）。
+        const scripts = proj.runnableScripts?.() ?? [];
+        const feedback = scriptFeedback(scripts);
+        if (feedback !== '') {
+          this.#ledgerWrite('plugin:tf-agent/final', { verification: 'scripts', detail: feedback.slice(0, 300) });
+          this.#pendingNotes.push(feedback);
+        }
+      }
+
       // ---- final 收束闸（真连 R3/R4 教训 + v0.3.1 截断修复）----
       // 四类拒绝，任一成立都说明"这条 final 不能作为交付答案"：
       //   ① depends_on 未满足 / ② 仍有命令未完成（原有过早判定）
@@ -2469,22 +3410,32 @@ export class SingleStreamDriver {
       // 回合归属：上一回合的 final（或 resume 回放 turn=0）不得充当本回合答案
       const lastFinal = candidate !== undefined && candidate.turn === turn ? candidate : undefined;
       let prematureFinal                    ;
+      /** 拒绝事由的**稳定分类键**（用于"同一毛病只提示一次"的判定，与文案措辞无关）：
+       *  ①② 面用事由原文（依赖集合/验收 id/构建错误都体现在文本里，变了就是新信息），
+       *  ③④ 面用 kind（换新 id 再写一次占位/过期 final 是同一个毛病，绝不因换个词就重新烧注入）。 */
+      let prematureKey                    ;
       let rejectedFinal                    ;
-      if (lastFinal !== undefined && level !== 'final-only') {
+      if (lastFinal !== undefined && level !== 'final-only' && this.#cfg.finalCheck) {
         const finalRec = this.#commands.get(lastFinal.cmdId);
         const unmetDeps = (finalRec?.cmd.depends_on ?? []).filter((d) => this.#commands.get(d)?.status !== 'ok');
         const unfinished = [...this.#commands.values()].filter((r) => r.cmd.name !== 'tf-final' && (r.status === 'pending' || r.status === 'dispatched'));
-        prematureFinal = unmetDeps.length > 0
-          ? `tf-final 过早：depends_on 未满足（${unmetDeps.join(', ')}）`
-          : unfinished.length > 0
-            ? 'tf-final 过早：仍有命令未完成'
-            : undefined;
+        prematureFinal = this.#buildFailure !== undefined
+          ? `tf-final 过早：交付构建校验失败（${capText(this.#buildFailure, 200)}）——修复后重试`
+          : unmetDeps.length > 0
+            ? `tf-final 过早：depends_on 未满足（${unmetDeps.join(', ')}）`
+            : unfinished.length > 0
+              ? 'tf-final 过早：仍有命令未完成'
+              : undefined;
         // F5：计划存在且还有未验证的验收项 → tf-final 过早（缺项或未验证不得标完成；
         // 验证只能来自命令成功回执，模型自述不算）。
         if (prematureFinal === undefined && this.#cfg.enablePlan && this.#plan !== null) {
-          const open = [...this.#plan.items.entries()].filter(([, item]) => item.status === 'open');
+          const open = [...this.#plan.items.entries()].filter(([, item]) => item.status !== 'verified');
           if (open.length > 0) {
-            prematureFinal = `tf-final 过早：计划有 ${open.length} 项验收未验证（${open.map(([id]) => id).join(', ')}）——完成对应命令并用 accepts="..." 声明回执，或用 tf-plan 修订计划（显式移除不再需要的项）。`;
+            const reasons = open.map(([id, item]) => {
+              const v = item.verification;
+              return v !== undefined && !v.ok ? `${id}(${v.detail})` : id;
+            });
+            prematureFinal = `tf-final 过早：计划有 ${open.length} 项验收未验证（${reasons.join(', ')}）——完成对应命令并用 accepts="..." 声明回执，或让机器判定通过，或用 tf-plan 修订计划（显式移除不再需要的项）。`;
           }
         }
         // ③④ 内容面：占位 summary / 过期 final
@@ -2501,25 +3452,89 @@ export class SingleStreamDriver {
           }
         }
         if (hardIssue !== undefined) {
-          // key 只按 kind：换新 id 再写一次占位/过期 final，是同一个毛病，不再重复烧注入
-          if (this.#reportedFinalRejects.has(hardIssue.kind)) {
-            // 已提示过仍未改：不重复注入，也不放行收敛（走 nudge / blocked，如实收场）
-            rejectedFinal = hardIssue.detail;
-          } else {
-            this.#reportedFinalRejects.add(hardIssue.kind);
-            prematureFinal = hardIssue.detail;
-          }
+          prematureFinal = hardIssue.detail;
+          prematureKey = `hard:${hardIssue.kind}`;
+        }
+      }
+
+      // 0.5.3：premature-final 注入的结构性收敛（见 #prematureInjected 注释）。
+      // 判据只看"信息面是否零增量"——同一拒绝事由 + 此后零新增 ok 命令 → 已经提示过的
+      // 内容再烧一次请求也不会有新结果，直接如实收场；模型只要做了新工作就重新提示。
+      let finalRejectExhausted = false;
+      if (prematureFinal !== undefined) {
+        const key = prematureKey ?? prematureFinal;
+        const progress = this.#productiveOkCount();
+        const injectedAt = this.#prematureInjected.get(key);
+        if (injectedAt !== undefined && progress <= injectedAt) {
+          finalRejectExhausted = true;
+          rejectedFinal = prematureFinal;
+          prematureFinal = undefined;
+          const detail = capText(rejectedFinal, 200);
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'final-reject-exhausted', detail });
+          this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'final-reject-exhausted', detail, turn });
+        } else {
+          this.#prematureInjected.set(key, progress);
         }
       }
 
       const finalSeen = lastFinal !== undefined && prematureFinal === undefined && rejectedFinal === undefined;
       // 0.5.0：标准通道才有 tf-final 收束概念；代码通道（§3.2：验收闸 否）流正常终止
       // 且无重入事由即收束，交付物 = 最后一条 assistant 消息。
-      const expectsFinal = this.#cfg.channel === 'standard';
+      const expectsFinal = this.#cfg.channel === 'standard' && this.#cfg.finalCheck;
       // steer 在本流期间到达 → 不能带着未消费的 steer 收敛（对齐内建：插话必须被下一步看到）
       const pendingSteerCount = this.#pendingSteers.length;
       const needsReentry = issues.length > 0 || injections.blocks.length > 0 || prematureFinal !== undefined
         || pendingSteerCount > 0 || (promotedBlock !== null && !finalSeen);
+
+      // ---- 0.5.1（1.1）：提问即收束 + 流末正文即交付 ----
+      // ① 等待用户：tf-ask 的结果是宿主 timed ask 的 pending 形态（用户还没回答）——
+      //    回合以 awaiting 收束，0 nudge / 0 额外请求。它不是失败，也不进兜底交付。
+      //    若本步还有其它重入事由（失败块/纠错块），错误可见性优先，照常重入。
+      const awaitingUser = this.#askPending !== null;
+      // 提问本身的 full 观测块（obs:ask:<id>@vN）在"等待用户"语义下没有投递价值——
+      // 问题已经在 UI 里、答案还没来。除此之外的任何注入块都必须先投递（错误/纠错优先）。
+      const askObsMarker = this.#askPending === null ? null : `obs:ask:${this.#askPending.cmdId}@`;
+      const otherBlocks = askObsMarker === null
+        ? injections.blocks
+        : injections.blocks.filter((block) => !block.content.includes(askObsMarker));
+      const awaitingClean = issues.length === 0 && prematureFinal === undefined
+        && pendingSteerCount === 0 && promotedBlock === null && otherBlocks.length === 0;
+      if (awaitingUser && awaitingClean && !finalSeen) {
+        reason = {
+          kind: 'awaiting:user',
+          detail: `等待用户回答（${this.#askPending .cmdId}）：${capText(this.#askPending .question, 120)}`,
+        };
+        try {
+          this.#ports.events?.stepEnd(turn, step);
+        } catch (error) {
+          this.#warn('step/end 事件写入失败', error);
+        }
+        break;
+      }
+      // ② 同轮交付：标准通道 + 无验收项（无计划或计划无未验证项）+ 本回合有生产性产出
+      //    + 四类拒绝未触发 + 无重入事由 → 流末正文就是交付（不再为"缺 tf-final"烧一次 nudge）。
+      //    零产出回合不适用（没有可交付内容；C4 的"不伪造交付"不变量优先）。
+      const acceptanceOpen = this.#cfg.enablePlan && this.#plan !== null
+        && [...this.#plan.items.values()].some((item) => item.status !== 'verified');
+      const deliveryProse = normalizeProse(this.#streamProse);
+      const proseDelivery = expectsFinal && this.#cfg.requireFinal !== true
+        && !finalSeen && !needsReentry && !awaitingUser && !acceptanceOpen
+        && rejectedFinal === undefined && prematureFinal === undefined && this.#buildFailure === undefined
+        && this.#productiveOkCount() > 0 && deliveryProse !== '';
+      if (proseDelivery) {
+        reason = { kind: 'completed' };
+        try {
+          this.#ports.events?.finalAnswer?.(turn, step, deliveryProse);
+        } catch (error) {
+          this.#warn('final 答案消息写入失败', error);
+        }
+        try {
+          this.#ports.events?.stepEnd(turn, step);
+        } catch (error) {
+          this.#warn('step/end 事件写入失败', error);
+        }
+        break;
+      }
 
       if (!expectsFinal && !needsReentry && streamOutcome.finish.kind !== 'error' && streamOutcome.finish.kind !== 'aborted') {
         // 代码通道收束：无 tf-final、无验收闸——流正常终止且无事由即完成（§3.2 能力矩阵）
@@ -2607,14 +3622,24 @@ export class SingleStreamDriver {
         aggressiveness: this.#cfg.compactAggressiveness,
       });
       const hardCap = stepLimit.atLimit;
-      const stallExhausted = this.#stallReentries >= this.#cfg.stallReentries;
-      const atWall = finalOnlyGate || nudgeExhausted || hardCap || stallExhausted;
+      const stallExhausted = this.#cfg.stallReentries > 0 && this.#stallReentries >= this.#cfg.stallReentries;
+      const atWall = finalOnlyGate || nudgeExhausted || hardCap || stallExhausted || finalRejectExhausted;
       let wallDetail = '';
       let closeOut = false;
       let ending = false;
       if (this.#aborted) {
         ending = true;
         reason = { kind: 'aborted', reason: this.#abortReason instanceof Error ? this.#abortReason.message : String(this.#abortReason ?? 'cancelled') };
+      } else if (finalRejectExhausted) {
+        // 0.5.3：**结构性**撞墙（不是数值上限）——同一条拒绝事由已提示过、此后零新增产出。
+        // 这里不给收束期：收束指令要求的是"补一条 tf-final"，而模型刚刚就在反复发 tf-final，
+        // 缺的是验收证据而不是收束动作，再注入只会把同一个循环多跑 N 次。
+        wallDetail = `同一条 final 拒绝事由重复且零新增产出（${capText(rejectedFinal ?? '', 200)}）`;
+        ending = true;
+        reason = {
+          kind: 'blocked',
+          detail: `final 被拒且同一事由反复出现、此后零新增产出（${capText(rejectedFinal ?? '', 200)}）：不把未验证/过期答案当交付`,
+        };
       } else if (atWall) {
         wallDetail = finalOnlyGate
           ? '预算进入 final-only 档'
@@ -2628,14 +3653,29 @@ export class SingleStreamDriver {
         // 已带 degraded 收束注入）。0.5.0（§4.5.2）：maxSteps 触顶同样先给收束期——
         // "触顶行为 = 停止探索，注入收束指令要求 tf-final"，closeOutRequests 限次数。
         const deliverable = this.#productiveOkCount() > 0;
-        const closeOutLeft = this.#cfg.closeOutRequests - this.#closeOutRequests;
-        if (deliverable && !finalSeen && closeOutLeft > 0 && level !== 'final-only') {
+        // 0.5.3：收束期次数不再预设。撞墙事由做**结构性去重**——同一事由只收束一次
+        //（重复的收束指令 = 同一句话再说一遍，信息面零增量，只会白烧请求），用户显式
+        // 设 closeOutRequests > 0 才是硬次数上限。
+        const closeOutKey = finalOnlyGate
+          ? 'final-only'
+          : hardCap
+            ? `steps:${stepLimit.reason}`
+            : stallExhausted
+              ? 'stall'
+              : 'no-final';
+        const closeOutCap = this.#cfg.closeOutRequests;
+        const closeOutLeft = closeOutCap > 0 ? closeOutCap - this.#closeOutRequests : 1;
+        const closeOutSeen = this.#closeOutReasons.has(closeOutKey);
+        // 0.6.0（§0 A2）：finalCheck=false 时收束 nudge 一并关闭——它存在的唯一目的就是
+        // 逼出一条 tf-final；闸门关了还催收等于凭空多烧一次请求。
+        if (deliverable && this.#cfg.finalCheck && !finalSeen && !closeOutSeen && closeOutLeft > 0 && level !== 'final-only') {
           this.#closeOutRequests += 1;
+          this.#closeOutReasons.add(closeOutKey);
           this.#closeOutActive = true;
           closeOut = true;
           this.#record({
             seq: ++DRIVER_SEQ, kind: 'fault', fault: 'closeout-nudge',
-            detail: `${wallDetail} → 收束第 ${this.#closeOutRequests}/${this.#cfg.closeOutRequests} 次`,
+            detail: `${wallDetail} → 收束第 ${this.#closeOutRequests} 次（${closeOutKey}）`,
           });
           this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'closeout-nudge', detail: wallDetail, attempt: this.#closeOutRequests, turn });
         } else {
@@ -2691,7 +3731,9 @@ export class SingleStreamDriver {
       if (closeOut) {
         // 收束期：保留失败/拒绝事实块（模型要知道哪里错了），收束指令压在最末
         tail = [...tail, { role: 'user'         , content: this.#closeOutNudge(this.#closeOutRequests, wallDetail) }];
-      } else if (tail.length === 0 && !finalSeen) {
+      } else if (tail.length === 0 && !finalSeen && this.#cfg.finalCheck) {
+        // 0.6.0（§0 A2）：finalCheck=false 时连"请输出 tf-final"的进度提示也不注入——
+        // 开关承诺的是"不要求 tf-final"，只关验收闸却继续催交付等于自相矛盾。
         if (level === 'final-only') {
           // O5 >90% 档：停止一切注入，输出降级交付（已完成/未完成/已排除见台账），只收 tf-final
           tail = [{
@@ -2852,19 +3894,63 @@ export class SingleStreamDriver {
           usage: null,
         };
       }
-      const stream = this.#ports.stream({
+      // ---- wire 传输面（对齐 xuxiang provider.py 的请求装配语义）----
+      // 数值全部来自生效 limits 的传输组（THINKFLOW_ALIGNED_LIMITS 默认，用户随时可改）：
+      //   maxTokens>0 → max_tokens；streamUsage=1 → stream_options.include_usage；
+      //   thinkingMode!=='disabled' 或 thinkingBudget>0 → thinking 字段；声明了原生工具
+      //   → tool_choice='auto'；maxRetries/retryBackoffMs → 建立重试。0 值一律不发字段
+      //   （xuxiang：None/0 委托给 provider）。
+      const effLimits = this.#limitsFor(this.#cfg.channel, this.#cfg.tier);
+      const wireMaxTokens = limitOf(effLimits, 'maxTokens');
+      const wireThinkingBudget = limitOf(effLimits, 'thinkingBudget');
+      const wireStreamUsage = limitOf(effLimits, 'streamUsage');
+      const wireMaxRetries = limitOf(effLimits, 'maxRetries');
+      const wireRetryBackoffMs = limitOf(effLimits, 'retryBackoffMs');
+      const wireTools = this.#cfg.assemblyPolicy === 'plan'
+        ? (this.#lastPlan === null || this.#lastPlan.tools === null ? undefined : this.#lastPlan.tools)
+        : (this.#cfg.nativeTools && this.#currentSurface !== undefined && this.#currentSurface.schemas.length > 0
+          ? this.#currentSurface.schemas
+          : undefined);
+      const wireThinkingMode = this.#cfg.thinkingMode;
+      // xuxiang 默认 reasoning_effort='high'：思考开启且用户未显式给 effort 时补默认。
+      const wireEffort = this.#cfg.reasoningEffort
+        ?? (wireThinkingMode === 'enabled' ? 'high' : undefined);
+      const wireOptions                       = {
         provider: this.#cfg.provider,
         model: this.#cfg.model,
-        reasoningEffort: this.#cfg.reasoningEffort,
-        messages: toWireMessages(messages),
-        // v0.4.0（P1）：nativeTools 开启时携带冻结面 schema（core 档白名单 / standard-full 全量）。
-        // 默认关闭——schema 的每请求 token 成本由 tf-call 的逐调用成本替代（§15 默认文本）。
-        ...(this.#cfg.nativeTools && this.#currentSurface !== undefined && this.#currentSurface.schemas.length > 0
-          ? { tools: this.#currentSurface.schemas }
-          : {}),
+        reasoningEffort: wireEffort,
+        // 推理回传策略：drop-stale 剥离 replayState（回放状态不回传），provider-required 原样。
+        messages: toWireMessages(messages, this.#cfg.reasoningStrategy),
+        ...(wireTools === undefined ? {} : { tools: wireTools, toolChoice: 'auto'          }),
+        ...(wireMaxTokens > 0 ? { maxTokens: wireMaxTokens } : {}),
+        ...(wireStreamUsage === 1 ? { streamOptions: { includeUsage: true } } : {}),
+        ...(wireThinkingMode === 'disabled' && wireThinkingBudget === 0
+          ? {}
+          : { thinking: { mode: wireThinkingMode, ...(wireThinkingBudget > 0 ? { budgetTokens: wireThinkingBudget } : {}) } }),
+        ...(wireMaxRetries > 0 ? { maxRetries: wireMaxRetries } : {}),
+        ...(wireRetryBackoffMs > 0 ? { retryBackoffMs: wireRetryBackoffMs } : {}),
         signal: controller.signal,
         sessionId: this.#sessionId,
-      });
+      };
+      // v0.4.0（P1）：nativeTools 开启时携带冻结面 schema。
+      // 0.6.0（RA-3）：plan 模式下 tools 声明面**只由投影决定**（首请求 0 schema、≤7 名），
+      // 否则"A2 首请求不声明工具"这条不变量会被旧路径绕过。
+      // 建立重试（maxRetries，xuxiang: max_retries）：只覆盖**连接建立失败**（ports.stream
+      // 同步抛错、尚未产出任何 chunk）——流中途错误不重试（半截流重发会重复计费与重复副作用）。
+      let stream                                ;
+      let setupAttempts = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        try {
+          stream = this.#ports.stream(wireOptions);
+          break;
+        } catch (error) {
+          setupAttempts += 1;
+          if (setupAttempts > wireMaxRetries || wireMaxRetries === 0) throw error;
+          this.#warn(`请求建立失败（第 ${setupAttempts}/${wireMaxRetries} 次重试前）：${error instanceof Error ? error.message : String(error)}`, error);
+          await new Promise((resolve) => setTimeout(resolve, wireRetryBackoffMs));
+        }
+      }
       this.#requestCount += 1;
       this.#taskRequestCount += 1;
       debugTrace('stream.call', {
@@ -2886,6 +3972,22 @@ export class SingleStreamDriver {
             break;
           case 'reasoning-delta': {
             reasoningChars += chunk.text.length; // 思维链不进协议解析，只计体积
+            // 0.5.1（2.1）：思考通道里出现的 `<tf-*>` 不执行，也不能静默丢弃——
+            // 记 protocol-error:reasoning-channel，并（每回合一次）注入纠正。
+            // 尾巴保留 4 字符：`<tf-` 可能被拆在两个 delta 里。
+            if (!this.#reasoningHit) {
+              const probe = this.#reasoningProbeTail + chunk.text;
+              if (probe.includes('<tf-')) {
+                this.#reasoningHit = true;
+                this.#reasoningNudge = REASONING_CHANNEL_NUDGE;
+                this.#record({
+                  seq: ++DRIVER_SEQ, kind: 'fault', fault: 'protocol-error:reasoning-channel',
+                  detail: 'reasoning-delta 命中 <tf-：思考通道不解析命令（0 执行），注入一次纠正',
+                });
+                this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'protocol-error:reasoning-channel', turn, step });
+              }
+              this.#reasoningProbeTail = probe.slice(-4);
+            }
             // v0.3.1：思考过程捕获 + 实时帧（桌面端思考过程 live 显示的数据源）
             if (reasoningLastIndex !== chunk.index) {
               reasoningParts.push(chunk.text);
@@ -3221,11 +4323,11 @@ export class SingleStreamDriver {
       if (effectLine !== null) {
         const folded = `[tf-stream:replay id=${item.cmdId} name=${item.name} handle=${item.handle}]\n${effectLine}\n（原始输出已按效果压缩折叠；原文用 tf-peek handle="${item.handle}" from_line=.. to_line=.. 取回）`;
         this.#replays += 1;
-        this.#noteFeedback('handle', folded);
+        this.#noteFeedback('dedup', folded);
         out.push({ role: 'user', content: folded });
         this.#record({
           seq: ++DRIVER_SEQ, kind: 'observation',
-          handle: item.handle, key: `replay:${item.cmdId}`, infoGain: 'high', reason: 'duplicate-replay-folded',
+          handle: item.handle, key: `replay:${item.cmdId}`, infoGain: 'full', reason: 'duplicate-replay-folded',
         });
         this.#ledgerWrite('plugin:tf-agent/command', { cmdId: item.cmdId, name: item.name, status: 'duplicate-replay-folded', handle: item.handle });
         continue;
@@ -3247,7 +4349,7 @@ export class SingleStreamDriver {
       });
       this.#record({
         seq: ++DRIVER_SEQ, kind: 'observation',
-        handle: item.handle, key: `replay:${item.cmdId}`, infoGain: 'high', reason: 'duplicate-replay',
+        handle: item.handle, key: `replay:${item.cmdId}`, infoGain: 'full', reason: 'duplicate-replay',
       });
       this.#ledgerWrite('plugin:tf-agent/command', { cmdId: item.cmdId, name: item.name, status: 'duplicate-replay', handle: item.handle, chars: content.length });
     }
@@ -3333,16 +4435,14 @@ export class SingleStreamDriver {
   // ------------------------------------------------------- v0.4.3 P0-6 wire 断言
 
   /**
-   * 0.5.0（§8.3 判定表 + §8.5 配置）：前缀非单调按三类分别处置——不采用"报错/重发"二分。
-   * 返回 'ok'（放行——含预算内的受限换基）或 'fail'（fail-closed 收场，detail 供 blocked
+   * 0.5.0（§8.3 判定表 + §8.5 配置）；0.6.1 修订：前缀不单调统一"接受继续"。
+   * 返回 'ok'（放行——接受为缓存重置点）或 'fail'（fail-closed 收场，detail 供 blocked
    * 文案与兜底交付）。比较与分类在内核 assertRequestPrefix：
-   *   - stable-drift：**始终 fail**（不受 prefixPolicy 影响，§8.5）——稳定段被改写意味着
-   *     装配被破坏，重发只会烧缓存不修根因；
-   *   - shrink（越界）：fail——承诺前缀收缩 = 历史被销毁；段边界必须走 dropAppendHead
-   *     / rebase 计划性通道；
-   *   - append-drift（可归因）：受限换基——prefixPolicy='fail' 时绝不换基（§12.4 回退）；
-     'auto'（默认）每回合 1 次/每会话 3 次内放行同一份 next（0 额外请求）；'rebase' 走
-     换基成本判据（§8.4：剩余预算 > rebase_cost × rebaseBudgetRatio）。
+   *   - stable-drift / append-drift / shrink（prefixPolicy ≠ 'fail'）：**发送前接受**——
+   *     照常发送同一份 next（0 额外请求 / 0 重复计费 / 0 注入文本），基线随本请求推进，
+   *     后续请求恢复单调（缓存恢复命中）。违约请求本就只有这一版可发：接受即物理最优，
+   *     阻断与重发只会徒增中断与开销。不设限流（接受不产生任何额外 token），计数仅作观测。
+   *   - prefixPolicy='fail'（显式回退面）：三类一律 fail-closed——绝不换基，违约必报错。
    *   - planned-rebase 永不进入本断言——压缩/通道切换在发送前已重置基线（#lastRequest=null）。
    */
   #assertWirePrefix(next                          , turn        , step        )                                                          {
@@ -3355,46 +4455,27 @@ export class SingleStreamDriver {
       if (!(error instanceof PrefixBrokenError)) throw error;
       const cause = error.prefixCause;
       const diag = `index=${error.index} stablePrefixLen=${error.stablePrefixLen} cause=${cause} 期望="${capText(error.expected, 80)}" 实际="${capText(error.actual, 80)}"`;
-      if (cause === 'append-drift' && this.#cfg.prefixPolicy !== 'fail') {
-        const contextTokens = estimatePromptTokens(next);
-        const budgetOk = this.#rebaseAffordable(contextTokens);
-        const limitsOk = this.#prefixResendsTurn < 1 && this.#prefixResendsSession < 3;
-        if (limitsOk && (this.#cfg.prefixPolicy === 'auto' || budgetOk)) {
-          // P0-6④（v0.4.3.1 用词，核查 §4.2）：断言在发送前——"放行"= 记账后照常发送同一份
-          // next，0 额外请求；显式缓存重置点（下一请求基线 = 本次发送内容）。
-          this.#prefixResendsTurn += 1;
-          this.#prefixResendsSession += 1;
-          this.#resetSeq += 1;
-          this.#resetCause = 'prefix-reset';
-          const detail = `append-drift 受限换基（${this.#cfg.prefixPolicy}；会话第 ${this.#prefixResendsSession} 次/上限 3，回合第 ${this.#prefixResendsTurn} 次/上限 1${this.#cfg.prefixPolicy === 'rebase' ? (budgetOk ? '' : '；预算判据不满足被拒') : ''}）：${diag}`;
-          this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'prefix-reset', detail });
-          this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'prefix-reset', cause, index: error.index, stablePrefixLen: error.stablePrefixLen, turn });
-          this.#warn(`P0-6 append-drift：承诺前缀与下一请求头部不一致——放行一次同一份 next，基线随本请求推进（${diag}）`, error);
-          return { verdict: 'ok' };
-        }
-      }
-      const verdict = cause === 'append-drift'
-        ? (this.#cfg.prefixPolicy === 'fail'
+      if (this.#cfg.prefixPolicy === 'fail') {
+        const verdict = cause === 'append-drift'
           ? 'append-drift：prefixPolicy=fail 绝不换基（§12.4 回退面）'
-          : `append-drift 超出放行预算（每回合 1 次/每会话 3 次，已用 ${this.#prefixResendsSession} 次）——降级 fail-closed`)
-        : cause === 'shrink'
-          ? '承诺前缀收缩（历史被销毁；段边界必须走 dropAppendHead / rebase 计划性通道）'
-          : 'stable-drift（稳定段被改写，0 放行；stable-drift 始终 fail，不受 prefixPolicy 影响）';
-      const full = this.#prefixFailClosed(error, turn, step, verdict);
-      return { verdict: 'fail', detail: full };
+          : cause === 'shrink'
+            ? '承诺前缀收缩（prefixPolicy=fail：绝不换基，违约必报错）'
+            : 'stable-drift（prefixPolicy=fail：绝不换基，违约必报错）';
+        const full = this.#prefixFailClosed(error, turn, step, verdict);
+        return { verdict: 'fail', detail: full };
+      }
+      // 0.6.1：接受为缓存重置点——记账后照常发送同一份 next（P0-6④用词，核查 §4.2：
+      // 断言在发送前，"放行"= 0 额外请求；显式缓存重置点（下一请求基线 = 本次发送内容）。
+      this.#prefixResendsTurn += 1;
+      this.#prefixResendsSession += 1;
+      this.#resetSeq += 1;
+      this.#resetCause = 'prefix-reset';
+      const detail = `前缀不单调（${cause}）→ 接受为缓存重置点，同一份 next 照常发送（0 额外请求；会话第 ${this.#prefixResendsSession} 次违约）：${diag}`;
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'prefix-reset', detail });
+      this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'prefix-reset', cause, index: error.index, stablePrefixLen: error.stablePrefixLen, turn });
+      this.#warn(`P0-6 前缀不单调（${cause}）：接受为缓存重置点继续对话（${diag}）`, error);
+      return { verdict: 'ok' };
     }
-  }
-
-  /**
-   * 0.5.0（§8.4 换基成本判据）：rebase_cost ≈ C（当前上下文 token）；
-   * 规则：剩余预算 > rebase_cost × rebaseBudgetRatio → 允许自动换基，否则 fail 保留现场。
-   * 剩余预算（token 口径）= maxInputTokens − 当前估算（maxInputTokens=0 无上限 → 恒允许）。
-   */
-  #rebaseAffordable(contextTokens        )          {
-    const maxInput = this.effectiveLimits().maxInputTokens;
-    if (maxInput <= 0) return true;
-    const remaining = maxInput - contextTokens;
-    return remaining > contextTokens * this.#cfg.rebaseBudgetRatio;
   }
 
   /**
@@ -3414,11 +4495,436 @@ export class SingleStreamDriver {
     return detail;
   }
 
-  /** v0.4.3（P0-6⑤）：最小对账——把 pending 意图整批标 unknown（ack 语义写死：
-   *  只解除恢复锁，不重放工具、不声称回滚）。IO 失败 fail-open + 告警（意图保持 pending，
-   *  恢复锁不解除——宁可多一次人工核对，不可虚报已对账）。 */
-  #reconcilePendingIntents(cause        )       {
+  // ------------------------------------------------------ 0.6.0 请求装配（RA-1/RA-4/RA-5）
+
+  /**
+   * RA-1/RA-4：把当前渲染状态投影成 AssemblyPlan（kernel/assembly.ts 纯函数）。
+   * 返回的 messages 就是本请求要发送的内容；同一状态连续投影逐字节一致。
+   *  - 首请求（本任务第 1 个请求）不声明工具（RA-3：0 schema）；
+   *  - 预算超限 → 'budget'（调用方 fail-closed，0 发送）；
+   *  - 投影异常 → 回退 host（RA-5），本会话固定 host。
+   */
+  #projectAssembly(turn        , step        ) 
+                                                                  
+                                        
+                       {
     try {
+      if (this.#cfg.assemblyFaultInject?.project === true) throw new Error('装配投影注入失败（assemblyFaultInject.project）');
+      const snap = this.#renderer.assemblySnapshot();
+      const firstRequest = this.#taskRequestCount === 0;
+      const surface = this.#currentSurface;
+      const decls                            = this.#cfg.nativeTools && !firstRequest && surface !== undefined && surface.schemas.length > 0
+        // 0.6.0 复查修复（同 assemblyDryRun）：先按名字典序排序、再截断（assembly.ts 契约）。
+        ? [...surface.schemas]
+            .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+            .slice(0, MAX_DECLARED_TOOLS)
+            .map((d) => ({ name: d.name, description: d.description, parameters: d.parameters }))
+        : null;
+      const asRole = (role        )                                  => (role === 'assistant' ? 'assistant' : role === 'system' ? 'system' : 'user');
+      const tail = snap.tail.map((b) => ({ role: asRole(b.role), content: b.content }));
+      const history = snap.append.map((b) => ({
+        role: asRole(b.role),
+        content: b.content,
+        ...(b.source === undefined ? {} : { source: b.source }),
+      }));
+      const plan = projectAssembly({
+        channel: snap.parts.system,
+        protocol: snap.parts.protocol,
+        // 契约：system 的 tools 块是**说明文本**（恒定）；声明面只进请求的 tools 字段。
+        // 两者混用会让"首请求 0 schema、后续声明 ≤7"改动 system 前缀 → 每次都被前缀断言拦下。
+        toolsBlock: snap.parts.toolSchemas,
+        tools: decls,
+        invariants: snap.parts.invariants,
+        // state 块留空：本插件的"状态"（计划差分 / 句柄目录增量 / 观测事实）走追加区与
+        // 易变尾块——那是与 host 模式**同一份事实来源**。把它再抄进 system 会让 system
+        // 每回合变化，直接击穿前缀缓存（§4.5 A3 的反面）。
+        state: '',
+        history,
+        tail,
+        reasoning: this.#cfg.reasoningStrategy,
+        budgetLimit: this.effectiveLimits().maxInputTokens,
+      });
+      this.#lastPlan = plan;
+      if (plan.budget.overBy > 0) {
+        const detail = budgetRefusal(plan);
+        const contributions = budgetContributions(plan, { maxItems: 5 });
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'assembly-budget', detail: `${plan.budget.estimatedInputTokens}t > ${plan.budget.limit}t（超出 ${plan.budget.overBy}）` });
+        this.#ledgerWrite('plugin:tf-agent/fault', {
+          fault: 'assembly-budget', turn, step,
+          estimated: plan.budget.estimatedInputTokens, limit: plan.budget.limit, overBy: plan.budget.overBy,
+          contributions: contributions.map((c) => ({ label: c.label, tokens: c.tokens })),
+        });
+        return { kind: 'budget', detail };
+      }
+      const messages                  = plan.messages.map((m) => ({
+        role: asRole(m.role),
+        content: m.content,
+        ...(m.source === undefined ? {} : { source: m.source                            }),
+      }));
+      return { kind: 'plan', messages, tailLen: tail.length };
+    } catch (error) {
+      this.#assemblyFallback(`投影异常：${error instanceof Error ? error.message : String(error)}`);
+      // 本请求改用 host 内容发送：旧（plan）基线不再适用，否则会误报一次前缀破坏。
+      this.#lastRequest = null;
+      return { kind: 'host' };
+    }
+  }
+
+  /** RA-5：回退到 host 路径（本会话固定），事件落 records + 台账（可检索）。 */
+  #assemblyFallback(reason        )       {
+    if (this.#cfg.assemblyPolicy === 'host') return;
+    this.#cfg.assemblyPolicy = 'host';
+    this.#assemblyFallbacks += 1;
+    this.#assemblyFallbackReason = reason;
+    this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'assembly-fallback', detail: capText(reason, 200) });
+    this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'assembly-fallback', reason: capText(reason, 200), fallbacks: this.#assemblyFallbacks });
+    this.#warn(`RA-5 装配回退：plan → host（${capText(reason, 160)}）`);
+  }
+
+  /**
+   * 0.6.0：前缀 fail-closed 后同轮自动续跑——不要求用户再发一条消息。
+   * 失败已经记账并完成 pending 对账；这里只做三件事：重置渲染器与 wire 基线、写入
+   * 一条模型可见的恢复事实、把同一回合推进到下一请求。每回合有上限，耗尽后走兜底交付。
+   */
+  #tryPrefixAutoContinue(turn        , step        , detail        )          {
+    if (this.#cfg.autoContinueOnPrefixFail !== true) return false;
+    if (this.#prefixAutoContinues >= MAX_PREFIX_AUTO_CONTINUES) {
+      const exhausted = `前缀失败自动续跑已达上限（${MAX_PREFIX_AUTO_CONTINUES} 次/回合）——转兜底交付`;
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'prefix-auto-exhausted', detail: exhausted });
+      this.#ledgerWrite('plugin:tf-agent/fault', {
+        fault: 'prefix-auto-exhausted', turn, step, attempts: this.#prefixAutoContinues, detail: capText(detail, 200),
+      });
+      return false;
+    }
+    this.#prefixAutoContinues += 1;
+    try {
+      // rebase 是唯一被允许的改写口：重置稳定段基线，下一次 render 不会再次撞同一条断言。
+      this.#renderer.rebase({ reason: `前缀失败自动续跑（第 ${this.#prefixAutoContinues}/${MAX_PREFIX_AUTO_CONTINUES} 次）` });
+    } catch (error) {
+      // 换基失败 = 续跑不可能发生：必须留痕（否则"为什么没续跑"在台账里查不到）。
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'prefix-auto-rebase-failed', detail: capText(detail, 200) });
+      this.#ledgerWrite('plugin:tf-agent/fault', { fault: 'prefix-auto-rebase-failed', turn, step, attempt: this.#prefixAutoContinues, detail: capText(detail, 200) });
+      this.#warn('前缀失败自动续跑：上下文换基失败', error);
+      return false;
+    }
+    // wire 承诺基线一并重置——本次失败的那份 next 不发送，下一次是新时代第一条。
+    this.#lastRequest = null;
+    this.#resetSeq += 1;
+    this.#resetCause = 'prefix-auto-continue';
+    const recovery = [
+      contextRebasedLine('prefix-auto-continue'),
+      `[tf-stream:prefix-recovered] 上一请求未发送（前缀校验失败：${capText(detail, 200)}）。`,
+      `已自动重建上下文基线（第 ${this.#prefixAutoContinues}/${MAX_PREFIX_AUTO_CONTINUES} 次），不需要用户操作。`,
+      '已记账的副作用意图标记为 unknown（未确认执行），不要假设它们成功；已确认成功的命令不要重复；',
+      '继续完成原任务；需要原文时用 tf-peek 按句柄取回。',
+    ].join('\n');
+    this.#renderer.appendHistory({ role: 'user', content: recovery });
+    this.#record({
+      seq: ++DRIVER_SEQ, kind: 'fault', fault: 'prefix-auto-continue',
+      detail: `第 ${this.#prefixAutoContinues}/${MAX_PREFIX_AUTO_CONTINUES} 次：${capText(detail, 160)}`,
+    });
+    this.#ledgerWrite('plugin:tf-agent/fault', {
+      fault: 'prefix-auto-continue', turn, step, attempt: this.#prefixAutoContinues,
+      maxAttempts: MAX_PREFIX_AUTO_CONTINUES, cause: 'prefix-broken', detail: capText(detail, 200),
+    });
+    return true;
+  }
+
+  // --------------------------------------------------- 0.6.0 TF-PEEK（PE-1/PE-3）
+
+  /** PE-3：登记 tf-read 句柄的文件快照。stat 失败（宿主沙箱/虚拟路径）不登记——
+   *  peek 端只在有快照时校验（fail-open：不因为拿不到 stat 就拒绝取回）。 */
+  #registerFileBinding(cmd           , handle               )       {
+    if (handle === null) return;
+    const raw = cmd.attrs['path'] ?? '';
+    if (raw === '') return;
+    try {
+      const abs = this.#changePath(raw);
+      const info = statSync(abs);
+      if (!info.isFile()) return;
+      this.#obs.registerFileBinding(handle, { path: abs, mtimeMs: info.mtimeMs, size: info.size });
+    } catch (error) {
+      this.#warn(`PE-3 文件快照登记失败（${raw}）：peek 不做 stat 校验（fail-open）`, error);
+    }
+  }
+
+  // --------------------------- 0.6.0 正式版：变更回执与守卫回滚（changes 缺口修复）
+
+  /**
+   * 回执路径解析（与 revisionFacts 同一根：projectDir ?? cwd）。
+   * 0.6.0 收口（核验 P2）：resolve 而非 join——`./a`、`b/../c` 等相对段必须归一，
+   * 否则同一文件的不同写法会分裂句柄/守卫/回滚的身份，Windows 与 POSIX 行为也不一致。
+   */
+  #changePath(raw        )         {
+    return resolve(this.#fileRoot, raw);
+  }
+
+  /** 受守卫文件事实（utf-8 文本 + sha256；不存在 = missing；>8MiB / 二进制如实标注）。 */
+  #guardedFileFacts(abs        )                                                                                           {
+    let buf        ;
+    try {
+      buf = readFileSync(abs);
+    } catch {
+      return { text: null, hash: 'missing', bytes: 0, binary: false, tooLarge: false };
+    }
+    const hash = createHash('sha256').update(buf).digest('hex');
+    if (buf.byteLength > MAX_GUARDED_FILE_BYTES) return { text: null, hash, bytes: buf.byteLength, binary: false, tooLarge: true };
+    let text                = null;
+    if (!buf.includes(0)) {
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(buf);
+      } catch {
+        text = null; // 非法 utf-8 = 二进制
+      }
+    }
+    return { text, hash, bytes: buf.byteLength, binary: text === null, tooLarge: false };
+  }
+
+  /** 写前 before 快照（fail-open：读失败不阻断写入，只是该次写入没有回执）。 */
+  #captureChangeBefore(cmd           )       {
+    if (this.#configRef.changeReceipts === false) return;
+    const raw = cmd.attrs['path'] ?? '';
+    if (raw === '') return;
+    try {
+      const abs = this.#changePath(raw);
+      const facts = this.#guardedFileFacts(abs);
+      // 0.6.0 收口（核验 P2）：身份用 abs（resolve 归一），展示用相对根路径（省 token、可读）；
+      // 根外路径退回绝对形态。过滤/回滚两侧经 samePath 对齐。
+      const rel = relative(this.#fileRoot, abs);
+      this.#pendingChanges.set(cmd.id, {
+        path: rel !== '' && !rel.startsWith('..') ? rel : abs,
+        before: facts.text,
+        beforeHash: facts.hash,
+        beforeBytes: facts.bytes,
+        binary: facts.binary || facts.tooLarge,
+      });
+    } catch (error) {
+      this.#warn(`变更回执 before 快照失败（${raw}）：该次写入将无回执（fail-open）`, error);
+    }
+  }
+
+  /** 写后结算：读 after → begin+complete → 持久化（私有目录）。失败只告警不影响写入本身。 */
+  #settleChange(cmd           , ok         )       {
+    const pending = this.#pendingChanges.get(cmd.id);
+    this.#pendingChanges.delete(cmd.id);
+    if (pending === undefined || !ok || this.#configRef.changeReceipts === false) return;
+    try {
+      const after = this.#guardedFileFacts(this.#changePath(pending.path));
+      const reason = after.tooLarge
+        ? 'snapshot_too_large'
+        : snapshotReason(pending.before, after.text, { binary: pending.binary || after.binary });
+      const id = randomUUID().replace(/-/g, '');
+      const entry = this.#changeStore.begin({
+        id,
+        workspace: this.#fileRoot,
+        path: pending.path,
+        operation: cmd.name === 'tf-write' ? 'write' : cmd.name === 'tf-edit' ? 'edit' : 'append',
+        commandId: cmd.id,
+        beforeHash: pending.beforeHash,
+        afterHash: after.hash,
+        beforeBytes: pending.beforeBytes,
+        afterBytes: after.bytes,
+        unavailableReason: reason,
+        snapshots: reason === ''
+          ? {
+              before: pending.before === null ? null : Buffer.from(pending.before, 'utf8').toString('base64'),
+              after: after.text === null ? null : Buffer.from(after.text, 'utf8').toString('base64'),
+            }
+          : undefined,
+      });
+      const settled = this.#changeStore.complete(id, after.hash);
+      if (!settled.ok) {
+        this.#warn(`变更回执结算失败（${pending.path}）：${settled.reason}`);
+        return;
+      }
+      if (this.#ports.onChangeReceipt !== undefined) {
+        this.#ports.onChangeReceipt(entry);
+      }
+      this.#ledgerWrite('plugin:tf-agent/change', {
+        id, path: pending.path, operation: entry.operation, status: entry.status,
+        canRevert: receiptMetadata(entry).canRevert,
+      });
+    } catch (error) {
+      this.#warn(`变更回执结算失败（${pending.path}）（fail-open：不影响写入本身）`, error);
+    }
+  }
+
+  /** 快照哈希完整性校验（加载/取用时；对齐 [TF]/changes.py:223-235 _snapshots）。 */
+  #verifySnapshots(entry             )                {
+    if (entry.snapshots === undefined) return null; // 无快照回执（元数据-only）不需要校验
+    for (const name of ['before', 'after']         ) {
+      const encoded = entry.snapshots[name];
+      const data = encoded === null ? null : Buffer.from(encoded, 'base64');
+      const hash = data === null ? 'missing' : createHash('sha256').update(data).digest('hex');
+      if (hash !== entry[`${name}Hash`]) return 'invalid_change_receipt: snapshot hash mismatch';
+    }
+    return null;
+  }
+
+  /** resume：加载已持久化回执（身份校验：workspace 必须一致；快照哈希必须完整）。
+   *  0.6.0 收口（核验 P2）：workspace 比对先 resolve 归一——否则 cwd 大小写/相对 projectDir
+   *  会让合法回执被整批误拒（revert 跨回合能力静默失效）。 */
+  loadChangeReceipts(entries                        )                                       {
+    let loaded = 0;
+    let rejected = 0;
+    for (const entry of entries) {
+      // 0.6.0 复查修复：逐条 try——一个形状不全的回执（workspace 缺失、snapshots 非对象）
+      // 此前会在 samePath/#verifySnapshots 抛 TypeError 并中止整批加载（已 load 的保留、
+      // 其余全丢，"从空账本开始"）。现在逐条拒绝并计数，坏文件不拖累整批（fail-open 有告警）。
+      try {
+        if (!samePath(entry.workspace, this.#fileRoot) || this.#verifySnapshots(entry) !== null) {
+          rejected += 1;
+          continue;
+        }
+        this.#changeStore.load(entry);
+        loaded += 1;
+      } catch {
+        rejected += 1;
+      }
+    }
+    return { loaded, rejected };
+  }
+
+  /** tf-changes：回执目录（公开面永不返回快照）。path 过滤经 samePath 归一（核验 P2）。
+   *  0.6.0 复查修复：过滤左侧（回执存的相对路径）同样以 fileRoot 解析——samePath 内部
+   *  resolve 以 process.cwd() 为基准，projectDir ≠ cwd 时相对路径会被解析到错误根，
+   *  `tf-changes path=` 恒返回空目录（回执明明存在）。两侧都过 #changePath 对齐基准。 */
+  #changesOutput(pathFilter                    )         {
+    const list = this.#changeStore.list()
+      .filter((m) => pathFilter === undefined || pathFilter === '' || samePath(this.#changePath(m.path), this.#changePath(pathFilter)));
+    if (list.length === 0) return '（本会话没有变更回执——tf-write/tf-edit/tf-append 成功后自动登记）';
+    return list.map((m) => {
+      const revert = m.canRevert ? 'yes' : `no(${m.unavailableReason})`;
+      return `${m.id} ${m.operation} ${m.path} status=${m.status} revert=${revert} expected=${m.expectedRevision}`;
+    }).join('\n');
+  }
+
+  /** tf-revert：守卫式回滚（双重校验 + 原子写回 + undo 回执）。 */
+  #executeRevert(rec               , cmd           )       {
+    const id = cmd.attrs['change'] ?? '';
+    const expected = cmd.attrs['expected'] ?? '';
+    const fail = (detail        )       => {
+      rec.status = 'failed';
+      rec.detail = detail;
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail });
+      this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: detail.slice(0, 200) });
+    };
+    const entry = this.#changeStore.get(id);
+    if (entry === undefined) {
+      fail(`unknown-change: 回执 ${id} 不在本会话账本（先 tf-changes 列出可用回执）`);
+      return;
+    }
+    const snapshotError = this.#verifySnapshots(entry);
+    if (snapshotError !== null) {
+      fail(snapshotError);
+      return;
+    }
+    const current = this.#guardedFileFacts(this.#changePath(entry.path));
+    const plan = planRevert(entry, expected, current.hash);
+    if (!plan.ok) {
+      fail(plan.reason);
+      return;
+    }
+    try {
+      const abs = this.#changePath(entry.path);
+      const data = Buffer.from(plan.before ?? '', 'utf8');
+      const tmp = `${abs}.tf-revert-${process.pid}.tmp`;
+      writeFileSync(tmp, data);
+      renameSync(tmp, abs);
+      // 恢复后复查 + undo 回执（对齐 TF：revert 本身也是一次 begin/complete）。
+      const restored = this.#guardedFileFacts(abs);
+      const undoId = randomUUID().replace(/-/g, '');
+      const undo = this.#changeStore.begin({
+        id: undoId,
+        workspace: this.#fileRoot,
+        path: entry.path,
+        operation: 'revert',
+        commandId: cmd.id,
+        beforeHash: entry.afterHash,
+        afterHash: entry.beforeHash,
+        beforeBytes: entry.afterBytes,
+        afterBytes: entry.beforeBytes,
+        unavailableReason: entry.unavailableReason,
+        undoOf: entry.id,
+        snapshots: entry.snapshots === undefined
+          ? undefined
+          : { before: entry.snapshots.after, after: entry.snapshots.before },
+      });
+      const settled = this.#changeStore.complete(undoId, restored.hash);
+      if (!settled.ok) {
+        fail(`revision_conflict: file changed before restoration（${settled.reason}）`);
+        return;
+      }
+      if (this.#ports.onChangeReceipt !== undefined) this.#ports.onChangeReceipt(undo);
+      if (this.#ports.revisionFacts !== undefined) this.#revisionGuard.noteWrite(entry.path, restored.hash);
+      rec.status = 'ok';
+      rec.output = `reverted ${entry.path} → ${entry.beforeHash.slice(0, 12)}（undo 回执 ${undoId}；原回执 ${entry.id}）`;
+      rec.detail = rec.output;
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+      this.#ledgerWrite('plugin:tf-agent/change', { id: undoId, path: entry.path, operation: 'revert', status: 'success', undoOf: entry.id });
+    } catch (error) {
+      fail(`revert-failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /** PE-3：取回前的 stat 校验。返回 null = 未变更（或该句柄无文件绑定）；否则返回
+   *  `[stale]` 一行——调用方必须把它当作**取回结果**，不得再返回旧文。 */
+  #staleGuard(handle        )                                                {
+    const binding = this.#obs.fileBindingOf(handle);
+    if (binding === undefined) return null;
+    let current                                   ;
+    try {
+      const info = statSync(binding.path);
+      if (!info.isFile()) throw new Error('not a file');
+      current = { mtimeMs: info.mtimeMs, size: info.size };
+    } catch {
+      const line = `[stale] handle 对应的文件已不存在（${binding.path}）：登记时 mtime=${Math.round(binding.mtimeMs)} size=${binding.size}。请重新 tf-read 或核对路径。`;
+      return { binding, line };
+    }
+    if (!isBindingStale(binding, current)) return null;
+    return { binding, line: staleLine(binding, current) };
+  }
+
+  /** PE-3：批量候选的 stale 判定——只要还有未变更的候选就放行（同名文件多句柄场景）；
+   *  全部变更/缺失时返回第一条 `[stale]` 文案。
+   *  0.6.0 复查修复：返回结构从"是否放行"改为 (fresh, staleLine)——fresh = 通过守卫的
+   *  候选（保序）。此前守卫"任一新鲜即放行"，而正文固定取 handleCandidates[0]：多句柄
+   *  候选（request:N 段句柄）下第一个候选 stale、第二个新鲜时，守卫放行、返回的却是
+   *  第一个候选的旧文且无标注（违反 PE-3"旧文不得冒充当前内容"）。取回点必须从 fresh
+   *  取内容——返回的正文一定来自未变更句柄。 */
+  #filterFreshHandles(handles                   )                                                {
+    if (handles.length === 0) return { fresh: [], staleLine: null };
+    const fresh           = [];
+    let staleLine                = null;
+    for (const h of handles) {
+      const verdict = this.#staleGuard(h);
+      if (verdict === null) fresh.push(h);
+      else if (staleLine === null) staleLine = verdict.line;
+    }
+    return { fresh, staleLine: fresh.length === 0 ? staleLine : null };
+  }
+
+  /** PE-4：取回预算的拒绝文案——必须同时给出**已用 / 上限 / 剩余**与可执行建议窗口，
+   *  否则模型只能盲试（"再试一次说不定就过了"）。 */
+  #peekBudgetLine(suggested        )         {
+    const cap = this.#cfg.peekBudgetChars;
+    const used = this.#peekBudgetUsed;
+    const remaining = Math.max(0, cap - used);
+    if (remaining === 0) {
+      return `[budget] 本回合取回已达上限：已用 ${used} / 上限 ${cap} 字符，剩余 0。`
+        + '本回合无法再取回正文：请下回合继续，或先用 tf-grep/tf-glob 把范围缩到下一次够用的窗口。';
+    }
+    const want = suggested > 0 ? suggested : remaining;
+    const window = Math.max(1, Math.min(want, remaining));
+    return `[budget] 本次取回会超预算：已用 ${used} / 上限 ${cap} 字符，剩余 ${remaining}。`
+      + `建议：把本次取回窗口缩到 ≤${window} 字符（from_line..to_line），或先用 tf-grep/tf-glob 缩小范围，或下回合继续。`;
+  }
+
+  /** v0.4.3（P0-6⑤）：最小对账——把 pending 意图整批标 unknown（ack 语义写死：
+   *  只解除恢复锁，不重放工具、不声称回滚）。IO 失败 fail-open + 告警（意图保持 pending,
+   *  恢复锁不解除——宁可多一次人工核对，不可虚报已对账）。 */
+  #reconcilePendingIntents(cause        )       {    try {
       const result = this.#ports.reconcilePendingIntents?.(cause);
       this.#record({
         seq: ++DRIVER_SEQ, kind: 'fault', fault: 'intent-reconciled',
@@ -3436,11 +4942,29 @@ export class SingleStreamDriver {
    *  时每回合只注入一次。只改基线快照（发送原文与 renderHash 不受影响）。
    *  v0.4.3.1：基线 = promised（转正后 stable），篡改点语义不变。 */
   #faultDriftBaseline(turn        )       {
-    const baseline = this.#lastRequest;
-    if (baseline === null) return;
     const cfg = this.#cfg.faultPrefixDrift;
     if (cfg === undefined) return;
+    // 0.6.0（§0 A4/A5）：rearm=true —— 基线为空（通常是刚自动续跑换基过）时合成一条
+    // 基线继续注入，复演"前缀持续失败直到续跑耗尽"；默认 false 保持 0.4.x 探针语义。
+    const synthetic = cfg.rearm === true
+      ? { promised: this.#renderer.stableMessages(), stableLen: Math.min(2, this.#renderer.stableMessages().length) }
+      : null;
+    const baseline = this.#lastRequest ?? synthetic;
+    if (baseline === null) return;
     const promised = [...baseline.promised];
+    // shrink：给承诺前缀补一条多余消息 → 下一请求必然比承诺短（next.length < promised.length）。
+    if (cfg.kind === 'shrink') {
+      if (promised.length === 0) return;
+      if (cfg.oncePerTurn === true) {
+        if (this.#faultDriftTurns.has(turn)) return;
+        this.#faultDriftTurns.add(turn);
+      }
+      // 补两条多余承诺（下一条请求被截掉 1 条尾块后，必然比承诺短 → shrink）
+      promised.push({ role: 'user', content: '（探针：多余承诺块 A）' });
+      promised.push({ role: 'user', content: '（探针：多余承诺块 B）' });
+      this.#lastRequest = { promised, stableLen: Math.min(baseline.stableLen, promised.length) };
+      return;
+    }
     let index        ;
     if (cfg.kind === 'stable') {
       if (baseline.stableLen < 2) return; // 没有可篡改的稳定段（system 之下）
@@ -3455,21 +4979,15 @@ export class SingleStreamDriver {
       if (this.#faultDriftTurns.has(turn)) return;
       this.#faultDriftTurns.add(turn);
     }
-    if (cfg.kind === 'stable') {
-      if (baseline.stableLen < 2) return; // 没有可篡改的稳定段（system 之下）
-      index = 1;
-    } else {
-      if (promised.length <= baseline.stableLen) return; // 无转正块可篡改
-      index = baseline.stableLen;
-    }
     promised[index] = { ...promised[index] , content: `${promised[index] .content}（探针篡改）` };
     this.#lastRequest = { promised, stableLen: baseline.stableLen };
   }
 
-  /** v0.4.3（P0-7①）：反馈字节分类累计（注入位点调用；request 记录写入时快照清零）。
-   *  'full' = 全量回灌；'handle' = 句柄/骨架/回执（超限或自写回验形态）。dedup 由 P0-4
-   *  （0.5.0）引入，0.4.3 恒 0——字段先占位，口径不漂移。 */
-  #noteFeedback(kind                   , content        )       {
+  /** 0.5.1（2.2）：反馈字节分类累计（注入位点调用；request 记录写入时快照清零）。
+   *  三桶与 info_gain 三档逐字一致、可外部复算：
+   *  'full' = 全量回灌；'dedup' = 去重形态（[unchanged] / 部分重叠只补新增 / 效果折叠行）；
+   *  'handle' = 句柄/骨架/回执（超限、自写回验、native/code 降级）。 */
+  #noteFeedback(kind                             , content        )       {
     this.#feedbackBytes[kind] += content.length;
   }
 
@@ -3522,14 +5040,27 @@ export class SingleStreamDriver {
    * 交付说明（不是伪造模型答案）：已完成什么、最近一次命令输出、哪些没验证。
    * 零产出回合返回 null（不伪造"已完成"）。
    */
-  #buildFallbackFinal(detail        )                {
+  #buildFallbackFinal(detail        , zeroOutputFact = false)                {
     const ok = this.#turnOkRecords();
-    if (ok.length === 0) return null;
+    const zeroOutput = ok.length === 0;
+    // 0.6.0（§0 A4）：零产出**且失败发生在请求发送前（前缀校验）**时也要写一条事实消息
+    // ——否则用户侧只剩空白，不知道发生过失败、也不知道已自动续跑过。
+    // 其它零产出收场（停滞/收束期末收敛）保持 0.3.3 语义：没有事实就不伪造交付。
+    if (zeroOutput && !zeroOutputFact) return null;
     const writes = ok.filter((r) => r.cmd.name === 'tf-write' || r.cmd.name === 'tf-edit' || r.cmd.name === 'tf-append');
     const bashes = ok.filter((r) => r.cmd.name === 'tf-bash' || r.cmd.name === 'tf-code');
     const reads = ok.filter((r) => r.cmd.name === 'tf-read' || r.cmd.name === 'tf-grep' || r.cmd.name === 'tf-glob'
       || r.cmd.name === 'tf-peek' || r.cmd.name === 'tf-call');
     const lines           = [`[未完成交付] 回合在收束预算内停止（${capText(detail, 160)}），没有收到有效的 tf-final。以下为台账事实，不是模型结论：`];
+    if (zeroOutput) {
+      lines.push('- 本回合没有成功执行的命令；失败发生在请求发送前（前缀校验/预算拒绝）。');
+      // 只有真的开过续跑才这么写（autoContinueOnPrefixFail=false 时不伪造"已尝试"）。
+      if (this.#cfg.autoContinueOnPrefixFail === true && this.#prefixAutoContinues > 0) {
+        lines.push(`- 已尝试同轮自动续跑 ${this.#prefixAutoContinues} 次；仍未产生任何交付。`);
+      } else {
+        lines.push('- 未产生任何交付。');
+      }
+    }
     let listed = 0;
     for (const rec of [...writes, ...bashes, ...reads]) {
       if (listed >= 8) break;
@@ -3558,21 +5089,23 @@ export class SingleStreamDriver {
         lines.push(`- ${rec.cmd.id} ${rec.cmd.name} → ${rec.status}${rec.detail === undefined ? '' : `（${capText(rec.detail, 120)}）`}`);
       }
     }
-    lines.push('如需继续，请直接说明下一步（例如“继续修 X”）；本回合没有把未验证的工作标成完成。');
+    lines.push(zeroOutput
+      ? '本轮已结束；没有产生交付，也没有把未验证的工作标成完成。'
+      : '本轮已结束；没有把未验证的工作标成完成。');
     return capText(lines.join('\n'), 4000);
   }
 
   /**
-   * v0.4.3（P0-6⑤，自 0.3.3 回植）：兜底交付——前缀破坏收场的最后一道闸。
-   * fail-closed 拒绝发送后，把**台账事实**写成一条明确标注未完成的 assistant 消息落进
-   * 会话，而不是让界面停在最后一句 prose 上。零产出（无 ok 命令）→ 不写（不伪造"已完成"）；
+   * v0.4.3（P0-6⑤，自 0.3.3 回植）：兜底交付——前缀破坏/预算拒绝收场的最后一道闸。
+   * 0.6.0：零产出也写事实消息（此前零产出直接跳过，用户侧看到空白且不知道发生过失败）；
+   * 文案不再要求用户“再发一条”，同轮续跑已在 #tryPrefixAutoContinue 内完成。
    * 同一回合只写一次。异常上抛开发者日志，不作为用户可见终态。
    */
-  #deliverFallbackFinal(turn        , step        , detail        )       {
+  #deliverFallbackFinal(turn        , step        , detail        , cause                    = 'turn')       {
     if (this.#fallbackFinalDelivered) return;
-    const text = this.#buildFallbackFinal(detail);
+    const text = this.#buildFallbackFinal(detail, cause === 'prefix');
     if (text === null) {
-      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'fallback-final-skipped', detail: '零产出回合（无 ok 命令）→ 不写兜底交付（不伪造"已完成"）' });
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'fallback-final-skipped', detail: '兜底交付为空（不应发生）' });
       return;
     }
     this.#fallbackFinalDelivered = true;
@@ -3642,18 +5175,188 @@ export class SingleStreamDriver {
       }
     }
 
+    // ---- 4.1：文件版本冲突守卫（edit/append 派发前；revisionFacts 在位才启用）----
+    if ((cmd.name === 'tf-write' || cmd.name === 'tf-edit' || cmd.name === 'tf-append') && this.#ports.revisionFacts !== undefined) {
+      const targetPath = cmd.attrs['path'] ?? '';
+      const verdict = this.#revisionGuard.guardEdit(targetPath, this.#ports.revisionFacts, {
+        exactEdit: cmd.name === 'tf-edit',
+        targetRange: cmd.attrs['offset'] !== undefined && /^\d+$/.test(cmd.attrs['offset'])
+          ? { start: Number(cmd.attrs['offset']), end: Number(cmd.attrs['offset']) + 1 }
+          : undefined,
+      });
+      if (verdict.verdict === 'deny') {
+        rec.status = 'rejected';
+        rec.detail = `${verdict.reason}: ${verdict.detail}`;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'rejected', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'rejected', reason: verdict.reason, detail: verdict.detail });
+        return;
+      }
+    }
+
+    // ---- 0.6.0 正式版（security 缺口）：默认密钥文件拒读（对齐 [TF]/security.py:193-199）。
+    // fail-closed 但给出明确出路（装配 allowSensitivePaths 或改用脱敏副本），不是死路。----
+    if (cmd.name === 'tf-read' && this.#configRef.allowSensitivePaths !== true && isSecretPath(cmd.attrs['path'] ?? '')) {
+      rec.status = 'failed';
+      rec.detail = secretReadRefusalDetail(cmd.attrs['path'] ?? '');
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+      this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', kind: 'secret-path', detail: rec.detail.slice(0, 200) });
+      return;
+    }
+
+    // ---- 0.6.0 正式版（changes 缺口）：tf-changes / tf-diff / tf-revert（插件侧执行，
+    // 不经宿主工具映射；对齐 [TF]/changes.py list_changes/diff/revert）----
+    if (cmd.name === 'tf-changes') {
+      rec.status = 'ok';
+      rec.output = this.#changesOutput(cmd.attrs['path']);
+      rec.detail = `${rec.output.length} chars（变更回执目录）`;
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+      return;
+    }
+    if (cmd.name === 'tf-diff') {
+      const entry = this.#changeStore.get(cmd.attrs['change'] ?? '');
+      if (entry === undefined) {
+        rec.status = 'failed';
+        rec.detail = `unknown-change: 回执 ${cmd.attrs['change'] ?? ''} 不在本会话账本（先 tf-changes）`;
+      } else {
+        const meta = receiptMetadata(entry);
+        const snapshotError = this.#verifySnapshots(entry);
+        if (!meta.canDiff || snapshotError !== null || entry.snapshots === undefined) {
+          rec.status = 'failed';
+          rec.detail = snapshotError ?? meta.unavailableReason;
+        } else {
+          const before = entry.snapshots.before === null ? null : Buffer.from(entry.snapshots.before, 'base64').toString('utf8');
+          const after = entry.snapshots.after === null ? null : Buffer.from(entry.snapshots.after, 'base64').toString('utf8');
+          const diff = unifiedDiff(before, after, entry.path);
+          rec.status = 'ok';
+          rec.output = diff === '' ? '（该次变更前后内容一致，无差异）' : diff;
+          rec.detail = `${rec.output.length} chars（快照 diff）`;
+        }
+      }
+      this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: rec.status, detail: rec.detail });
+      return;
+    }
+    if (cmd.name === 'tf-revert') {
+      this.#executeRevert(rec, cmd);
+      return;
+    }
+
     // ---- tf-peek：内核 obs 直接取回（need_result 通道；0.5.0 走 span 账本 + 回合预算）----
     if (cmd.name === 'tf-peek') {
       const handle = cmd.attrs['handle'] ?? '';
       const symbol = cmd.attrs['symbol'];
       const from = Number(cmd.attrs['from_line'] ?? '1');
       const to = cmd.attrs['to_line'] === undefined ? Number.MAX_SAFE_INTEGER : Number(cmd.attrs['to_line']);
+      // 0.5.2（审计 C-6）：receipt:N 引用空间——回执是"已发生事实"的最小凭证（路径 + 行数 +
+      // 指纹），0.5.1 只把它闪一次就没了：模型跨几步后想确认"我到底写过什么"只能重读文件。
+      const receiptRef = /^receipt:(\d+)$/.exec(handle.trim());
+      if (receiptRef !== null) {
+        const stored = this.#receipts.get(Number(receiptRef[1]));
+        if (stored === undefined) {
+          rec.status = 'ok';
+          rec.output = `receipt:${receiptRef[1]} 不在本会话回执表中（回执表只保留本任务发出的回执；可能序号超范围或已被任务边界清空）`;
+          rec.detail = 'unknown-receipt';
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+          return;
+        }
+        rec.status = 'ok';
+        rec.output = stored;
+        rec.detail = `${stored.length} chars（receipt 引用取回）`;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', receipt: Number(receiptRef[1]) });
+        return;
+      }
       // 0.5.0（§5.2）：handle 支持 request:N 别名（长上下文压缩段的取回地址）
       const handleCandidates = this.#obs.resolveHandleRef(handle);
+      // 0.6.0（PE-3）：取回前 stat 校验（文件被外部改动 → [stale] + 新 mtime/size + 重读建议）。
+      // 必须发生在任何正文返回之前：旧文不得冒充当前内容。
+      // 0.6.0 复查修复：取回点一律使用 fresh（通过守卫的候选），不再直接用 handleCandidates。
+      const { fresh: freshCandidates, staleLine: staleVerdict } = this.#filterFreshHandles(handleCandidates);
+      if (staleVerdict !== null) {
+        rec.status = 'ok';
+        rec.output = staleVerdict;
+        rec.detail = 'peek-stale';
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', handle, detail: 'peek-stale' });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'peek-stale', handle });
+        return;
+      }
+      // v1.1.0（2.3）：offset（字符级起点）/query（字面续搜）优先于 symbol/行段。
+      // 对齐 thinkflow recall.py:34：命中返回 continuation=next offset=N，未命中结构化失败。
+      const charOffset = cmd.attrs['offset'];
+      const query = cmd.attrs['query'];
+      // 再评估修正：offset 显式给出但非法（负号/非数字）时结构化失败，不静默降级到行段取回。
+      if (charOffset !== undefined && !/^\d+$/.test(charOffset)) {
+        rec.status = 'failed';
+        rec.detail = `invalid-offset:${charOffset}（tf-peek offset 须为非负整数字符位置）`;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        return;
+      }
+      if ((charOffset !== undefined && /^\d+$/.test(charOffset)) || (query !== undefined && query !== '')) {
+        // 审查修正：预算耗尽时明确发 [budget] 并 ledger，不静默返回空成功。
+        // 0.5.2：peekBudgetChars 未设（0）= 不限制——不再有隐藏的 8000 字符单次上限
+        //（那是插件替用户决定"一次能取多少"）。
+        const effectiveLimit = this.#cfg.peekBudgetChars > 0
+          ? Math.max(0, this.#cfg.peekBudgetChars - this.#peekBudgetUsed)
+          : Number.MAX_SAFE_INTEGER;
+        if (effectiveLimit <= 0) {
+          rec.status = 'ok';
+          // PE-4：拒绝文案带"已用/上限/剩余 + 建议窗口"，不让模型盲试。
+          rec.output = this.#peekBudgetLine(0);
+          rec.detail = 'peek-budget-exhausted';
+          this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+          return;
+        }
+        const picked = freshCandidates
+          .map((h) => this.#obs.recallText(h, {
+            offset: charOffset === undefined ? undefined : Number(charOffset),
+            query,
+            limit: effectiveLimit,
+          }))
+          .find((r) => r !== null) ?? null;
+        if (picked === null) {
+          // 0.5.2（审计 C-7）：query 未命中是**正常检索结果**，不是命令失败。
+          // 走 failed 会让它进 [tf-stream:error] 通道（被当成协议/执行错误计账、触发重入判定），
+          // 而模型实际需要的只是"没找到，换个 offset/先用 tf-grep"。handle 不存在才是失败。
+          if (query !== undefined && query !== '') {
+            rec.status = 'ok';
+            // 0.6.0（PE-1）：未命中必须给候选行段（行号 + 首行，≤2000 字符），按查询词命中数
+            // 排序；没有候选就真的只能盲试——这是 0.5.x 的失败点。
+            const candidates = freshCandidates
+              .flatMap((h) => this.#obs.queryCandidates(h, query, { limit: 3, maxChars: 2000 }))
+              .sort((a, b) => (b.score - a.score) || (a.line - b.line))
+              .slice(0, 3);
+            const candidateText = candidates.length === 0
+              ? ''
+              : `\n候选行段（按查询词命中数排序，≤3 条）：\n${candidates
+                .map((c) => `L${c.line} ${c.text}${c.score === 0 ? '（无查询词命中，文件头部行）' : `（命中 ${c.score} 次）`}`)
+                .join('\n')}`;
+            rec.output = `query 未命中：${query}（handle=${handle} 中不存在该字面量）。先按候选行段用 from_line/to_line 取回，或改用 offset=<字符位置> / symbol=<符号名>。${candidateText}`;
+            // 响应预算：PE-1 要求整条响应 ≤2000 字符（含提示行）。
+            if (rec.output.length > 2000) rec.output = `${rec.output.slice(0, 1990)}…（已截断）`;
+            rec.detail = 'query-not-found';
+            this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+            this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail, query, candidates: candidates.map((c) => c.line) });
+            return;
+          }
+          rec.status = 'failed';
+          rec.detail = `unknown-handle:${handle}（offset 取回）`;
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+          this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+          return;
+        }
+        rec.status = 'ok';
+        rec.output = `chars ${picked.start}-${picked.end}${picked.continuation === null ? '' : `（${picked.continuation}）`}\n${picked.text}`;
+        rec.detail = `${picked.text.length} chars（offset/query 字符级取回）`;
+        this.#peekBudgetUsed += picked.text.length;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', handle: freshCandidates[0] ?? handle, detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', handle, offset: charOffset, query, chars: picked.text.length });
+        return;
+      }
       // 0.5.0（Appendix B）：symbol 属性 → 符号定位取回（±40 行窗口；§7.2 问题 1 修复）。
       // 符号命中按窗口区间走 span 账本（recordDelivered 由 peek 结果注入时统一登记）。
       if (symbol !== undefined && symbol !== '') {
-        const symbolHit = handleCandidates
+        const symbolHit = freshCandidates
           .map((h) => this.#obs.peekBySymbol(h, symbol, this.#requestCount))
           .find((r) => r !== null) ?? null;
         if (symbolHit === null) {
@@ -3674,7 +5377,8 @@ export class SingleStreamDriver {
           return;
         }
         if (this.#cfg.peekBudgetChars > 0 && symbolHit.text.length > this.#cfg.peekBudgetChars - this.#peekBudgetUsed) {
-          const budgetLine = `[budget] 本回合取回已达上限（${this.#cfg.peekBudgetChars} 字符，已用 ${this.#peekBudgetUsed}）。请先用 tf-grep 缩小范围，或在下回合继续。`;
+          // PE-4：同样的"已用/上限/剩余 + 建议窗口"口径（符号窗口可用 from_line 收窄）。
+          const budgetLine = this.#peekBudgetLine(symbolHit.text.length);
           rec.status = 'ok';
           rec.output = budgetLine;
           rec.detail = 'peek-budget-exhausted';
@@ -3685,13 +5389,13 @@ export class SingleStreamDriver {
         rec.output = `L${symbolHit.from}-${symbolHit.to}（符号 ${symbol} 定义于 L${symbolHit.line}，±40 行窗口）\n${symbolHit.text}`;
         rec.detail = `${symbolHit.text.length} chars（symbol=${symbol} → L${symbolHit.line}）`;
         this.#peekBudgetUsed += symbolHit.text.length;
-        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', handle: handleCandidates[0] ?? handle, detail: rec.detail });
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', handle: freshCandidates[0] ?? handle, detail: rec.detail });
         this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', handle, symbol: symbol, line: symbolHit.line, chars: symbolHit.text.length });
         return;
       }
-      const spanResult = handleCandidates.length > 0 ? this.#obs.peekWithLedger(handleCandidates[0] , from, to, this.#requestCount) : null;
+      const spanResult = freshCandidates.length > 0 ? this.#obs.peekWithLedger(freshCandidates[0] , from, to, this.#requestCount) : null;
       const content = spanResult === null
-        ? (handleCandidates.length > 1 ? handleCandidates.map((h) => this.#obs.peek(h, from, to)).find((c) => c !== null) ?? null : null)
+        ? (freshCandidates.length > 1 ? freshCandidates.map((h) => this.#obs.peek(h, from, to)).find((c) => c !== null) ?? null : null)
         : (spanResult.kind === 'unchanged' ? spanResult.line : spanResult.text);
       if (spanResult === null && content === null) {
         // 同流乐观 peek（句柄所在命令还在执行）：延迟到流末 drain 后重试一次（上游语义
@@ -3713,11 +5417,18 @@ export class SingleStreamDriver {
         return;
       }
       // 0.5.0（§7.3(3)）：回合取回预算——超预算返回 [budget] 一行（不允许静默继续）。
-      if (this.#cfg.peekBudgetChars > 0 && content !== null && content.length > 0) {
+      // 0.6.0（PE-4）：`[unchanged]` 是"不重发正文"的一行指针，只计命令数、不占正文预算
+      // （它本身就是省正文的产物——再拿它扣预算等于惩罚去重）。
+      const unchangedSpan = spanResult !== null && spanResult.kind === 'unchanged';
+      rec.status = 'ok';
+      rec.output = content ?? '';
+      rec.detail = `${(content ?? '').length} chars${spanResult?.kind === 'unchanged' ? '（span 命中：不重发正文）' : spanResult?.kind === 'partial' ? `（${spanResult.note}）` : ''}`;
+      // 0.6.0（PE-4）：判定与记账用**同一个数**（实际注入块长度）——此前判定看正文、
+      // 记账看整块，会出现"判定放行、记账超限"的口径漂移。
+      if (!unchangedSpan && this.#cfg.peekBudgetChars > 0 && rec.output.length > 0) {
         const remaining = this.#cfg.peekBudgetChars - this.#peekBudgetUsed;
-        if (content.length > remaining) {
-          const budgetLine = `[budget] 本回合取回已达上限（${this.#cfg.peekBudgetChars} 字符，已用 ${this.#peekBudgetUsed}）。请先用 tf-grep 缩小范围，或在下回合继续。`;
-          rec.status = 'ok';
+        if (rec.output.length > remaining) {
+          const budgetLine = this.#peekBudgetLine(rec.output.length);
           rec.output = budgetLine;
           rec.detail = `peek-budget-exhausted: ${budgetLine}`;
           this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
@@ -3725,16 +5436,15 @@ export class SingleStreamDriver {
           return;
         }
       }
-      rec.status = 'ok';
-      rec.output = content ?? '';
-      rec.detail = `${(content ?? '').length} chars${spanResult?.kind === 'unchanged' ? '（span 命中：不重发正文）' : spanResult?.kind === 'partial' ? `（${spanResult.note}）` : ''}`;
       if (content !== null && spanResult !== undefined && spanResult !== null && spanResult.kind !== 'unchanged') {
         // 投递记账（span 账本）：本次正文进入上下文，登记已投递区间
         this.#obs.recordDelivered(spanResult.handle, spanResult.from, spanResult.to, this.#requestCount);
       }
-      if (content !== null) this.#peekBudgetUsed += content.length;
+      if (content !== null && !unchangedSpan) this.#peekBudgetUsed += rec.output.length;
+      // 与口径一致：预算与台账都记整块长度（正文长度单列，便于对账）
+      const outputChars = rec.output.length;
       this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', handle, detail: rec.detail });
-      this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', handle, chars: (content ?? '').length, spanKind: spanResult?.kind ?? 'content' });
+      this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'ok', handle, chars: outputChars, bodyChars: (content ?? '').length, spanKind: spanResult?.kind ?? 'content' });
       return;
     }
 
@@ -3748,6 +5458,11 @@ export class SingleStreamDriver {
         return;
       }
       const items = parsePlanItems(cmd.body ?? '');
+      const activeDup = planActiveDuplicates(cmd.body ?? '');
+      if (activeDup > 0) {
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'fault', fault: 'plan-active-duplicate', detail: `${activeDup} 条额外活动项声明被忽略：一次最多一个活动项（对齐上游 in_progress 唯一约束）` });
+        this.#ledgerWrite('plugin:tf-agent/plan', { revision: (this.#plan?.revision ?? 0) + 1, fault: 'plan-active-duplicate', ignored: activeDup });
+      }
       if (items.length === 0) {
         rec.status = 'failed';
         rec.detail = 'bad-plan: tf-plan body 需要至少一行验收项（格式：- [id] 描述）';
@@ -3756,13 +5471,29 @@ export class SingleStreamDriver {
         return;
       }
       // 计划修订 = 整体替换（修订必须在显式 tf-plan 里声明，不接受隐式改计划）；
-      // 已验证项在新计划中同名重声明时保留证据（显式重声明显式保留），缺席项 = 显式移除。
+      // 0.5.1（1.3）：已验证项只有在"同名 + 同文本"重声明时才保留证据——
+      // 改了验收项文本（改需求/改口径）= 旧回执不再证明新要求，一律回到 open。
       const next = new Map                        ();
       for (const item of items) {
+        // 1.2：拆分验收项文本尾部的机器谓词；谓词参与 textHash（改谓词=改验收口径）。
+        const parsed = parseAcceptancePredicate(item.text);
+        const textHash = contentFingerprint(item.text);
         const prev = this.#plan?.items.get(item.id);
-        next.set(item.id, prev !== undefined && prev.status === 'verified'
-          ? { text: item.text, status: 'verified', evidence: prev.evidence }
-          : { text: item.text, status: 'open' });
+        const keep = prev !== undefined && prev.status === 'verified' && prev.textHash === textHash;
+        if (prev !== undefined && prev.status === 'verified' && !keep) {
+          this.#record({
+            seq: ++DRIVER_SEQ, kind: 'fault', fault: 'plan-evidence-invalidated',
+            detail: `验收项 ${item.id} 文本已变更（${prev.textHash.slice(0, 8)} → ${textHash.slice(0, 8)}）：旧证据作废，回到未验证`,
+          });
+          this.#ledgerWrite('plugin:tf-agent/plan', { revision: (this.#plan?.revision ?? 0) + 1, invalidated: item.id, reason: 'text-changed' });
+        }
+        // 1.3：活动项以 in_progress 落状态（对齐上游 task_plan 单个 in_progress）；
+        // 它仍属"未验证"，final 闸不兑现。非活动项保持 open。
+        const activePart = item.active === true ? { active: true          } : {};
+        const initialStatus                         = item.active === true ? 'in_progress' : 'open';
+        next.set(item.id, keep
+          ? { text: parsed.text, textHash, status: 'verified', evidence: prev.evidence, ...activePart, ...(parsed.predicate === null ? {} : { predicate: parsed.predicate }), ...(prev.verification === undefined ? {} : { verification: prev.verification }) }
+          : { text: parsed.text, textHash, status: initialStatus, ...activePart, ...(parsed.predicate === null ? {} : { predicate: parsed.predicate }) });
       }
       const revision = (this.#plan?.revision ?? 0) + 1;
       this.#plan = { revision, items: next };
@@ -3786,10 +5517,176 @@ export class SingleStreamDriver {
       }
       const timeoutAttr = cmd.attrs['timeout'];
       const timeoutMs = timeoutAttr !== undefined && /^\d+$/.test(timeoutAttr) ? Number(timeoutAttr) : this.#cfg.codeTimeoutMs;
+      // b 通道 PTC 对齐（第 2 轮）：解析 format/state/sandbox 属性 → PTC resolve 扩展。
+      const formatAttr = cmd.attrs['format'];
+      const programFormat = formatAttr === 'function-body' || formatAttr === 'repl' || formatAttr === 'script' ? formatAttr : undefined;
+      if (formatAttr !== undefined) {
+        // 再评估修正：format 请求必须落 ledger（可复算），且如实标注"实际形态由宿主决定"。
+        this.#ledgerWrite('plugin:tf-agent/code', {
+          cmdId: cmd.id, requestedFormat: formatAttr, accepted: programFormat !== undefined,
+          note: '实际执行形态由宿主 runtime.programFormat 决定，插件不改写 resolve',
+        });
+        if (programFormat === undefined) {
+          this.#warn(`tf-code ${cmd.id} 的 format=${formatAttr} 非法（应 function-body|repl|script），已忽略`);
+        }
+      }
+      const stateAttr = cmd.attrs['state'];
+      // 审查修正：release 判断必须在 owner 创建之前——否则"释放一个从未建立的状态域"
+      // 会先被创建再释放，永远不报 state-not-found（隐藏拼写错误）。
+      if (cmd.attrs['release'] === 'true') {
+        const releaseState = stateAttr ?? '';
+        const known = this.#codeStateOwners.get(releaseState);
+        if (known === undefined) {
+          rec.status = 'failed';
+          rec.detail = `state-not-found:${releaseState || '(未指定 state)'}（无保留态可释放；用 tf-code state="名" 先建立状态域）`;
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+          this.#ledgerWrite('plugin:tf-agent/code', { release: releaseState, cmdId: cmd.id, status: 'failed', reason: 'state-not-found' });
+          return;
+        }
+        const runtime = this.#ports.ptcRuntimeRelease;
+        // 再评估修正：无释放端口时不得"什么都没释放却报成功"——判 failed 并保留身份映射。
+        if (runtime === undefined) {
+          rec.status = 'failed';
+          rec.detail = `release-unavailable:${releaseState}（宿主未提供 ptcRuntimeRelease，无法清空保留态；身份映射保留供重试）`;
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+          this.#ledgerWrite('plugin:tf-agent/code', { release: releaseState, cmdId: cmd.id, status: 'failed', reason: 'release-unavailable' });
+          return;
+        }
+        try {
+          // 0.5.3 修复：这里此前写的是 `runtime(owner)`，而 `owner` 在该作用域里从未声明
+          // （`let owner` 在下方 state 分支的块内）——运行时抛 ReferenceError 被 catch 吞成
+          // "release-failed"，于是 release=true 永远释放不了宿主保留态。
+          await runtime(known.owner);
+          this.#codeStateOwners.delete(releaseState);
+          rec.status = 'ok';
+          rec.detail = `state released: ${releaseState}`;
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'ok', detail: rec.detail });
+          this.#ledgerWrite('plugin:tf-agent/code', { release: releaseState, cmdId: cmd.id, status: 'ok' });
+        } catch (error) {
+          rec.status = 'failed';
+          rec.detail = `release-failed:${releaseState}（${error instanceof Error ? error.message : String(error)}）`;
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+          this.#ledgerWrite('plugin:tf-agent/code', { release: releaseState, cmdId: cmd.id, status: 'failed', reason: 'release-failed' });
+          this.#warn(`tf-code release ${releaseState} 失败`, error);
+        }
+        return; // 只释放，不执行程序体
+      }
+      let stateOwner                    ;
+      // 0.5.2（审计 M5）：stateOwner 的"策略未变"门——宿主按对象身份保留内存态，
+      // 若本次 sandbox 策略与建立该状态域时不同，继续传同一个 owner 等于让旧程序在
+      // **更宽的**沙箱里带着旧内存继续跑。策略一旦变化就换身份（旧态自然失效）。
+      const sandboxAttr = cmd.attrs['sandbox'];
+      const requestedMode = sandboxAttr === undefined ? undefined : normalizeSandboxMode(sandboxAttr);
+      if (sandboxAttr !== undefined && requestedMode === undefined) {
+        rec.status = 'failed';
+        rec.detail = `invalid-attribute: sandbox="${sandboxAttr}" 不在白名单内（read-only | workspace-write | danger-full-access）`;
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/code', { cmdId: cmd.id, status: 'failed', reason: 'invalid-sandbox-mode' });
+        return;
+      }
+      // ---- 0.5.3：单次提权（宿主 run_code 的 sandbox_permissions/justification 同构）----
+      // 宿主语义（dsh-tool-executor-ptc/src/ptc.ts）：两个参数必须成对出现；审批只覆盖**本次**
+      // 程序执行；提权后的这次执行**不携带 stateOwner**（旧内存态不得在更宽策略里复活）。
+      const escalationAttr = cmd.attrs['sandbox_permissions'];
+      const justificationAttr = cmd.attrs['justification'];
+      let escalated                                               ;
+      if ((escalationAttr === undefined) !== (justificationAttr === undefined)) {
+        rec.status = 'failed';
+        rec.detail = 'invalid-attribute: sandbox_permissions 与 justification 必须成对出现（提权需要一句理由给用户看）';
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/code', { cmdId: cmd.id, status: 'failed', reason: 'escalation-pair-missing' });
+        return;
+      }
+      if (escalationAttr !== undefined) {
+        const target = normalizeSandboxMode(escalationAttr);
+        if (target === undefined || target === 'read-only') {
+          rec.status = 'failed';
+          rec.detail = `invalid-attribute: sandbox_permissions="${escalationAttr}" 不是合法的提权目标（只允许 workspace-write | danger-full-access）`;
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+          this.#ledgerWrite('plugin:tf-agent/code', { cmdId: cmd.id, status: 'failed', reason: 'invalid-escalation-target' });
+          return;
+        }
+        const standing = this.#ports.resolveSandboxPolicy?.();
+        const approve = this.#ports.approveEscalation;
+        const standingMode = (standing                                  )?.mode;
+        if (standing === undefined || approve === undefined || typeof standingMode !== 'string') {
+          rec.status = 'failed';
+          rec.detail = 'escalation-unavailable: 宿主未提供沙箱策略/审批服务，无法提权（不要绕过沙箱；改道声明能力或请用户调整策略）';
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+          this.#ledgerWrite('plugin:tf-agent/code', { cmdId: cmd.id, status: 'failed', reason: 'escalation-unavailable' });
+          return;
+        }
+        try {
+          const approvedMode = await approve(
+            {
+              requestedMode: target,
+              justification: justificationAttr ?? '',
+              effectiveMode: standingMode,
+              subject: 'program',
+            },
+            {
+              ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
+              callId: cmd.id,
+              toolName: 'tf-code',
+              signal: this.#commandSignal(),
+            },
+          );
+          escalated = { policy: { ...(standing                           ), mode: approvedMode }, mode: approvedMode };
+          this.#ledgerWrite('plugin:tf-agent/code', { cmdId: cmd.id, escalation: 'approved', from: standingMode, to: approvedMode, note: '单次生效，不落盘' });
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          rec.status = 'failed';
+          rec.detail = `escalation-denied: ${detail}`;
+          this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+          this.#ledgerWrite('plugin:tf-agent/code', { cmdId: cmd.id, status: 'failed', reason: 'escalation-denied', detail: detail.slice(0, 200) });
+          return;
+        }
+      }
+      if (stateAttr !== undefined && stateAttr !== '' && escalated !== undefined) {
+        // 宿主同构：提权执行不携带 stateOwner——旧内存态不得在新策略下复活。
+        this.#ledgerWrite('plugin:tf-agent/code', {
+          cmdId: cmd.id, state: stateAttr, dropped: true, reason: 'sandbox 单次提权：本次执行不携带 stateOwner',
+        });
+        this.#warn(`tf-code state="${stateAttr}" 在提权执行中不生效（宿主契约：策略变化后的执行使用全新环境）`);
+      }
+      if (stateAttr !== undefined && stateAttr !== '' && escalated === undefined) {
+        const known = this.#codeStateOwners.get(stateAttr);
+        if (known !== undefined && known.mode !== requestedMode) {
+          this.#ledgerWrite('plugin:tf-agent/code', {
+            cmdId: cmd.id, state: stateAttr, dropped: true,
+            reason: `sandbox 策略变化（${known.mode ?? 'default'} → ${requestedMode ?? 'default'}）`,
+          });
+          this.#warn(`tf-code state="${stateAttr}" 的沙箱策略已变化（${known.mode ?? 'default'} → ${requestedMode ?? 'default'}）：保留态按宿主契约作废（不跨策略复用内存）`);
+          this.#codeStateOwners.delete(stateAttr);
+        }
+        let owner = this.#codeStateOwners.get(stateAttr)?.owner;
+        if (owner === undefined) {
+          owner = {};
+          this.#codeStateOwners.set(stateAttr, { owner, ...(requestedMode === undefined ? {} : { mode: requestedMode }) });
+        }
+        stateOwner = owner;
+      }
+      const sandboxPolicy = escalated !== undefined
+        ? escalated.policy
+        : (requestedMode !== undefined && this.#ports.resolveSandboxPolicy !== undefined
+          ? this.#ports.resolveSandboxPolicy(requestedMode)
+          : undefined);
+      // errorClass：对齐宿主 ptc.ts:691 的 ToolCallError 契约（bindings namespace 类型化拒绝）。
+      // 插件不改宿主语义，只在启用 PTC 扩展时带上同一契约值。
+      const errorClass = stateOwner !== undefined || sandboxPolicy !== undefined
+        ? { name: 'ToolCallError', memberNameProperty: 'toolName' }
+        : undefined;
+      const ptc                                                                    =
+        stateOwner === undefined && sandboxPolicy === undefined && errorClass === undefined
+          ? undefined
+          : { ...(stateOwner === undefined ? {} : { stateOwner }), ...(sandboxPolicy === undefined ? {} : { sandboxPolicy }), errorClass };
       let outcome;
       try {
         outcome = await executor({
+          ...(ptc === undefined ? {} : { ptc }),
           callId: cmd.id,
+          // 宿主契约：子调用审计事件带 rootCallId（缺省时宿主取 callId；这里显式给出）。
+          rootCallId: cmd.id,
           code: cmd.body ?? '',
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
           // K4：回合 signal 直通（cancel 传导到 runtime；不再用独立且永不触发的 controller）
@@ -3807,12 +5704,14 @@ export class SingleStreamDriver {
         this.#warn(`tf-code ${cmd.id} 执行异常`, error);
         return;
       }
-      // 观测登记（code 族：成功 high 首次/变化注骨架；失败一律 high）
+      // 观测登记（code 族：成功 full 首次/变化注骨架；失败一律 full）
+      // 0.5.2（审计 M10）：观测正文 = logs + result 并列（宿主体裁），句柄取回也能拿到日志。
+      const codeOutput = joinCodeOutput(outcome.valueJson, outcome.logs);
       const observation = this.#obs.observe({
         tool: 'tf-code',
         ok: outcome.ok,
         key: observationKey(cmd),
-        content: outcome.ok ? (outcome.valueJson ?? '') : (outcome.error ?? 'unknown'),
+        content: outcome.ok ? codeOutput : joinCodeOutput(undefined, outcome.logs, outcome.error ?? 'unknown'),
         callId: cmd.id,
       });
       rec.observation = observation;
@@ -3828,7 +5727,7 @@ export class SingleStreamDriver {
         this.#record({
           seq: ++DRIVER_SEQ, kind: 'sandbox',
           cmdId: cmd.id, mode: sandbox.mode, enforcement: sandbox.enforcement,
-          deniedCount: sandbox.denied?.length ?? 0,
+          denied: sandbox.denied === true,
         });
         this.#ledgerWrite('plugin:tf-agent/command', {
           cmdId: cmd.id, name: cmd.name, sandbox: true,
@@ -3838,22 +5737,33 @@ export class SingleStreamDriver {
       }
       if (!outcome.ok) {
         rec.status = 'failed';
-        // K3 结构化失败注入：kind + 可重试结论 + 建议 + 日志尾（200 字符）。
+        // K3 结构化失败注入：kind + 可重试结论 + 诊断（含沙箱事实）+ 程序日志正文。
+        // 0.5.2（审计 M10）：宿主把一次运行的输出渲染成 {logs, sandbox, result} 并列三元组
+        //（`logs.join("\n")` 与 `result` 同块回给模型）。0.5.1 只回 200 字符 "logs tail"，
+        // 于是程序自己打印的诊断被丢弃——模型看到 "exit 1" 却看不到原因，只能盲改。
         const kind = outcome.kind ?? 'exception';
         const retryable = outcome.retryable === true;
-        const logsTail = outcome.logs === undefined ? '' : `\nlogs tail: ${outcome.logs.slice(-200)}`;
-        rec.detail = `[kind=${kind} retry=${retryable ? 'yes' : 'no'}] ${outcome.error ?? 'unknown'}${logsTail}`.slice(0, 800);
+        const head = `[kind=${kind} retry=${retryable ? 'yes' : 'no'}] ${outcome.error ?? 'unknown'}`;
+        const logsBody = codeLogsBody(outcome.logs, this.#cfg.codeValueInjectLimit);
+        rec.detail = logsBody === null ? head : `${head}\n${logsBody}`;
         this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
-        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', kind, retryable, detail: (outcome.error ?? '').slice(0, 200) });
+        this.#ledgerWrite('plugin:tf-agent/command', {
+          cmdId: cmd.id, name: cmd.name, status: 'failed', kind, retryable,
+          logsChars: (outcome.logs ?? '').length,
+          detail: (outcome.error ?? '').slice(0, 200),
+        });
         return;
       }
       rec.status = 'ok';
-      rec.detail = `${(outcome.valueJson ?? '').length} chars${outcome.logs === undefined ? '' : ` + logs ${outcome.logs.length} chars`}`;
+      const valueJson = outcome.valueJson ?? '';
+      const logsBody = codeLogsBody(outcome.logs, this.#cfg.codeValueInjectLimit);
+      rec.detail = `${valueJson.length} chars${logsBody === null ? '' : ` + logs ${(outcome.logs ?? '').length} chars`}`;
       // F3：首成功/变化结果完整注入——值在上限内时挂到 rec.output（need_result 通道），
       // 超限保持骨架 + 句柄形态（中间结果不回灌的红线不破）。
-      const valueJson = outcome.valueJson ?? '';
-      if (observation.payload.kind === 'skeleton' && valueJson.length <= this.#cfg.codeValueInjectLimit) {
-        rec.output = valueJson;
+      // 0.5.2：上限 0 = 不限制；logs 与 result 并列注入，超预算只截 logs、不吞 result。
+      if (observation.payload.kind === 'skeleton') {
+        const inject = joinCodeOutput(valueJson, outcome.logs, undefined, this.#cfg.codeValueInjectLimit);
+        if (inject.trim() !== '') rec.output = inject;
       }
       // F5：tf-code 成功（有回执）→ 声明的验收项记为已验证（证据 = 命令 id + 值指纹）
       this.#markAccepts(cmd, rec.handle, contentFingerprint(valueJson));
@@ -3904,6 +5814,26 @@ export class SingleStreamDriver {
     } else {
       mapped = this.#cfg.toolMapping.toToolCall(cmd);
     }
+    // ---- 0.6.0 收口（核验 P1-1）：tf-call 旁路封堵——通用调用体的路径参数命中密钥模式即拒
+    //（tf-read 拒读不能是纸面闸门：模型改用 tf-call name="read" {"path":".env"} 即可绕过）。
+    // 判定用与 tf-read 同一套 isSecretPath；出路文案一致（allowSensitivePaths / 脱敏副本）。---
+    if (cmd.name === 'tf-call' && this.#configRef.allowSensitivePaths !== true && mapped !== null) {
+      const argsRecord = mapped.arguments                                       ;
+      let hitPath                = null;
+      if (argsRecord !== null && typeof argsRecord === 'object' && !Array.isArray(argsRecord)) {
+        for (const key of PATH_ARG_KEYS) {
+          const value = argsRecord[key];
+          if (typeof value === 'string' && value !== '' && isSecretPath(value)) { hitPath = value; break; }
+        }
+      }
+      if (hitPath !== null) {
+        rec.status = 'failed';
+        rec.detail = secretReadRefusalDetail(hitPath);
+        this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
+        this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', kind: 'secret-path-via-call', detail: rec.detail.slice(0, 200) });
+        return;
+      }
+    }
     // F6 写前意图：变更类命令（tf-write/tf-edit/tf-append）在派发到宿主工具**之前**落盘（fsync）。
     // 崩溃后"有意图无回执"即可判定写入可能已发生 → resume 停机核对。零注入：只进账本。
     const intentOp                                     = cmd.name === 'tf-write'
@@ -3914,6 +5844,8 @@ export class SingleStreamDriver {
           ? 'append'
           : null;
     if (intentOp !== null) {
+      // 0.6.0 正式版（changes 缺口）：写前 before 快照（回执的恢复依据；fail-open）。
+      this.#captureChangeBefore(cmd);
       try {
         this.#ports.onIntent?.({
           cmdId: cmd.id,
@@ -3931,10 +5863,11 @@ export class SingleStreamDriver {
         // tf-edit body 标记解析失败等：映射层无法产出参数——结构化失败，不静默改全文。
         rec.status = 'failed';
         rec.detail = cmd.name === 'tf-edit'
-          ? 'tf-edit body 解析失败：需要 "<<<<<<< OLD" / "=======" / ">>>>>>> NEW" 三行标记各出现一次且顺序正确（结构化失败，不做模糊匹配、不改全文）'
+          ? 'tf-edit body 解析失败：需要三行标记 "<<<<<<< OLD" / "=======" / ">>>>>>> NEW" 各出现一次且顺序正确，或上游写法 <old>…</old><new>…</new>（结构化失败，不做模糊匹配、不改全文）'
           : `no-tool-mapping:${cmd.name}`;
         this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
         this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail.slice(0, 200) });
+        this.#settleChange(cmd, false);
         return;
       }
       // v0.3.0（会话格式修复）：先广告 tool-call 生命周期，再让宿主工具管线落 tool/call。
@@ -3981,6 +5914,7 @@ export class SingleStreamDriver {
       }
       this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
       this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail.slice(0, 200) });
+      this.#settleChange(cmd, false);
       return;
     }
 
@@ -3996,7 +5930,7 @@ export class SingleStreamDriver {
     const contentText = blockTextOf(first?.result?.content);
     const isError = first?.result?.isError === true;
 
-    // ---- 观测登记（O1 三档返回；失败一律 high）。v0.4.0：tf-call 按宿主工具名分族
+    // ---- 观测登记（O1 三档返回；失败一律 full）。v0.4.0：tf-call 按宿主工具名分族
     // （familyHint 语义：web/skill/agent/ask → high 候选，office/goal → 低增益回执）----
     const observation = this.#obs.observe({
       tool: cmd.name === 'tf-call' ? (cmd.attrs['name'] ?? 'tf-call')
@@ -4009,6 +5943,28 @@ export class SingleStreamDriver {
       callId: cmd.id,
     });
     rec.observation = observation;
+    // 0.6.0（PE-3）：tf-read 成功 → 登记句柄的文件快照（path/mtimeMs/size）；
+    // tf-peek 之前用它做 stat 校验——文件被外部改动后不得把旧文冒充当前内容。
+    if (cmd.name === 'tf-read' && !isError) this.#registerFileBinding(cmd, observation.handle);
+    // 4.1：tf-read 成功 → 登记文件读观察（全文或行段），供后续 tf-edit/append 的 revision 守卫。
+    if (cmd.name === 'tf-read' && !isError && this.#ports.revisionFacts !== undefined) {
+      const readPath = cmd.attrs['path'] ?? '';
+      const rev = this.#ports.revisionFacts.revision(readPath);
+      if (rev !== null) {
+        const off = cmd.attrs['offset'];
+        const lim = cmd.attrs['limit'];
+        const hasRange = off !== undefined || lim !== undefined;
+        const start = off !== undefined && /^\d+$/.test(off) ? Number(off) : 1;
+        const end = lim !== undefined && /^\d+$/.test(lim) ? start + Number(lim) : Number.MAX_SAFE_INTEGER;
+        this.#revisionGuard.observeRead(readPath, rev, hasRange ? { start, end } : undefined);
+      }
+    }
+    // 4.1：写后推进版本（避免连续编辑被自身写入的版本前进误判冲突）。
+    if ((cmd.name === 'tf-write' || cmd.name === 'tf-edit' || cmd.name === 'tf-append') && !isError && this.#ports.revisionFacts !== undefined) {
+      const writePath = cmd.attrs['path'] ?? '';
+      const rev = this.#ports.revisionFacts.revision(writePath);
+      if (rev !== null) this.#revisionGuard.noteWrite(writePath, rev);
+    }
     this.#record({
       seq: ++DRIVER_SEQ, kind: 'observation',
       handle: observation.handle, key: observationKey(cmd),
@@ -4017,7 +5973,9 @@ export class SingleStreamDriver {
 
     if (isError) {
       rec.status = 'failed';
-      rec.detail = contentText.slice(0, 500);
+      // 0.6.0 收口（核验 P1-2）：失败细节原样回灌模型——先过 redactSecrets（工具输出可能带
+      // `password=...`；观测面已脱敏，这条错误面此前漏网）。
+      rec.detail = redactSecrets(contentText).slice(0, 500);
       rec.handle = observation.handle ?? undefined;
       // F6 写后回执（工具级失败路径）：意图闭合为"已发生但失败"
       if (intentOp !== null) {
@@ -4029,10 +5987,17 @@ export class SingleStreamDriver {
       }
       this.#record({ seq: ++DRIVER_SEQ, kind: 'command', id: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail });
       this.#ledgerWrite('plugin:tf-agent/command', { cmdId: cmd.id, name: cmd.name, status: 'failed', detail: rec.detail.slice(0, 200) });
+      this.#settleChange(cmd, false);
       return;
     }
 
     rec.status = 'ok';
+    // 0.5.1（1.1）：阻塞式提问的 pending 形态 → 本回合 awaiting（用户在 UI 里还能回答）。
+    // 宿主 dsh-tool-ask-user 的 timed ask 在等待超时后返回 {pending:true,...}；
+    // 有答案批次时返回 {answers:[...]}——后者不是 awaiting，模型应继续工作。
+    if (cmd.name === 'tf-ask' && /"pending"\s*:\s*true/.test(contentText)) {
+      this.#askPending = { cmdId: cmd.id, question: cmd.attrs['q'] ?? '' };
+    }
     // v0.4.2：detail 显示**写入正文的大小**（cmd.body = 解析器捕获的原文长度）——
     // 旧实现显示 contentText.length（回执包装 `<path>...Created file...</content>`
     // 的自身长度 ≈144 字符），模型误读为"文件只有 144 字符"→ 触发全量重写
@@ -4050,6 +6015,8 @@ export class SingleStreamDriver {
       } catch (receiptError) {
         this.#warn('F6 意图回执落盘失败（fail-open）', receiptError);
       }
+      // 0.6.0 正式版（changes 缺口）：写后结算回执（before/after 快照 + 守卫回滚依据）。
+      this.#settleChange(cmd, true);
     }
     // F5：命令成功（有回执）→ 声明的验收项记为已验证（证据 = 命令 id + 句柄/指纹）
     this.#markAccepts(cmd, rec.handle, contentFingerprint(contentText));
@@ -4102,7 +6069,9 @@ export class SingleStreamDriver {
     const results = (result?.results ?? []).map((r) => ({
       callId: r.callId,
       name: calls.find((c) => c.id === r.callId)?.name ?? 'unknown',
-      content: blockTextOf(r.result?.content),
+      // 0.6.0 收口（核验 P1-2）：原生通道结果直接整段回灌（tool-result 注入块）——
+      // 全文面必须先脱敏；句柄化路径的 observe() 会再跑一次幂等 redact，不叠加副作用。
+      content: redactSecrets(blockTextOf(r.result?.content)),
       isError: r.result?.isError === true,
     }));
     for (const _call of calls) this.#ports.onToolSettled?.();
@@ -4127,8 +6096,10 @@ export class SingleStreamDriver {
     // F4：仅在声明了 nativeToolSchemas（原生通道显式启用）时执行上限策略——
     // 首成功/短结果完整注入；超限块登记 obs 并转"骨架 + 句柄"，杜绝全量回灌。
     const capped = this.#cfg.nativeToolSchemasEnabled === true;
+    const nativeCap = this.#cfg.nativeResultLimit;
     const blocks = results.map((r) => {
-      if (!capped || r.isError || r.content.length <= this.#cfg.nativeResultLimit) {
+      // 0.5.2：cap = 0 → 不限制（不句柄化，全文注入）。
+      if (!capped || r.isError || nativeCap <= 0 || r.content.length <= nativeCap) {
         const nativeFull = `[tf-stream:tool-result callId=${r.callId} tool=${r.name}${r.isError ? ' isError=true' : ''}]\n${r.content}`;
         // v0.4.3（P0-7①）：上限内/未启用上限策略 = full（错误块如实计 full——它是实发内容）
         this.#noteFeedback('full', nativeFull);
@@ -4150,7 +6121,7 @@ export class SingleStreamDriver {
         handle: observation.handle, key: `native:${r.name}:${r.callId}`,
         infoGain: observation.info_gain, reason: `${observation.reason}:native-capped`,
       });
-      const nativeCapped = `[tf-stream:tool-result callId=${r.callId} tool=${r.name}] ${r.content.length} 字符超出原生通道注入上限（${this.#cfg.nativeResultLimit}），已句柄化：${skeleton}\n（原文用 tf-peek handle="${observation.handle ?? ''}" from_line=.. to_line=.. 取回）`;
+      const nativeCapped = `[tf-stream:tool-result callId=${r.callId} tool=${r.name}] ${r.content.length} 字符超出原生通道注入上限（${nativeCap}），已句柄化：${skeleton}\n（原文用 tf-peek handle="${observation.handle ?? ''}" from_line=.. to_line=.. 取回）`;
       // v0.4.3（P0-7①）：超限句柄化 = handle
       this.#noteFeedback('handle', nativeCapped);
       return {
@@ -4163,6 +6134,52 @@ export class SingleStreamDriver {
   }
 
   #pendingNativeBlocks                                           = [];
+
+  /** 0.5.2（审计 D1）：待注入的一次性提示（目前只有"交付校验：可运行脚本清单"）。
+   *  来源在回放/收束路径（#runVerifications），注入点在下一请求的易变尾。 */
+  #pendingNotes           = [];
+
+  /**
+   * 1.2（审计 D1）：交付构建校验的宿主实现——把 `{name:'bash', cmd}` 形式的校验命令
+   * 经 `toolMapping` 转成宿主真实工具调用（`tf-bash` → 宿主 shell = `pwsh{command,description}`）。
+   *
+   * 为什么必须走映射：0.5.1 的兜底实现硬编码 `name:'bash', arguments:{cmd}`，
+   * 而 DSH 宿主的 shell 工具是 `pwsh`（command/description 双必填）——于是**只要项目里有
+   * package.json**，每次收束都拿到 "unknown tool bash"，被判构建失败 → blocked。
+   * 走映射还顺带尊重用户自定义 toolMapping（不同宿主方言）。
+   */
+  #hostVerificationRunner()                                                                                                                                                                 {
+    if (this.#ports.executeTools === undefined) return undefined;
+    return async (commands) => {
+      const details           = [];
+      for (const c of commands) {
+        const mapped = this.#cfg.toolMapping.toToolCall({
+          name: 'tf-bash', id: `verify-${c.purpose}`, attrs: { cmd: c.cmd }, depends_on: [], seq: 0,
+        });
+        if (mapped === null) return { ok: false, detail: `${c.cmd}: toolMapping 拒绝映射（无 shell 工具可用）` };
+        let first                                                                   ;
+        try {
+          const result = await this.#ports.executeTools({
+            calls: [{ type: 'tool-call', id: `verify-${c.purpose}`, name: mapped.name, arguments: JSON.stringify(mapped.arguments) }],
+            signal: this.#commandSignal(),
+            maxParallelToolCalls: 1,
+            ...(this.#agentRef === undefined ? {} : { agent: this.#agentRef }),
+          });
+          first = result.results?.[0]                ;
+        } catch (error) {
+          return { ok: false, detail: `${c.cmd}: ${error instanceof Error ? error.message : String(error)}` };
+        }
+        const text = redactSecrets(blockTextOf(first?.result?.content));
+        if (first === undefined || first.result?.isError === true) {
+          // 失败原因原样回给模型（审计 C-5：截断 300 字符后"构建失败"无法定位）。
+          // 0.6.0 收口（核验 P1-2）：构建输出可能含 .env 回显/带值赋值——回灌前脱敏。
+          return { ok: false, detail: `${c.cmd}（经 ${mapped.name}）: ${text.slice(0, 4000) || 'no result'}` };
+        }
+        details.push(c.cmd);
+      }
+      return { ok: true, detail: `verified: ${details.join(' → ')}` };
+    };
+  }
 
   // ------------------------------------------------------------------ drain / 收束
 
@@ -4258,7 +6275,7 @@ export class SingleStreamDriver {
       }
     }
 
-    // 2. high 观测反馈（info_gain=high；none/low 永不注入；final-only 停止）
+    // 2. full 观测反馈（info_gain=full；dedup/handle 永不注入；final-only 停止）
     //    v0.2 语义对齐上游 ThinkFlow："成功结果按序完整反馈一次"（省 token 的主因是消灭回合数，
     //    不是骨架——2026-11-15 真连证据：模型不 peek 直接幻觉确认，R2/R4/C1 因此失败）。
     //    tf-read 成功 → 注入完整原文；超过 READ_FEEDBACK_LIMIT 截断为中段省略 + 头尾保留，
@@ -4271,7 +6288,7 @@ export class SingleStreamDriver {
         : Number.POSITIVE_INFINITY;
       for (const rec of this.#commands.values()) {
         const obs = rec.observation;
-        if (obs === undefined || obs.info_gain !== 'high') continue;
+        if (obs === undefined || obs.info_gain !== 'full') continue;
         // 失败命令的 obs 也是 high，但失败走结构化错误块，这里跳过（避免双重注入）
         if (rec.status !== 'ok') continue;
         if (obs.payload.kind !== 'skeleton') continue;
@@ -4299,10 +6316,13 @@ export class SingleStreamDriver {
           if (selfWritten) {
             const lines = full === null ? 'unknown' : String(full.split('\n').length);
             const fp = full === null ? 'unavailable' : contentFingerprint(full);
-            const receiptContent = `[tf-stream:receipt handle=${obs.handle ?? ''} path=${rec.cmd.attrs['path']} lines=${lines} sha256=${fp}]`
+            // 0.5.2（审计 C-6）：回执编号入册，模型此后可用 `tf-peek handle="receipt:N"` 复读。
+            const receiptNo = ++this.#receiptSeq;
+            const receiptContent = `[tf-stream:receipt handle=${obs.handle ?? ''} path=${rec.cmd.attrs['path']} lines=${lines} sha256=${fp} receipt=${receiptNo}]`
               + `\n该路径由你本任务的 tf-write 写入，写入成功（写失败会有 [tf-stream:error]；没有错误注入即写成功）。`
               + `写入正文不回灌（回验纪律）——若它是在更早的流步骤写的，你当前上下文里没有原文。`
-              + `需要原文（全量或行段）用 tf-peek handle="${obs.handle}" 取回；需要修改用 tf-edit 的 OLD 精确字面量可先 tf-peek 取回后再改。`;
+              + `需要原文（全量或行段）用 tf-peek handle="${obs.handle}" 取回；需要复读本回执用 tf-peek handle="receipt:${receiptNo}"。`;
+            this.#receipts.set(receiptNo, receiptContent);
             blocks.push({
               role: 'user',
               // v0.4.2 文案修正：写入正文不回灌——跨流步骤后"全文已在你的上下文中"是假的
@@ -4319,7 +6339,7 @@ export class SingleStreamDriver {
           if (spanView !== null && spanView.kind === 'unchanged') {
             const unchanged = `[tf-stream:observation handle=${obs.handle ?? ''} key=${observationKey(rec.cmd)}]\n${spanView.line}`;
             blocks.push({ role: 'user', content: unchanged });
-            this.#noteFeedback('handle', unchanged);
+            this.#noteFeedback('dedup', unchanged);
             highInjected = true;
             continue;
           }
@@ -4331,17 +6351,17 @@ export class SingleStreamDriver {
             if (obs.handle !== null) {
               this.#obs.recordDelivered(obs.handle, spanView.from, spanView.to, this.#requestCount);
             }
-            this.#noteFeedback('handle', partialContent);
+            this.#noteFeedback('dedup', partialContent);
             highInjected = true;
             continue;
           }
           // 0.5.0（§7.3(1) + §7.5 双旋钮）：读取侧超上限（maxReadChars）→ 行锚索引 +
           // 未投递区间（D4 修复：头部截断策略本身制造取回）；peekIndex=false（回退点）→
           // 回到 0.4.x 头部截断形态。
-          if (this.#cfg.peekIndex && full !== null && full.length > this.#cfg.maxReadChars) {
+          if (this.#cfg.peekIndex && this.#cfg.maxReadChars > 0 && full !== null && full.length > this.#cfg.maxReadChars) {
             const spans = this.#obs.deliveredSpanList(obs.handle ?? '')
               .map((s) => ({ from: s.from, to: s.to }));
-            const indexText = renderReadIndex(full, { delivered: spans });
+            const indexText = renderReadIndex(full, { delivered: spans, anchorEvery: this.#cfg.peekAnchorEvery });
             body = `${indexText}\n（正文超过读取上限 ${this.#cfg.maxReadChars} 字符：只投索引；用 tf-peek handle="${obs.handle}" from_line=.. to_line=.. 按窗口取回）`;
             feedbackClass = 'handle';
           } else {
@@ -4396,18 +6416,29 @@ export class SingleStreamDriver {
     }
 
     // 3. tf-peek 结果（need_result 通道；high-only/final-only 档暂停——预算紧张先保失败通道）
+    // 0.6.0 正式版：tf-changes/tf-diff/tf-revert 的结果走同一 need_result 通道
+    //（插件侧命令，不经宿主工具观测；结果必须模型可见，否则回执目录/差分/回滚回执全是死信息）。
     if (level === 'normal') {
       for (const rec of this.#commands.values()) {
-        if (rec.cmd.name !== 'tf-peek' || rec.status !== 'ok') continue;
-        if (this.#reportedPeeks.has(rec.cmd.id)) continue;
-        this.#reportedPeeks.add(rec.cmd.id);
-        const peekContent = `[tf-stream:peek handle=${rec.cmd.attrs['handle'] ?? ''} lines=${rec.cmd.attrs['from_line'] ?? 1}-${rec.cmd.attrs['to_line'] ?? 'end'}]\n${rec.output ?? ''}`;
-        blocks.push({
-          role: 'user',
-          content: peekContent,
-        });
-        // v0.4.3（P0-7①）：peek 是模型的显式取回请求 → 全量回灌
-        this.#noteFeedback('full', peekContent);
+        if (rec.status !== 'ok') continue;
+        if (rec.cmd.name === 'tf-peek') {
+          if (this.#reportedPeeks.has(rec.cmd.id)) continue;
+          this.#reportedPeeks.add(rec.cmd.id);
+          const peekContent = `[tf-stream:peek handle=${rec.cmd.attrs['handle'] ?? ''} lines=${rec.cmd.attrs['from_line'] ?? 1}-${rec.cmd.attrs['to_line'] ?? 'end'}]\n${rec.output ?? ''}`;
+          blocks.push({
+            role: 'user',
+            content: peekContent,
+          });
+          // 0.5.1（2.2）：peek 是模型的显式取回请求——正常回灌记 full；
+          // 命中已投递区间（[unchanged] 一行）记 dedup，字节口径可复算。
+          this.#noteFeedback(rec.output?.startsWith('[unchanged]') === true ? 'dedup' : 'full', peekContent);
+        } else if (rec.cmd.name === 'tf-changes' || rec.cmd.name === 'tf-diff' || rec.cmd.name === 'tf-revert') {
+          if (this.#reportedPeeks.has(rec.cmd.id)) continue;
+          this.#reportedPeeks.add(rec.cmd.id);
+          const changeContent = `[tf-stream:${rec.cmd.name.slice(3)} id=${rec.cmd.id}]\n${rec.output ?? ''}`;
+          blocks.push({ role: 'user', content: changeContent });
+          this.#noteFeedback('full', changeContent);
+        }
       }
     }
 
@@ -4440,6 +6471,12 @@ export class SingleStreamDriver {
       // S5 端口在位（真实宿主 systemPrompt.context）→ 变化即推送快照（替换旧快照语义）；
       // 代码通道只走这条路（无回灌），标准通道两条都通。
       if (digest !== null) this.#pushRuntimeContext(digest);
+    }
+
+    // 4.6 0.5.2（审计 D1）：一次性提示（交付校验：可运行脚本清单等）——只发一次。
+    if (this.#pendingNotes.length > 0) {
+      for (const note of this.#pendingNotes) blocks.push({ role: 'user', content: note });
+      this.#pendingNotes = [];
     }
 
     // 5. 原生 tool_call 结果（阻塞通道回灌，任意档都注入——它们是模型的即时需求）
@@ -4477,6 +6514,8 @@ export class SingleStreamDriver {
   }
 
   #effectLineIfElidable(effect             , index        )                {
+    // 0.5.2：折叠门槛由用户定义——未设（0）= 不折叠（保留全部效果行）。
+    if (this.#cfg.effectElisionKeepRecent <= 0) return null;
     const recencyFromNewest = this.#effects.length - 1 - index;
     if (!shouldElideEffect(effect.verify, recencyFromNewest, this.#cfg.effectElisionKeepRecent)) return null;
     return renderEffectLine({
@@ -4511,6 +6550,11 @@ export class SingleStreamDriver {
 
   #record(record              )       {
     this.#records.push(record);
+  }
+
+  /** b 通道：子调用审计的私有 ledger 写入口（装配层在 driver 建好后挂接 dispatchWriter）。 */
+  writeDispatchLedger(event                  )       {
+    this.#ledgerWrite('plugin:tf-agent/dispatch', { ...event, at: Date.now() });
   }
 
   #ledgerWrite(type                   , data         )       {
@@ -4713,8 +6757,8 @@ function observationKey(cmd           )         {
  */
 function renderPlanDiff(
   revision        ,
-  items                                                                                       ,
-  announced                                                 ,
+  items                                                                                                       ,
+  announced                                                                 ,
 )                {
   const lines           = [];
   if (announced === null) {
@@ -4723,7 +6767,9 @@ function renderPlanDiff(
     for (const [id, item] of items) {
       lines.push(item.status === 'verified'
         ? `- [${id}] ${item.text} ✓ 已验证（回执：${item.evidence ?? '-'}）`
-        : `- [${id}] ${item.text}（未验证）`);
+        : item.status === 'in_progress'
+          ? `- [${id}] ${item.text}（进行中，未验证）`
+          : `- [${id}] ${item.text}（未验证）`);
     }
     return lines.join('\n');
   }
@@ -4733,7 +6779,7 @@ function renderPlanDiff(
   for (const [id, item] of items) {
     const prev = announced.get(id);
     if (prev === undefined) added.push(`+ [${id}] ${item.text}`);
-    else if (prev === 'open' && item.status === 'verified') verified.push(`✓ [${id}] 已验证（回执：${item.evidence ?? '-'}）`);
+    else if ((prev === 'open' || prev === 'in_progress') && item.status === 'verified') verified.push(`✓ [${id}] 已验证（回执：${item.evidence ?? '-'}）`);
   }
   for (const id of announced.keys()) {
     if (!items.has(id)) removed.push(`- [${id}] 已从计划移除`);
@@ -4766,12 +6812,27 @@ function finishDetail(finish                  )         {
 
 /** RenderMessage → GenerateOptions.messages 线格式（loop-built 请求：首条 system 携带系统提示）。
  *  v0.4.2：assistant 消息必须携带 source（宿主 LlmRuntime.forAdapter 无防护读
- *  message.source.replayState，GitHub master 同源；缺失 = 流 error → 回合中断）。 */
-function toWireMessages(messages                          )                                   {
+ *  message.source.replayState，GitHub master 同源；缺失 = 流 error → 回合中断）。
+ *  reasoning 策略（RA 契约两实值都真实生效）：
+ *   · 'provider-required'（默认）= source 原样携带（含 replayState——宿主 provider 会话
+ *     续传状态按宿主原样回传）；
+ *   · 'drop-stale' = 保留 source 壳（宿主硬要求）、**剥离 replayState**——推理/回放状态
+ *     绝不回传，请求纯文本、每请求无状态（xuxiang 等价：靠前缀单调续缓存，不靠 provider
+ *     会话续传）。 */
+export function toWireMessages(
+  messages                          ,
+  strategy                                     = 'provider-required',
+)                                   {
   return messages.map((m) => ({
     role: m.role,
     content: [{ type: 'text'         , text: m.content }],
-    ...(m.source === undefined ? {} : { source: { ...m.source } }),
+    ...(m.source === undefined
+      ? {}
+      : {
+          source: strategy === 'drop-stale' && m.source.replayState !== undefined
+            ? { kind: m.source.kind, provider: m.source.provider, model: m.source.model }
+            : { ...m.source },
+        }),
   }));
 }
 
@@ -5175,6 +7236,15 @@ export class StreamLoopAgent {
     } catch (error) {
       this.#warning(`agent "${this.id}": agent scope 释放失败（不阻断 dispose）`, error);
     }
+    // 0.5.2（审计 M12）：释放该会话在宿主侧保留的 PTC 状态域（#codeStateOwners 此前只增不减）。
+    try {
+      const result = await this.#driver.dispose();
+      if (result.failed.length > 0) {
+        this.#warning(`agent "${this.id}": ${result.failed.length} 个 tf-code 状态域释放失败（宿主保留态可能泄漏）: ${result.failed.map((f) => `${f.state}(${f.detail})`).join(', ')}`);
+      }
+    } catch (error) {
+      this.#warning(`agent "${this.id}": tf-code 状态域释放失败（不阻断 dispose）`, error);
+    }
   }
 
   /** v0.4.1-beta.2：运行态转换统一出口（只在真正变化时发 agent/status，镜像内建 setPhase 语义）。
@@ -5549,7 +7619,7 @@ export function createStreamAgentFactory(deps                        )
         // v0.4.1-beta.2（UI 卡住修复，与 0.3.2 同一套）：宿主事件总线在位（cordis ctx.emit）
         // 才接 agent/status。桌面端 dsh-api-session-controller 监听它转发 api-session/status
         // （running 布尔），客户端据此收起"运行中"指示——不接线 = 回合结束后 UI 永远转圈。
-        ...(typeof (deps.ctx                      ).emit === 'function'
+        ...(safeHasEmit(deps.ctx)
           ? {
               emitStatus: (payload                                                ) => {
                 (deps.ctx                                                      ).emit('agent/status', payload);
@@ -5780,9 +7850,35 @@ export async function attachSessionLedger(
                     
                  
                            
+     
+                                             
+                                                                  
+                                                                               
+     
+                   
+                                             
+                                                        
+                        
+                                                  
                                 
                         
                                
+                                                     
+                                                                       
+                                                    
+                                                                                
+                                                       
+                                                                           
+                       
+                                                                                                         
+                                                                                        
+                       
+                                                     
+                                                                                                                                                                     
+                                                         
+                                                                                                                      
+                                                     
+                      
                             
                                                                     
                    
@@ -5806,8 +7902,34 @@ export async function attachSessionLedger(
                                    
                             
                         
-                                                             
+                                                
                               
+                                        
+                        
+                                                                      
+                       
+                                             
+                                     
+                                              
+                                          
+                        
+                                                                       
+                                            
+                       
+                                                     
+                                     
+                                                                 
+                       
+                                                                          
+                             
+                                                                                
+                        
+                                                                      
+                                
+                                                 
+                         
+                                                                      
+                           
                                                      
                        
                                                   
@@ -5862,7 +7984,7 @@ export async function attachSessionLedger(
                                              
                                                     
                           
-                                                                                      
+                                                                                              
                                         
                                                             
                                    
@@ -5876,6 +7998,9 @@ export async function attachSessionLedger(
                              
                                                                
                        
+                                                          
+                                             
+                         
                                                            
                           
                                                                  
@@ -6052,6 +8177,12 @@ export default function apply(ctx
       tier: config.tier ?? ns.tier,
       lang: config.lang ?? ns.lang,
       mode: config.mode ?? ns.mode,
+      // 0.5.2：limits 三层合并（file → env → 显式 config）在 resolveControlState 内完成；
+      // 这里不再重复合并，避免两处优先级不一致。
+      ...(config.limits === undefined ? {} : { limits: config.limits }),
+      ...(config.contextFold === undefined ? {} : { contextFold: config.contextFold }),
+      ...(config.finalCheck === undefined ? {} : { finalCheck: config.finalCheck }),
+      ...(config.contextRaw === undefined ? {} : { contextRaw: config.contextRaw }),
     },
     config.stateDir,
     warning,
@@ -6066,9 +8197,12 @@ export default function apply(ctx
                                          
                                     
                              
-                                 
-                         
+                                  
+                          
                                      
+                        
+                                                             
+                                                       
                                  
                                 
   ) => {
@@ -6081,16 +8215,38 @@ export default function apply(ctx
     if (surfacePolicy === 'profile') {
       warning('[stream-loop] surfacePolicy=profile 是 0.4.x 过滤行为（已弃用，仅回退演练 §12.4；默认 reserved-only 对第三方工具零影响）');
     }
+    // 0.5.2：三层上限（全局 / 通道 / 档位）——全部来自用户；插件不补默认值。
+    const sanitizeLayer = (input         , label        )              => {
+      const parsed = sanitizeLimitPatch(input, label);
+      for (const message of parsed.warnings) warning(`[stream-loop] ${message}`);
+      return parsed.values;
+    };
+    const byChannel                                          = {};
+    for (const channel of CHANNELS) {
+      const raw = config.limitsByChannel?.[channel];
+      if (raw !== undefined) byChannel[channel] = sanitizeLayer(raw, `config.limitsByChannel.${channel}`);
+    }
+    const byTier                                       = {};
+    for (const tier of TIERS) {
+      const raw = config.limitsByTier?.[tier];
+      if (raw !== undefined) byTier[tier] = sanitizeLayer(raw, `config.limitsByTier.${tier}`);
+    }
     return {
       channel: control.channel,
       tier: control.tier,
-      selfReadFeedback: config.selfReadFeedback ?? 'receipt',
+      selfReadFeedback: config.selfReadFeedback ?? 'full',
       // 'auto' = 交给 codeExecutor 是否存在决定（保持 v0.2.0 的"宿主有 PTC 就开"语义）
       enableCode: config.enableCode,
       persistFallback: config.persistFallback ?? true,
-      maxParallelToolCalls: config.maxParallelToolCalls ?? 3,
-      maxReentries: config.maxReentries ?? 12,
+      maxParallelToolCalls: config.maxParallelToolCalls,
+      maxReentries: config.maxReentries,
       budgetTokens: config.budgetTokens,
+      limits: mergeLimits(control.limits, sanitizeLayer(config.limits, 'config.limits')),
+      // 0.6.0 复查修复（preset replace 语义）：装配层原始值单独传给驱动器——
+      // replace 清用户层（control.json / session）时装配层保留（装配 > 面板的层级不变）。
+      assemblyLimits: sanitizeLayer(config.limits, 'config.limits'),
+      limitsByChannel: byChannel,
+      limitsByTier: byTier,
       surfacePolicy,
       toolSurface: asSurfaceProfile(config.toolSurface),
     };
@@ -6104,11 +8260,20 @@ export default function apply(ctx
   const ptcRuntime = getService         (ctx, 'ptcRuntime');
   // 0.5.0（§5.2）：代码通道三来源探测（U3 探针；R12——只按执行器实现判定，不按 preset id）。
   // preset 探测走 tools 内省 / run_code 工具清单；bridge 探测走 ptcRuntime 形状。
-  const codeSourceProbe = detectCodeChannelSource(tools                                                 , ptcRuntime);
-  if (codeSourceProbe === null) {
-    warning('[stream-loop] 代码通道来源判定 = none（未检测到 PTC 预设或 ptcRuntime）：channel=code 将被拒绝并回退标准通道（§5.2，不静默降级）');
+  // 0.6.1：探测不再只算一次。装载期快照（codeSourceAtLoad）用于告警与横幅；真正的判据是
+  // 惰性探针（codeSourceProbe）——每次现取宿主 tools/ptcRuntime 服务重新判定。PTC preset
+  // 按窗口/会话挂载，装载期探测常常早于它；驱动器构造与会话级 setChannel('code') 经惰性
+  // 探针补判后，窗口后开 PTC 也能进入 PTC 兼容模式。
+  const codeSourceAtLoad = detectCodeChannelSource(tools                                                 , ptcRuntime);
+  const codeSourceProbe = ()                             =>
+    detectCodeChannelSource(
+      getService                                                                                                                                                          (ctx, 'tools')                                                 ,
+      getService         (ctx, 'ptcRuntime'),
+    );
+  if (codeSourceAtLoad === null) {
+    warning('[stream-loop] 代码通道来源判定 = none（装载期未检测到 PTC 预设或 ptcRuntime）：channel=code 将在会话创建与切换时经惰性探针实时补判，仍为空才拒绝（§5.2，不静默降级）');
   } else {
-    warning(`[stream-loop] 代码通道来源判定 = ${codeSourceProbe}${codeSourceProbe === 'preset' ? '（PTC preset 在位：代码通道完全让位，§5.3）' : '（内置窄桥：受限能力，如实显示）'}`);
+    warning(`[stream-loop] 代码通道来源判定 = ${codeSourceAtLoad}${codeSourceAtLoad === 'preset' ? '（PTC preset 在位：代码通道完全让位，§5.3）' : '（内置窄桥：受限能力，如实显示）'}`);
   }
   // v0.4.0（P5）：当前会话驱动器引用（createDriver 闭包回填；tf-code 全绑定按面生成）。
   // v0.4.1-beta.2：同一持有者供会话日志 model source 写入时取实时 provider/model（不缓存）。
@@ -6124,15 +8289,70 @@ export default function apply(ctx
                                                                                       
                                                             
                                                                                                                          
+                                                                                                                            
                                                                                                 
       
     = {};
-  const codeExecutor = looksLikePtcRuntime(ptcRuntime)
-    ? createCodeExecutor(ptcRuntime, { executeTools: (input) => tools.execute(input         ) })
+  // b 通道 PTC 对齐（第 2 轮，审查修正）：宿主 tool/ptc-dispatch* 是 session 事件，
+  // 由宿主 executor 写入；插件在让位纪律下**不写宿主 session、不冒充宿主事件名**。
+  // 这里只把子调用审计写进插件私有 ledger（plugin:tf-agent/*），供自身对账；
+  // 真实宿主审计事件在 preset 通道下天然由宿主产生（本插件不干预）。
+  // 0.5.2（审计 M4/M14）：出口按 agent 路由（DISPATCH_TARGETS），执行器端口补齐——
+  //   surfaceToolNames（冻结工具面 → 全绑定生成）、maxParallelBindings（用户 limits）、
+  //   classifyBinding（宿主 lane 语义）、onDescriptor（运行时描述符进状态面）。
+  const descriptorRef                                     = {};
+  const rawCodeExecutor = looksLikePtcRuntime(ptcRuntime)
+    ? createCodeExecutor(ptcRuntime, {
+        executeTools: (input) => tools.execute(input         ),
+        onDispatch: (event, agent) => dispatchTargetOf(agent)?.writeDispatchLedger(event),
+        // P5：绑定集 = 固定三绑定 + 本会话冻结工具面（driver 建好后才有面；取不到 = 空）。
+        surfaceToolNames: () => currentDriverRef.driver?.surfaceNames() ?? [],
+        // 用户未设（0）= 跟随宿主默认；显式 0 之外的负数不出现（sanitize 已挡）。
+        maxParallelBindings: () => {
+          const live = currentDriverRef.driver?.limitsSnapshot();
+          const explicit = live === undefined ? 0 : limitOf(live, 'maxParallelBindings');
+          return explicit > 0 ? explicit : HOST_DEFAULT_MAX_PARALLEL_BINDINGS;
+        },
+        // 宿主 executionMode 同构：只认 `isConcurrencySafe(args) === true` 为并行，
+        // 其余（未声明/隐藏/抛错）一律独占（fail-closed）。工具注册表缺席时退回白名单。
+        classifyBinding: (name, args, agent) => {
+          try {
+            const registry = tools                
+                                                                                                                                   
+             ;
+            const definition = registry.get?.(name, agent);
+            if (definition !== undefined && typeof definition.isConcurrencySafe === 'function') {
+              return definition.isConcurrencySafe(args) === true ? 'parallel' : 'exclusive';
+            }
+          } catch {
+            // 分类器抛错 = 按宿主语义 fail-closed 独占，不冒进并行。
+          }
+          return defaultBindingLane(name);
+        },
+        onDescriptor: (descriptor) => { descriptorRef.current = descriptor; },
+      })
     : undefined;
-  if (ptcRuntime !== undefined && codeExecutor === undefined) {
+  // 0.5.2（审计 M17）：消费 runtime.language——宿主若声明了非 TS/JS 程序语言，插件写出的
+  // tf-code 程序体在宿主里根本跑不起来（每段都语法错误）。此时关闭 code 通道并告警，
+  // 回退标准通道（fail-open，不让用户卡在"程序永远报错"的通道里）。
+  const hostLanguage = descriptorRef.current?.language;
+  const languageSupported = hostLanguage === undefined || /^(typescript|javascript|ts|js)$/i.test(hostLanguage);
+  const codeExecutor = languageSupported ? rawCodeExecutor : undefined;
+  if (!languageSupported) {
+    warning(`ctx.ptcRuntime.language="${hostLanguage}" 不是 TypeScript/JavaScript：tf-code 程序体无法在该 runtime 执行 → code 通道关闭（回退标准通道）`);
+  }
+  if (ptcRuntime !== undefined && codeExecutor === undefined && languageSupported) {
     warning('ctx.ptcRuntime 形状不符（缺 resolve/run），tf-code 通道关闭（fail-open，其余行为不变）', ptcRuntime);
   }
+  // wire 推理/思考配置清洗（红线 5：未知值不静默）。
+  const reasoningStrategyWire = config.reasoningStrategy === undefined || config.reasoningStrategy === ''
+    ? undefined
+    : (config.reasoningStrategy === 'drop-stale' || config.reasoningStrategy === 'provider-required')
+      ? config.reasoningStrategy                                      
+      : (warning(`[stream-loop] reasoningStrategy="${config.reasoningStrategy}" 不是已知策略（可用: provider-required | drop-stale），已按默认 provider-required 处理`)                      );
+  const thinkingModeWire = typeof config.thinkingMode === 'string' && config.thinkingMode.trim() !== ''
+    ? config.thinkingMode.trim()
+    : undefined;
   const factory = createStreamAgentFactory({
     ctx: ctx                                            ,
     createFallbackPersistence: persistFallbackEnabled
@@ -6150,9 +8370,12 @@ export default function apply(ctx
         provider: agentOptions.provider || config.provider || defaultSelection.provider || '',
         model: agentOptions.model || config.model || defaultSelection.model || '',
         reasoningEffort: agentOptions.reasoningEffort ?? config.reasoningEffort ?? defaultSelection.reasoningEffort,
-        // ---- 0.5.0 两轴 + 数值旋钮（§4.2/§4.5）----
+        // ---- 0.5.0 两轴 + 0.5.2 用户上限（§4.2/§4.5）----
         channel: live.channel,
         tier: live.tier,
+        limits: live.limits,
+        limitsByChannel: live.limitsByChannel,
+        limitsByTier: live.limitsByTier,
         maxSteps: config.maxSteps,
         maxInputTokens: config.maxInputTokens,
         compactAggressiveness: config.compactAggressiveness,
@@ -6172,9 +8395,14 @@ export default function apply(ctx
         maxRebasesPerTurn: config.maxRebasesPerTurn,
         maxRebasesPerSession: config.maxRebasesPerSession,
         surfacePolicy: live.surfacePolicy,
-        // 0.5.0（§5.2）：代码通道来源判定（apply() 全局探测一次；显式配置绕过探测）
+        // 0.5.0（§5.2）：代码通道来源判定（apply() 装载期快照 + 0.6.1 惰性探针实时补判；
+        // 显式配置绕过探测）
         codeChannelSource: config.codeChannelSource,
-        ...(codeSourceProbe !== null ? { codeSource: codeSourceProbe } : {}),
+        ...(codeSourceAtLoad !== null ? { codeSource: codeSourceAtLoad } : {}),
+        codeSourceProbe,
+        // wire 推理/思考配置（清洗后；undefined = 驱动器默认 provider-required/disabled）
+        ...(reasoningStrategyWire === undefined ? {} : { reasoningStrategy: reasoningStrategyWire }),
+        ...(thinkingModeWire === undefined ? {} : { thinkingMode: thinkingModeWire }),
         // 观测预算（D7：只告警不改行为）
         observeBudgetTokens: config.observeBudgetTokens,
         // 0.5.0（附录 A）：taskBudget = 任务级便捷写法的会话级默认
@@ -6190,6 +8418,15 @@ export default function apply(ctx
         codeValueInjectLimit: config.codeValueInjectLimit,
         nativeResultLimit: config.nativeResultLimit,
         enablePlan: config.enablePlan,
+        contextFold: control.contextFold,
+        finalCheck: control.finalCheck,
+        autoContinueOnPrefixFail: config.autoContinueOnPrefixFail,
+        // 0.6.0 正式版：原样档 / 密钥保护 / 脱敏 / 变更回执
+        contextRaw: control.contextRaw,
+        allowSensitivePaths: config.allowSensitivePaths,
+        redactOutput: config.redactOutput,
+        changeReceipts: config.changeReceipts,
+        requireFinal: config.requireFinal,
         segmentMaxChars: config.segmentMaxChars,
         nativeToolSchemas: config.nativeToolSchemas,
         systemPrompt: config.systemPrompt,
@@ -6228,9 +8465,94 @@ export default function apply(ctx
           // ToolSurfaceHolder 自行降级 L2（protocol-only，一行注入 + 台账）
           ...(tools === undefined ? {} : { toolsService: tools                                }),
           ...(codeExecutor === undefined ? {} : { executeCode: codeExecutor }),
+          // 0.5.2（审计 M17）：运行时描述符进 driver（协议段 + 状态面消费）。
+          ...(descriptorRef.current === undefined ? {} : { ptcDescriptor: descriptorRef.current }),
+          // b 通道 PTC 对齐（第 2 轮，审查修正）：装配两个端到端端口——
+          // ① sandbox 策略解析：宿主注入 resolveSandboxPolicy（返回宿主策略对象），插件不自行构造；
+          // ② release：优先用注入端口，否则从 ptcRuntime 的 async release 方法桥接。
+          // ① sandbox：优先装配显式注入；否则从宿主 sandboxPolicy.resolve({session, mode}) 派生
+          //    （宿主真实 API，见 dsh-sandbox-policy/src/index.ts:135+）。
+          //    0.5.2（审计 M6）：必须带 **session** —— 宿主按会话给出有效策略（会话级
+          //    sandbox/mode override、工作区边界都挂在这里）；只传 mode 等于绕过会话策略，
+          //    让程序跑在比会话约定更宽的沙箱里。session 在 createDriver 闭包里，故在此解析。
+          ...(config.resolveSandboxPolicy !== undefined
+            ? { resolveSandboxPolicy: config.resolveSandboxPolicy }
+            : (() => {
+                const sp = getService                                                                  (ctx, 'sandboxPolicy');
+                if (sp === undefined || typeof sp.resolve !== 'function') return {};
+                const resolve = sp.resolve.bind(sp);
+                return {
+                  resolveSandboxPolicy: (name         ) => {
+                    try {
+                      const request = name === undefined ? { session } : { session, mode: name };
+                      const policy = resolve(request);
+                      if (policy === undefined || policy === null) {
+                        warning(`[stream-loop] sandboxPolicy.resolve(${name === undefined ? '常驻' : `mode:"${name}"`}) 返回空策略：本次不传 sandboxPolicy（宿主保持自身默认）`);
+                        return undefined;
+                      }
+                      return policy;
+                    } catch (error) {
+                      warning(`[stream-loop] sandboxPolicy.resolve(${name === undefined ? '常驻' : `mode:"${name}"`}) 失败：本次不传 sandboxPolicy（fail-open，不静默降级为更宽策略）`, error);
+                      return undefined;
+                    }
+                  },
+                };
+              })()),
+          // ③ 0.5.3：单次提权审批——走宿主 @deepseek-ai/dsh-sandbox 的 approveEscalation
+          //    与 approval 服务（不自行弹窗、不自造策略）。模块/服务任一缺席 → 端口不存在，
+          //    tf-code sandbox_permissions 按 escalation-unavailable 失败（fail-closed）。
+          ...(config.approveEscalation !== undefined
+            ? { approveEscalation: config.approveEscalation }
+            : {
+                approveEscalation: async (request, context) => {
+                  const mod = await acquireHostModule(ctx, '@deepseek-ai/dsh-sandbox')     
+                                                                                             
+                               ;
+                  const approve = mod?.approveEscalation;
+                  if (typeof approve !== 'function') throw new Error('宿主未导出 approveEscalation（@deepseek-ai/dsh-sandbox）');
+                  const approver = getService         (ctx, 'approval');
+                  return await approve(request, {
+                    ...(approver === undefined ? {} : { approver }),
+                    ...(context.agent === undefined ? {} : { agent: context.agent }),
+                    callId: context.callId,
+                    toolName: context.toolName,
+                    signal: context.signal,
+                  });
+                },
+              }),
+          ...(config.ptcRuntimeRelease !== undefined
+            ? { ptcRuntimeRelease: config.ptcRuntimeRelease }
+            : ptcRuntime !== undefined && typeof ptcRuntime.release === 'function'
+              ? { ptcRuntimeRelease: (owner        ) => ptcRuntime.release (owner) }
+              : {}),
+          // 1.2：交付构建校验的项目事实（审查修正：原实现只在接口声明，未转发到 driver，
+          // 导致整块校验永不执行）。优先显式注入；缺省从 config.projectDir 派生同步探测。
+          ...(config.projectFacts !== undefined
+            ? { projectFacts: config.projectFacts }
+            : config.projectDir !== undefined
+              ? { projectFacts: createProjectFacts(config.projectDir) }
+              : {}),
+          // 1.2 / 4.1（审计 D2）：只读文件事实——**此前只在接口里声明，装配处从未接线**，
+          // 于是 `:: exists(path)` 谓词永不开、带谓词的验收项永远到不了 verified，final 被
+          // "未验证"卡到重入上限；版本冲突守卫同理不可达（永远不启用）。装配层做 IO，内核零 IO。
+          ...(config.deliveryFacts !== undefined
+            ? { deliveryFacts: config.deliveryFacts }
+            : { deliveryFacts: createFsFacts(config.projectDir) }),
+          ...(config.revisionFacts !== undefined
+            ? { revisionFacts: config.revisionFacts }
+            : config.revisionGuard === false
+              ? {}
+              : { revisionFacts: createFsRevisionFacts(config.projectDir) }),
+          // 1.2：交付构建校验——优先显式注入。缺省不在这里造 runner：驱动器自带
+          // `#hostVerificationRunner()`（经 executeTools + toolMapping 走宿主 shell，
+          // 且带 agent 作用域），此前这里引用了从未定义的 `createHostVerificationRunner(tools)`，
+          // 一旦装配了 ctx.tools 就会在 agent 创建时抛 ReferenceError（0.5.3 修复）。
+          ...(config.runVerification !== undefined
+            ? { runVerification: config.runVerification }
+            : {}),
           // v0.3.1 思考过程实时帧：宿主事件总线在位（cordis ctx.emit）才接线；
           // 发射契约由驱动器保证（revision/index 递增、异常熔断），宿主无监听器时是 no-op。
-          ...(typeof (ctx                      ).emit === 'function'
+          ...(safeHasEmit(ctx)
             ? {
                 emitHostEvent: (event        , payload         ) => {
                   (ctx                                                      ).emit(event, payload);
@@ -6254,12 +8576,54 @@ export default function apply(ctx
                 reconcilePendingIntents: (cause        ) => ({ acked: reconcilePendingIntents(intentFile , cause, intentSeqState) }),
               }
             : {}),
+          // 0.6.0 正式版（changes 缺口）：变更回执持久化——私有目录 stateDir/changes/<session>/
+          //（模型输入之外；模型不能经 tf-write 覆盖授权回滚的回执）。fail-open：落盘失败只告警。
+          ...(config.changeReceipts === false
+            ? {}
+            : {
+                onChangeReceipt: (entry             ) => {
+                  try {
+                    const dir = join(stateRoot, 'changes', sessionId ?? 'default');
+                    mkdirSync(dir, { recursive: true });
+                    const file = join(dir, `${entry.id}.json`);
+                    const tmp = `${file}.${process.pid}.tmp`;
+                    writeFileSync(tmp, `${JSON.stringify(entry)}\n`, 'utf8');
+                    renameSync(tmp, file);
+                  } catch (error) {
+                    warning('变更回执落盘失败（fail-open：回执在内存可用，重启后不可恢复）', error);
+                  }
+                },
+              }),
           events: createSessionEventWriter(session, () => currentDriverRef.driver?.modelSource()),
           onWarning: warning,
         },
         cfg,
       );
       currentDriverRef.driver = driver;
+      // 0.6.0 正式版：resume/新建时加载已持久化回执（workspace 身份 + 快照哈希校验在驱动器内）。
+      if (config.changeReceipts !== false) {
+        try {
+          const dir = join(stateRoot, 'changes', sessionId ?? 'default');
+          const entries                = [];
+          if (existsSync(dir)) {
+            for (const name of readdirSync(dir)) {
+              if (!name.endsWith('.json')) continue;
+              try {
+                const raw = JSON.parse(readFileSync(join(dir, name), 'utf8'))               ;
+                if (raw !== null && typeof raw === 'object' && raw.version === 1 && typeof raw.id === 'string') entries.push(raw);
+              } catch {
+                warning(`变更回执文件不可解析（已跳过）：${join(dir, name)}`);
+              }
+            }
+          }
+          if (entries.length > 0) {
+            const { rejected } = driver.loadChangeReceipts(entries);
+            if (rejected > 0) warning(`变更回执加载：${rejected} 条因工作区身份/快照哈希不符被拒绝（不混用跨工作区回执）`);
+          }
+        } catch (error) {
+          warning('变更回执加载失败（fail-open：本会话从空账本开始）', error);
+        }
+      }
       // K2：会话工作区解析（tf-code resolve 透传用）。会话 header.cwd（会话原始目录）
       // 优先，缺省回退宿主 workingDirectory 服务的部署默认目录；两者都不可得则不传，
       // 由宿主按自己的默认语义解析。插件不复制宿主的优先级规则。
@@ -6269,6 +8633,10 @@ export default function apply(ctx
         ? headerCwd
         : (workingDirectory?.defaultDirectory !== undefined ? workingDirectory.defaultDirectory : undefined);
       driver.setSessionCwd(resolvedCwd);
+      // 0.5.2（审计 M4）：子调用审计出口由 setAgent 时的 DISPATCH_TARGETS 登记接管——
+      // 不再有"单槽 dispatchSink + 构造期缓冲"（那个缓冲从未存在）。
+      // PTC 运行时描述符（language / programFormat / sandboxMode / 超时）进状态面与诊断。
+      if (descriptorRef.current !== undefined) driver.setPtcDescriptor(descriptorRef.current);
       // 0.5.0（S5 / §2.4 接缝 5）：systemPrompt.context 快照贡献——代码通道的唯一注入通道
       //（不接管 loop 时无法在流内插消息），宿主 loop 把贡献渲染成 runtime-context 快照并
       // supersede 旧快照（U10 探针面；服务缺席 = 静默跳过，标准通道走回灌不受影响）。
@@ -6352,7 +8720,7 @@ export default function apply(ctx
       lang: control.lang,
       langSource: control.langSource,
       langLocked: control.langSource === 'config' || control.langSource === 'env',
-      codeSource: codeSourceProbe,
+      codeSource: codeSourceProbe(),
       takeoverPriority: config.takeoverPriority ?? 100,
       effective: {
         selfReadFeedback: live.selfReadFeedback,
@@ -6366,8 +8734,32 @@ export default function apply(ctx
         ...(currentDriverRef.driver?.runtimeStatus().effective
           ?? { maxSteps: getTier(control.tier).values.maxSteps, maxInputTokens: getTier(control.tier).values.maxInputTokens }),
       },
+      // 0.6.0（§0 A1/A2/A3）：行为开关与其来源——控制页与 CLI 同源，来源必须可诊断。
+      contextFold: control.contextFold !== false,
+      contextFoldSource: control.contextFoldSource,
+      finalCheck: control.finalCheck !== false,
+      finalCheckSource: control.finalCheckSource,
+      finalCheckInert: control.channel === 'code',
+      // 0.6.0 正式版：原样档（0.6.1：行为预设字段已移除——limits 一律用户自定义）。
+      contextRaw: control.contextRaw === true,
+      contextRawSource: control.contextRawSource,
+      switchSummary: switchSummaryLine(control, control.lang, (() => {
+        // 生效阈值以驱动器实际参数为准（装配 config 设了阈值时，只读 control.json 会误报"未触发"）。
+        const p = currentDriverRef.driver?.effectiveParams();
+        return p === undefined
+          ? {}
+          : {
+              maxInputTokens: p.maxInputTokens,
+              effectElisionKeepRecent: p.effectElisionKeepRecent,
+              segmentMaxChars: p.segmentMaxChars,
+            };
+      })()),
       // 0.5.0：运行时状态（本任务 N / 换基 / 重复取回 / 摘要段；控制栏底部状态行同源）
       runtime: currentDriverRef.driver?.runtimeStatus() ?? null,
+      // 0.5.3：用户自定义上限（控制页"③ 上限"区块的数据源；0/缺省 = 不限制）
+      limits: control.limits ?? {},
+      limitsSource: control.limitsSource,
+      limitCatalog: publicLimitCatalog(control.limits),
       // v0.4.2：运行时缓存口径（控制页"缓存命中"行；当前会话无活动驱动器时为 null，
       // 客户端隐藏该行——离线/mock 适配器没有缓存数据，不渲染成 0%）。
       cache: currentDriverRef.driver?.cacheStats() ?? null,
@@ -6378,6 +8770,22 @@ export default function apply(ctx
       stateFile: control.file,
     };
   };
+  /** 落盘当前控制状态（通道/档位/语言/上限一起写；任何单字段写入都不得丢其余字段）。 */
+  const persistControlState = ()         => writePersistedControl(
+    {
+      channel: control.channel,
+      tier: control.tier,
+      lang: control.lang,
+      ...(control.limits === undefined ? {} : { limits: control.limits }),
+      // 0.6.0：两个开关也必须随每次写盘带上——`writePersistedControl` 对缺字段按默认
+      // （true）落盘，漏带 = 关掉开关后改一次通道就被重置回开（审查实测：磁盘被写回 true）。
+      contextFold: control.contextFold !== false,
+      finalCheck: control.finalCheck !== false,
+      // 0.6.0 正式版：原样档同样不得在单字段写入时丢失。
+      contextRaw: control.contextRaw === true,
+    },
+    config.stateDir,
+  );
   const applyChannel = (next        )                                                                       => {
     if (!isChannelId(next)) return { ok: false, code: 'invalid-channel' };
     if (control.channelSource === 'config' || control.channelSource === 'env') return { ok: false, code: 'locked' };
@@ -6387,7 +8795,8 @@ export default function apply(ctx
     const driverResult = currentDriverRef.driver?.setChannel(next) ?? { ok: true };
     let persisted = true;
     try {
-      writePersistedControl({ channel: control.channel, tier: control.tier, lang: control.lang }, config.stateDir);
+      // 0.5.3 修复：落盘必须带上 limits——否则改一次通道就把用户自定义上限整个抹掉。
+      persistControlState();
       control.channelSource = 'file';
     } catch (error) {
       persisted = false;
@@ -6408,7 +8817,7 @@ export default function apply(ctx
     const driverResult = currentDriverRef.driver?.setTier(next) ?? { ok: true };
     let persisted = true;
     try {
-      writePersistedControl({ channel: control.channel, tier: control.tier, lang: control.lang }, config.stateDir);
+      persistControlState();
       control.tierSource = 'file';
     } catch (error) {
       persisted = false;
@@ -6418,6 +8827,44 @@ export default function apply(ctx
     if (!driverResult.ok) return { ok: false, code: driverResult.code, persisted };
     if (!degradedSidecar) markTakeover(`${control.channel}/${control.tier}`, 'stream-agent');
     return { ok: true, persisted };
+  };
+  /**
+   * 0.5.3：控制面板自定义上限（终端交互栏 / 桌面页 / CLI 共用同一落点）。
+   * 语义与 `dsh-stream-agent limits --set` 一致：增量合并、0 = 不限制、非法键丢弃并告警。
+   * 变更立即对当前会话生效（数值不进请求字节，不换基），同时落盘供新会话继承。
+   */
+  const applyLimits = (patch         , options                        = {}    
+                                                                                                              
+  ) => {
+    const sanitized = sanitizeLimitPatch(patch, 'control-panel:limits');
+    const driverResult = currentDriverRef.driver?.setLimits(sanitized.values, { replace: options.replace === true })
+      ?? { ok: true, accepted: sanitized.values, ignored: []             };
+    const base = options.replace === true ? {} : (control.limits ?? {});
+    const merged = mergeLimits(base, sanitized.values);
+    control.limits = merged;
+    let persisted = true;
+    try {
+      writePersistedControl({
+        channel: control.channel,
+        tier: control.tier,
+        lang: control.lang,
+        limits: merged,
+        contextFold: control.contextFold !== false,
+        finalCheck: control.finalCheck !== false,
+        contextRaw: control.contextRaw === true,
+      }, config.stateDir);
+    } catch (error) {
+      persisted = false;
+      warning(`控制栏上限已在本进程生效，但落盘失败（重启后会回到旧值）：${control.file}`, error);
+    }
+    const ignored = [...sanitized.warnings, ...driverResult.ignored];
+    return {
+      ok: ignored.length === 0,
+      accepted: mergeLimits(driverResult.accepted, merged),
+      ignored,
+      persisted,
+      ...(ignored.length === 0 ? {} : { code: 'invalid-limit', detail: ignored.join('; ') }),
+    };
   };
   const applyBudget = (budget                                                )                                                  => {
     return currentDriverRef.driver?.setBudget(budget)
@@ -6431,7 +8878,7 @@ export default function apply(ctx
       return { ok: false, code: 'locked' };
     }
     const mapped = resolveLegacyMode(next);
-    warning(`[stream-loop] setMode("${next}") 是旧模式值，已按别名映射为 channel=${mapped.channel}/tier=${mapped.tier}（0.5.x 保留别名，0.6.0 移除）`);
+    warning(`[stream-loop] setMode("${next}") 是旧模式值，已按别名映射为 channel=${mapped.channel}/tier=${mapped.tier}`);
     const channelResult = applyChannel(mapped.channel);
     if (!channelResult.ok) return { ...channelResult, aliased: true };
     const tierResult = applyTier(mapped.tier);
@@ -6442,12 +8889,50 @@ export default function apply(ctx
     if (control.langSource === 'config' || control.langSource === 'env') return { ok: false, code: 'locked' };
     control.lang = next;
     try {
-      writePersistedControl({ channel: control.channel, tier: control.tier, lang: control.lang }, config.stateDir);
+      persistControlState();
       control.langSource = 'file';
       return { ok: true, persisted: true };
     } catch (error) {
       control.langSource = 'runtime';
       warning(`控制栏语言已在本进程生效，但落盘失败（重启后会回到旧值）：${control.file}`, error);
+      return { ok: true, persisted: false };
+    }
+  };
+  /**
+   * 0.6.0 正式版：行为开关落点（桌面页 / CLI 共用）。与终端 f/v/x 同一语义：
+   * 写 control.json + 更新进程内控制状态；驱动器参数在**下一次创建 agent** 时生效
+   *（开关进稳定前缀/观测管线，会话内不突变——与 0.6.0-beta 的 fold/final 同口径）。
+   * 手工修改清除预设标记。
+   */
+  const applySwitches = (patch                                                                           
+                                                                     
+  ) => {
+    const entries                                                                              = [];
+    for (const key of ['contextFold', 'finalCheck', 'contextRaw']         ) {
+      const raw = patch[key];
+      if (raw === undefined) continue;
+      const parsed = typeof raw === 'boolean' ? raw : parseSwitchValue(raw);
+      if (parsed === undefined) return { ok: false, code: 'invalid-switch', detail: `${key} 不是 on/off` };
+      const source = key === 'contextFold' ? control.contextFoldSource : key === 'finalCheck' ? control.finalCheckSource : control.contextRawSource;
+      if (source === 'config' || source === 'env') return { ok: false, code: 'locked', detail: `${key} 由装配配置或环境变量锁定` };
+      entries.push({ key, value: parsed });
+    }
+    if (entries.length === 0) return { ok: false, code: 'empty', detail: '没有要修改的开关' };
+    for (const { key, value } of entries) {
+      if (key === 'contextFold') { control.contextFold = value; control.contextFoldSource = 'runtime'; }
+      else if (key === 'finalCheck') { control.finalCheck = value; control.finalCheckSource = 'runtime'; }
+      else { control.contextRaw = value; control.contextRawSource = 'runtime'; }
+    }
+    try {
+      persistControlState();
+      for (const { key } of entries) {
+        if (key === 'contextFold') control.contextFoldSource = 'file';
+        else if (key === 'finalCheck') control.finalCheckSource = 'file';
+        else control.contextRawSource = 'file';
+      }
+      return { ok: true, persisted: true };
+    } catch (error) {
+      warning(`控制栏开关已在本进程生效，但落盘失败（重启后会回到旧值）：${control.file}`, error);
       return { ok: true, persisted: false };
     }
   };
@@ -6463,6 +8948,10 @@ export default function apply(ctx
         setBudget: applyBudget,
         setMode: applyMode,
         setLang: applyLang,
+        // 0.5.3：控制面板自定义上限（0.6.1 起默认面 = thinkflow 对齐层；0 = 不限制；增量合并）
+        setLimits: applyLimits,
+        // 0.6.0 正式版：行为开关（桌面页与终端/CLI 同源；applyPreset 已随预设系统移除）
+        setSwitches: applySwitches,
       });
     } catch (error) {
       warning('streamAgentRuntime 服务注册失败：桌面控制页降级为只读（loop 本体不受影响）', error);
@@ -6472,7 +8961,7 @@ export default function apply(ctx
   if (config.announceTakeover === true) {
     const codeState = degradedSidecar
       ? 'loop=sidecar(degraded)'
-      : `channel=${control.channel} source=${codeSourceProbe ?? '-'} tier=${control.tier}`;
+      : `channel=${control.channel} source=${codeSourceProbe() ?? '-'} tier=${control.tier}`;
     console.error(`[stream-loop] ${degradedSidecar ? 'TAKEOVER-DEGRADED: sidecar mode（另一 loop 插件已接管）' : 'TAKEOVER-ACTIVE: agent factory registered via setFactory (built-in agent-loop must be disabled by profile patch)'} · ${codeState} · executor=${codeExecutor === undefined ? 'native' : 'bridge-available'} · priority=${config.takeoverPriority ?? 100} · profile=${profileName}`);
   }
 
@@ -6512,6 +9001,113 @@ export default function apply(ctx
   ctx.effect?.(() => dispose, 'streamAgent.setFactory()');
   // Cordis 函数式插件契约：返回值必须可调用（cordis-compat.ts 缺陷 2）
   return asPluginEffect({ factory, dispose });
+}
+
+/** 宿主沙箱模式白名单（dsh-sandbox-policy 的三档；其余一律结构化拒绝，不静默降级）。 */
+const SANDBOX_MODES                      = new Set(['read-only', 'workspace-write', 'danger-full-access']);
+
+/** 归一 sandbox 属性；不在白名单 → undefined（调用方按 invalid-attribute 拒绝）。 */
+export function normalizeSandboxMode(value        )                     {
+  const trimmed = value.trim();
+  return SANDBOX_MODES.has(trimmed) ? trimmed : undefined;
+}
+
+/** 1.2：从项目根目录派生同步事实（装配层 IO，kernel 仍零 IO）。只读 stat/exists。 */
+function createProjectFacts(root        )   
+              
+                            
+                            
+                              
+  {
+  return {
+    cwd: root,
+    hasPackageJson: () => existsSync(join(root, 'package.json')),
+    hasNodeModules: () => existsSync(join(root, 'node_modules')),
+    runnableScripts: () => {
+      const out           = [];
+      try {
+        for (const name of readdirSync(root)) {
+          // 0.5.2（审计 D1）：原判据 `!name.includes('.')` 与 `/\.(py|js|mjs|ts)$/` 互斥——
+          // 任何带扩展名的脚本都被排除，于是清单恒空、功能等于不存在。改为按扩展名 + 必须是文件。
+          if (!/\.(py|js|mjs|cjs|ts|sh)$/.test(name)) continue;
+          const full = join(root, name);
+          try {
+            if (!statSync(full).isFile()) continue;
+          } catch {
+            continue;
+          }
+          out.push(full);
+        }
+      } catch { /* 目录不可读 = 无可运行脚本，fail-closed */ }
+      return out.slice(0, 20);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 1.2 / 4.1（审计 D2）：只读文件事实（装配层 IO；kernel 仍零 IO）
+// ---------------------------------------------------------------------------
+
+/** 文本事实读取上限（字节）：超过只给 sha256/字节数，不把整文件读进内存做正则。 */
+const FS_FACT_TEXT_LIMIT = 4 * 1024 * 1024;
+/** sha256 计算上限（字节）：超大文件跳过摘要（返回 undefined，不编造）。 */
+const FS_FACT_HASH_LIMIT = 64 * 1024 * 1024;
+
+/** 验收谓词用的事实面（`:: exists(p)` / sha256 / bytes / regex 的求值源）。 */
+function createFsFacts(root                    )   
+                                                                                                 
+  {
+  // 0.6.0 收口（核验 P2）：node:path resolve 归一相对段——与 #changePath 同一口径，
+  // 谓词事实与守卫事实对同一文件必须给同一身份。
+  const abs = (path        )         => resolve(root ?? process.cwd(), path);
+  return {
+    stat(path) {
+      let file        ;
+      try {
+        file = abs(path);
+      } catch {
+        return { exists: false };
+      }
+      let info                             ;
+      try {
+        info = statSync(file);
+      } catch {
+        return { exists: false };
+      }
+      if (!info.isFile()) return { exists: true, bytes: info.size };
+      const out                                                                      = { exists: true, bytes: info.size };
+      if (info.size > FS_FACT_HASH_LIMIT) return out;
+      try {
+        const buf = readFileSync(file);
+        out.sha256 = createHash('sha256').update(buf).digest('hex');
+        if (buf.byteLength <= FS_FACT_TEXT_LIMIT) out.text = buf.toString('utf8');
+      } catch {
+        return { exists: true, bytes: info.size };
+      }
+      return out;
+    },
+  };
+}
+
+/** 版本冲突守卫用的事实面（对齐上游 content_revision：sha256；不存在 = null）。 */
+function createFsRevisionFacts(root                    )                                            {
+  const facts = createFsFacts(root);
+  return {
+    revision(path) {
+      const stat = facts.stat(path);
+      if (stat === null || !stat.exists) return null;
+      return stat.sha256 ?? `bytes:${stat.bytes ?? 0}`;
+    },
+  };
+}
+
+/** strict inject 守卫下未声明属性的 getter 会抛错；安全探测 emit 是否存在。 */
+function safeHasEmit(ctx         )          {
+  try {
+    return typeof (ctx                      ).emit === 'function';
+  } catch {
+    return false;
+  }
 }
 
 function detailString(detail         )         {

@@ -76,7 +76,8 @@ function makeHarness(responses: ReadonlyArray<readonly StreamChunkLike[]>, task:
       return { results };
     },
   };
-  const driver = new SingleStreamDriver(ports, { provider: 'mock-provider', model: 'mock-model', streamIdleTimeoutMs: 30_000 });
+  // 0.5.1（1.1）：本文件覆盖 0.4.x 收束/重入机制 → 显式走回退开关
+  const driver = new SingleStreamDriver(ports, { provider: 'mock-provider', model: 'mock-model', streamIdleTimeoutMs: 30_000, requireFinal: true });
   driver.pushUserTask(task);
   return { driver, wireRequests, sandboxDir, cleanup: () => rmSync(sandboxDir, { recursive: true, force: true }) };
 }

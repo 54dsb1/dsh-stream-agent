@@ -22,50 +22,56 @@ function obs(partial: Partial<ObservationInput>): ObservationInput {
 test('规则1: read/grep 族首次输出 = high', () => {
   const ledger = new ObservationLedger();
   const r1 = ledger.observe(obs({ tool: 'tf-read', key: 'src/a.ts', content: 'line1\nline2' }));
-  assert.equal(r1.info_gain, 'high');
+  assert.equal(r1.info_gain, 'full');
   const r2 = ledger.observe(obs({ tool: 'grep', key: 'TODO', content: 'a.ts:1: TODO x' }));
-  assert.equal(r2.info_gain, 'high');
+  assert.equal(r2.info_gain, 'full');
   assert.equal(r2.payload.kind, 'skeleton');
 });
 
 test('规则1(变体): web/test 首次输出 = high', () => {
   const ledger = new ObservationLedger();
-  assert.equal(ledger.observe(obs({ tool: 'web_fetch', key: 'http://x', content: '<html>hi</html>' })).info_gain, 'high');
-  assert.equal(ledger.observe(obs({ tool: 'test', key: 'npm test', content: 'all green' })).info_gain, 'high');
+  assert.equal(ledger.observe(obs({ tool: 'web_fetch', key: 'http://x', content: '<html>hi</html>' })).info_gain, 'full');
+  assert.equal(ledger.observe(obs({ tool: 'test', key: 'npm test', content: 'all green' })).info_gain, 'full');
 });
 
 test('规则2: write/append/mkdir 成功回执 = low（句柄化不注入）', () => {
   const ledger = new ObservationLedger();
   const w = ledger.observe(obs({ tool: 'tf-write', key: 'src/a.ts', content: 'written' }));
-  assert.equal(w.info_gain, 'low');
+  assert.equal(w.info_gain, 'handle');
   assert.equal(w.payload.kind, 'receipt');
   const m = ledger.observe(obs({ tool: 'mkdir', key: 'src/lib', content: 'ok' }));
-  assert.equal(m.info_gain, 'low');
+  assert.equal(m.info_gain, 'handle');
   const ap = ledger.observe(obs({ tool: 'append', key: 'log.txt', content: 'ok' }));
-  assert.equal(ap.info_gain, 'low');
+  assert.equal(ap.info_gain, 'handle');
 });
 
-test('规则2(变体): bash 成功 = low（README §5：成功记 ledger），bash 失败见规则4', () => {
+test('规则2(变体): bash 成功输出可见（首次/变化 = full，重复未变 = dedup）', () => {
+  // 0.5.2（审计 C1）：bash 不再只记回执——上游 thinkflow 把 shell stdout 原样回给模型；
+  // 只记回执时模型跑完 `npm test`/`git status` 看不到任何内容。
   const ledger = new ObservationLedger();
-  assert.equal(ledger.observe(obs({ tool: 'tf-bash', key: 'npm test', content: 'ok' })).info_gain, 'low');
-  assert.equal(ledger.observe(obs({ tool: 'tf-bash', key: 'npm build', content: 'ok' })).info_gain, 'low');
+  assert.equal(ledger.observe(obs({ tool: 'tf-bash', key: 'npm test', content: 'ok' })).info_gain, 'full');
+  assert.equal(ledger.observe(obs({ tool: 'tf-bash', key: 'npm build', content: 'ok' })).info_gain, 'full');
+  // 同一 key 内容未变 → dedup（不会重复烧 token）
+  assert.equal(ledger.observe(obs({ tool: 'tf-bash', key: 'npm test', content: 'ok' })).info_gain, 'dedup');
+  // 同一 key 内容变化 → full
+  assert.equal(ledger.observe(obs({ tool: 'tf-bash', key: 'npm test', content: 'ok, 3 passed' })).info_gain, 'full');
 });
 
 test('规则3: 重复观测（内容哈希未变）= none', () => {
   const ledger = new ObservationLedger();
   ledger.observe(obs({ tool: 'tf-read', key: 'a.ts', content: 'same' }));
   const again = ledger.observe(obs({ tool: 'tf-read', key: 'a.ts', content: 'same' }));
-  assert.equal(again.info_gain, 'none');
+  assert.equal(again.info_gain, 'dedup');
   assert.equal(again.reason, 'duplicate-observation');
   const third = ledger.observe(obs({ tool: 'tf-read', key: 'a.ts', content: 'same' }));
-  assert.equal(third.info_gain, 'none');
+  assert.equal(third.info_gain, 'dedup');
   assert.deepEqual(third.payload, { kind: 'unchanged', text: UNCHANGED_TEXT });
 });
 
 test('规则3(变体): 空输出 = none，且句柄目录不更新', () => {
   const ledger = new ObservationLedger();
   const e = ledger.observe(obs({ tool: 'grep', key: 'nothing', content: '' }));
-  assert.equal(e.info_gain, 'none');
+  assert.equal(e.info_gain, 'dedup');
   assert.equal(e.handle, null);
   // 空输出不产生目录条目
   assert.deepEqual(ledger.directoryDelta(0), { added: [], changed: [], stale: [] });
@@ -74,30 +80,30 @@ test('规则3(变体): 空输出 = none，且句柄目录不更新', () => {
 test('规则4: 一切执行失败 = high（含 write/bash 失败）', () => {
   const ledger = new ObservationLedger();
   const f1 = ledger.observe(obs({ tool: 'tf-read', key: 'missing.ts', ok: false, content: 'ENOENT' }));
-  assert.equal(f1.info_gain, 'high');
+  assert.equal(f1.info_gain, 'full');
   const f2 = ledger.observe(obs({ tool: 'tf-bash', key: 'npm test', ok: false, content: 'exit 1' }));
-  assert.equal(f2.info_gain, 'high');
+  assert.equal(f2.info_gain, 'full');
   const f3 = ledger.observe(obs({ tool: 'tf-write', key: 'ro/a.ts', ok: false, content: 'EACCES' }));
-  assert.equal(f3.info_gain, 'high');
+  assert.equal(f3.info_gain, 'full');
 });
 
 test('规则4(变体): 重复读但内容失败 = high；classify 纯函数可直接用', () => {
   const ledger = new ObservationLedger();
   ledger.observe(obs({ tool: 'tf-read', key: 'a.ts', content: 'v1' }));
   const fail = ledger.observe(obs({ tool: 'tf-read', key: 'a.ts', ok: false, content: 'EIO' }));
-  assert.equal(fail.info_gain, 'high');
+  assert.equal(fail.info_gain, 'full');
   // 内容变化的新版本也是 high
   const changed = ledger.observe(obs({ tool: 'tf-read', key: 'a.ts', content: 'v2' }));
-  assert.equal(changed.info_gain, 'high');
+  assert.equal(changed.info_gain, 'full');
   assert.equal(changed.reason, 'content-changed:read');
 });
 
 test('classify 纯函数：不依赖 ledger 状态即可判定', () => {
-  assert.equal(classify(obs({ content: 'x' })).info_gain, 'high'); // 无历史 → 首次
-  assert.equal(classify(obs({ ok: false, content: 'boom' })).info_gain, 'high');
-  assert.equal(classify(obs({ tool: 'tf-write', content: 'ok' })).info_gain, 'low');
-  assert.equal(classify(obs({ content: '' })).info_gain, 'none');
-  assert.equal(classify(obs({ tool: 'unknown_thing', content: 'x' })).info_gain, 'low');
+  assert.equal(classify(obs({ content: 'x' })).info_gain, 'full'); // 无历史 → 首次
+  assert.equal(classify(obs({ ok: false, content: 'boom' })).info_gain, 'full');
+  assert.equal(classify(obs({ tool: 'tf-write', content: 'ok' })).info_gain, 'handle');
+  assert.equal(classify(obs({ content: '' })).info_gain, 'dedup');
+  assert.equal(classify(obs({ tool: 'unknown_thing', content: 'x' })).info_gain, 'handle');
 });
 
 test('classifyTool：tf-* 与常见工具名映射正确，未知归 other', () => {
@@ -234,7 +240,7 @@ test('句柄版本语义：同 key 新内容版本递增，handle 形如 obs:<fa
 test('饥饿防线：连续 5 步无 high 注入，第 5 步触发升级注入', () => {
   const ledger = new ObservationLedger({ starvationThreshold: 5 });
   const write = ledger.observe(obs({ tool: 'tf-write', key: 'out.ts', content: 'result\n'.repeat(20) }));
-  assert.equal(write.info_gain, 'low');
+  assert.equal(write.info_gain, 'handle');
 
   for (let step = 1; step <= 4; step++) {
     const promoted = ledger.noteStep(false);
@@ -243,7 +249,7 @@ test('饥饿防线：连续 5 步无 high 注入，第 5 步触发升级注入',
   const fifth = ledger.noteStep(false);
   assert.ok(fifth, '第 5 步必须触发升级注入');
   assert.equal(fifth!.reason, 'starvation-promotion');
-  assert.equal(fifth!.info_gain, 'high');
+  assert.equal(fifth!.info_gain, 'full');
   assert.equal(fifth!.handle, write.handle);
   assert.equal(fifth!.payload.kind, 'skeleton');
 });

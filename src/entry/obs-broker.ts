@@ -3,7 +3,7 @@
 // 挂点（06 号 loop 完整接管装配后的实际形态，任务书"以 06 的实际形态为准"）：
 //   1. tools/post-execute waterfall（工具结果出口，dsh-tools/lib/types/events.d.ts:40）：
 //      结果全文 → 共享 BlobSink（ctx.state，接 DSH storage）落盘 → kernel/obs 登记（audit）。
-//      失败结果原样放行且 info_gain=high（内核 classify：ok=false 一律 high，模型必须看到失败）；
+//      失败结果原样放行且 info_gain=full（内核 classify：ok=false 一律 full，模型必须看到失败）；
 //      结果内容绝不改写（decision 走 next() 原样 accept——驱动器 tf-peek 依赖原文，改写会毁 O2）。
 //   2. llm/stream waterfall（F4，dsh-llm/lib/types/index.d.ts:45）：逐请求泄漏扫描——
 //      已登记 blob 全文若原样出现在任一请求消息（含骨架单行不算，须全文逐字节包含），
@@ -111,7 +111,7 @@ export default function apply(ctx: HostCtxLike, config: ObsBrokerConfig = {}): O
         isError: result.isError,
         chars: content.length,
         handle: observation.handle,
-        info_gain: observation.info_gain, // 失败必为 high（内核规则）；模型必须看到失败
+        info_gain: observation.info_gain, // 失败必为 full（内核规则）；模型必须看到失败
         reason: observation.reason,
       });
     } catch (error) {

@@ -16,7 +16,7 @@
 //     不能复活——命令级失败兜底仍在驱动器里，构成防御纵深）。
 //   - 某段在某档没有专属文本时回退用 full 文本（如 lean/minimal 的 plan、lean 的 finalSummary）。
 
-export const PROTOCOL_SECTION_IDS = ['syntax', 'plan', 'results', 'selfread', 'timing', 'finalSummary', 'rules', 'peek'] as const;
+export const PROTOCOL_SECTION_IDS = ['syntax', 'plan', 'results', 'selfread', 'timing', 'finalSummary', 'rules', 'peek', 'v11', 'v12', 'v14', 'v15'] as const;
 export type ProtocolSectionId = (typeof PROTOCOL_SECTION_IDS)[number];
 
 export const PROTOCOL_LEVELS = ['full', 'lean', 'minimal'] as const;
@@ -230,6 +230,68 @@ const FULL_PEEK = `## 取回纪律（分页取回的真实成本）
 - 大文件（超出读取上限）只投行锚索引与未投递区间——按索引定位后再取，不要整读。
 - 每回合取回有字符预算（超预算会收到 [budget] 提示）：先用 tf-grep 缩小范围。`;
 
+/**
+ * v11 段（v1.1.0 新语法）：默认不进任何档位（LEVEL_SECTIONS 不含它），故金样逐字节不变、
+ * 旧会话前缀缓存零回归。需显式 `sections: { v11: true }` 或装配 `protocolSections` 开启。
+ * 内容为本轮四项新能力的模型可见语法（字符级取回 / 机器验收谓词 / 活动项 / 文件版本守卫）。
+ */
+const FULL_V11 = `## v1.1 增强语法（显式开启；未开启时这些能力不对模型可见）
+
+- 字符级取回：<tf-peek handle="..." offset="N" query="字面串" id="p1"/>。
+  offset 为字符起点；query 从 offset 起找首次出现并从该处返回（带 next offset=N 续搜提示）。
+  未命中是正常结果（正文一行"query 未命中"，先 tf-grep 定位或改 offset）；优先级高于 symbol/行段。
+- 机器验收谓词：tf-plan 验收项行尾写 " :: 谓词(...)"：
+  exists(path) / sha256(path, 64位hex) / bytes(path, min|max|eq, n) / regex(path, /pattern/flags)。
+  收束前机器判定，通过即验证；失败会在 final 拒绝里列出原因。
+- 活动项：tf-plan 正文里单独一行 "> [id]" 声明当前唯一活动项（重复声明只认第一条）。
+- 文件版本守卫：改文件前须先 tf-read；文件被外部改动会收到 revision_conflict（重新读）；
+  范围读后编辑请用 tf-edit offset="起始行" 声明目标行，未覆盖会收到 read_required。`;
+
+/**
+ * v12 段（v1.2.0，b 通道 PTC 对齐）：默认不进装配（金样不变）；需显式开启。
+ * 仅 code 通道 + enableCode 时可见，描述 tf-code 的 state/format/sandbox/release 属性。
+ */
+const FULL_V12 = `## v1.2 代码通道增强（b 通道，显式开启；须 enableCode 且宿主 PTC runtime 在位）
+
+- <tf-code format="function-body|repl|script" state="命名状态域" sandbox="read-only|workspace-write|danger-full-access" id="c1">程序</tf-code>：
+  format 选择执行形态（对齐宿主 executionMode 三档）；state 让变量跨调用存活（宿主按对象身份保留）；
+  sandbox 解析为宿主策略（未配置解析端口时不传，宿主保持自身默认）；不在白名单内的值会被结构化拒绝。
+  沙箱策略改变时保留态按宿主契约作废——同一 state 名在新策略下从空白内存开始，不跨策略复用。
+- <tf-code state="dom" release="true" id="c2"/>：释放命名状态域（清空宿主保留态）。
+- 未给出的属性一律不传宿主，宿主缺失这些字段时行为与旧版一致。`;
+
+/**
+ * v14 段（v1.4.0，0.5.3）：tf-code 单次提权（宿主 run_code 的 sandbox_permissions 同构）。
+ * 默认不进装配（金样逐字节不变）；显式开启或 code+bridge 精确追加时才可见。
+ * 编号避让：v1.3.0 已用于 0.5.2 的契约收敛（沙箱白名单/release 语义/receipt:N 等），
+ * 那些是既有命令语义的修正，不需要新段；提权是**新增属性**，故单列一段。
+ */
+const FULL_V14 = `## v1.4 单次提权（显式开启；宿主提供沙箱策略与审批服务时可用）
+
+- <tf-code sandbox_permissions="workspace-write|danger-full-access" justification="一句理由" id="c1">程序</tf-code>：
+  两个属性必须成对出现；审批只覆盖**本次**程序执行，不改变会话常驻策略，也不落盘。
+- 提权执行不携带 stateOwner：同一次调用里 state= 会被忽略（旧内存态不得在更宽策略下复活）。
+- 被拒绝时命令结构化失败（escalation-denied）：不要绕过沙箱重试；先检查是否真的需要更宽权限。
+- 宿主未提供策略/审批服务时命令直接失败（escalation-unavailable）——不要假设提权一定可用。`;
+
+/**
+ * v15 段（v1.5.0，0.6.0 正式版）：私有变更回执与守卫式回滚（对齐 [TF]/changes.py）。
+ * 默认不进装配（金样逐字节不变）；需显式 `sections: { v15: true }` 或装配 protocolSections 开启。
+ * 覆盖核验缺口修复：快照回执（begin/complete 语义）+ tf-changes/tf-diff/tf-revert。
+ */
+const FULL_V15 = `## v1.5 变更回执与守卫回滚（显式开启；对齐 thinkflow changes.py）
+
+- 每次 tf-write/tf-edit/tf-append 成功后登记一条私有回执（before/after 快照 + sha256）。
+  回执目录在模型输入之外，不可经 tf-write 覆盖。
+- <tf-changes id="ch1"/>：列出本会话回执（id/操作/路径/状态/可否回滚/expected 哈希）。
+  可加 path="..." 只看某路径。
+- <tf-diff change="回执id" id="d1"/>：该次变更的 unified diff（快照对快照，不是对当前文件）。
+- <tf-revert change="回执id" expected="after哈希" id="r1"/>：守卫式回滚到该次变更前的内容。
+  expected 必须等于回执的 after_hash 且等于文件当前哈希（双重校验）；文件已被后续编辑改动
+  会收到 revision_conflict——不要绕过，先 tf-changes 找到覆盖当前状态的那条回执。
+- 新建文件（before 不存在）不可回滚删除（new_file_requires_manual_recovery）；
+  超大/二进制/含密钥内容的变更只存元数据（快照不可用原因如实给出）。`;
+
 /** 各档各段文本；缺项回退 full（composeProtocolText 负责回退）。 */
 export const SECTION_TEXTS: Record<ProtocolLevel, Partial<Record<ProtocolSectionId, string>>> = {
   full: {
@@ -241,6 +303,10 @@ export const SECTION_TEXTS: Record<ProtocolLevel, Partial<Record<ProtocolSection
     finalSummary: FULL_FINALSUMMARY,
     rules: FULL_RULES,
     peek: FULL_PEEK,
+    v11: FULL_V11,
+    v12: FULL_V12,
+    v14: FULL_V14,
+    v15: FULL_V15,
   },
   lean: {
     syntax: LEAN_SYNTAX,
@@ -348,4 +414,17 @@ export function protocolPreview(opts: ComposeProtocolOptions = {}): ProtocolPrev
     savedChars: fullChars - text.length,
     sections,
   };
+}
+
+/**
+ * 只取指定增强段的文本（不携带默认 8 段）。
+ * 用于 code+bridge 通道在窄桥协议段后**精确追加** v11/v12/v14/v15，而不把 0.4 默认协议整段注入
+ * （后者会破坏"bridge 约 200 字符"与 preset 让位的设计）。
+ */
+export function enhancedSectionTexts(ids: readonly ProtocolSectionId[]): string {
+  return ids
+    .filter((id) => id === 'v11' || id === 'v12' || id === 'v14' || id === 'v15')
+    .map((id) => SECTION_TEXTS.full[id] ?? '')
+    .filter((s) => s !== '')
+    .join('\n\n');
 }

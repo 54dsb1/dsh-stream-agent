@@ -16,7 +16,7 @@
  *   0.5.0 P3 起压缩走 kernel/compaction.ts 的确定性摘要 + dropAppendHead 合法通道）；
  * - render() 内置 preflight：发送前对上一请求的稳定段做逐字节断言，违反直接抛错拒绝发送；
  * - 0.5.0（§8.3 K8）：前缀非单调按三类分别处置，新增**计划性换基**（planned-rebase）
- *   合法通道——surface replace / 段边界 / 通道切换产生的前缀断裂走 rebase()，重置基线
+ *   合法通道——整块压缩（dropAppendHead）/ 段边界 / 通道切换产生的前缀断裂走 rebase()，重置基线
  *   + 记账 + 模型侧可见（[tf-stream:context-rebased]），不采用"报错/重发"二分。
  *
  * 内核层纪律：零框架依赖、无 IO（时钟注入）。
@@ -63,7 +63,7 @@ export type DynamicPlacement = 'volatile-tail' | 'turn-freeze';
 
 /** 策略事件记录（红线：不许静默）。compress-history-request = 违规拒绝（accepted:false）；
  *  segment-drop = F7 显式段边界（accepted:true——整块丢弃、前缀基线重置并记录）；
- *  planned-rebase = 0.5.0 计划性换基（§8.3：surface replace / dropAppendHead / 通道切换
+ *  planned-rebase = 0.5.0 计划性换基（§8.3：dropAppendHead / 段边界 / 通道切换
  *  产生的合法换基——重置基线、记账、模型侧可见，accepted:true）。 */
 export interface PolicyViolationRecord {
   at: number;
@@ -87,9 +87,9 @@ export interface RenderClock {
  *  判定式：error.index < error.stablePrefixLen → 'stable-drift'（稳定段漂移——装配被改写，
  *  最严重）；否则 'append-drift'（追加区/转正块漂移——转正纪律被破坏）；长度收缩不匹配
  *  时为 'shrink'（历史被销毁且未走段边界通道）。
- *  'planned-rebase' 永不作为断言失败抛出——计划性换基（surface replace / 段边界 /
+ *  'planned-rebase' 永不作为断言失败抛出——计划性换基（整块压缩 / 段边界 /
  *  通道切换）走 ContextRenderer.rebase() 显式通道：重置基线 + 记账 + 模型侧可见
- *  （§8.3 K8：不采用"报错/重发"二分，宿主 surfaceOp:replace 是合法换基通道）。 */
+ *  （§8.3 K8：不采用"报错/重发"二分；压缩走整块丢弃，未使用 surfaceOp:replace）。 */
 export type PrefixBrokenCause = 'stable-drift' | 'append-drift' | 'shrink' | 'planned-rebase';
 
 /** 0.5.0（§8.6 实现要求 1）：换基后的模型可见一行。 */
@@ -393,7 +393,9 @@ export class ContextRenderer {
     placement: DynamicPlacement,
   ): void {
     for (const [key, value] of Object.entries(dynamics)) {
-      if (this.#prefix[0].content.includes(value)) {
+      // 0.6.0 复查修复（R1）：空串不可能被"写进"前缀造成漂移，但 ''.includes('') === true
+      // 会让任何空值动态字段误抛 DynamicInPrefixError、合法装配中断——跳过空值。
+      if (value !== '' && this.#prefix[0].content.includes(value)) {
         throw new DynamicInPrefixError(key);
       }
     }
@@ -456,6 +458,40 @@ export class ContextRenderer {
   /** 稳定段哈希（O4/O6 单调性证明与 08 号 prefix_hash 序列都用它）。 */
   stableHash(): string {
     return renderHash(this.stableMessages());
+  }
+
+  /**
+   * 0.6.0（RA-1）：装配投影快照——只读，供 AssemblyPlan 纯函数投影使用。
+   * 不改变任何渲染状态（不 render、不推进基线）；返回的是当前四段 + 追加块 + 易变尾的
+   * 逐字节副本，调用方可以连续调用 20 次得到完全一致的结果。
+   */
+  assemblySnapshot(): {
+    parts: { system: string; protocol: string; toolSchemas: string; invariants: string };
+    append: ReadonlyArray<{ kind: string; role: MessageRole; content: string; source?: RenderMessageSource }>;
+    tail: ReadonlyArray<{ role: MessageRole; content: string }>;
+  } {
+    return {
+      parts: { ...this.#prefixParts },
+      append: this.#appendBlocks.map((b) => ({
+        kind: b.kind,
+        role: b.role,
+        content: b.content,
+        ...(b.source === undefined ? {} : { source: b.source }),
+      })),
+      // 与 renderTail 逐块对齐：易变动态块（每请求重建）排在易变尾最前面。
+      tail: [
+        ...(this.#volatileDynamics.size === 0
+          ? []
+          : [{
+              role: 'user' as MessageRole,
+              content: [
+                '[动态上下文（易变尾，每请求重建）]',
+                ...[...this.#volatileDynamics.keys()].sort().map((k) => `${k}: ${this.#volatileDynamics.get(k)}`),
+              ].join('\n'),
+            }]),
+        ...this.#tailBlocks.map((b) => ({ role: b.role, content: b.content })),
+      ],
+    };
   }
 
   /**
@@ -577,7 +613,7 @@ export class ContextRenderer {
 
   /**
    * 0.5.0（§8.3 K8）：计划性换基——前缀非单调的第三类处置（合法路径，不是报错也不是
-   * 重发）。适用：surface replace 压缩 / 段边界 / **通道切换**（工具面与协议段同时变化，
+   * 重发）。适用：整块压缩（dropAppendHead）/ 段边界 / **通道切换**（工具面与协议段同时变化，
    * 必然破前缀；切换在任务边界执行，换基一次）。
    *
    * 行为：

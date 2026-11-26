@@ -55,7 +55,8 @@ function makeHarness(opts: { task: string; streams: Array<Array<unknown>>; confi
     executeTools: noopExecutor(),
     onToolSettled: () => {},
   };
-  const config: StreamDriverConfig = { provider: 'mock', model: 'mock-scenario', streamIdleTimeoutMs: 30_000, ...opts.config };
+  // 0.5.1（1.1）：这些用例覆盖 0.4.x 收束机制（缺 final → nudge → 重入）→ 回退开关
+  const config: StreamDriverConfig = { provider: 'mock', model: 'mock-scenario', streamIdleTimeoutMs: 30_000, requireFinal: true, ...opts.config };
   const driver = new SingleStreamDriver(ports, config);
   driver.pushUserTask(opts.task);
   return { driver, wireRequests, cleanup: () => rmSync(sandboxDir, { recursive: true, force: true }) };
@@ -199,7 +200,8 @@ function makeBigHarness(opts: {
     executeTools: contentExecutor(opts.files ?? {}),
     onToolSettled: () => {},
   };
-  const config: StreamDriverConfig = { provider: 'mock', model: 'mock-scenario', streamIdleTimeoutMs: 30_000, maxSteps: 16, ...opts.config };
+  // 0.5.1（1.1）：0.4.x 收束机制回归 → 回退开关
+  const config: StreamDriverConfig = { provider: 'mock', model: 'mock-scenario', streamIdleTimeoutMs: 30_000, maxSteps: 16, requireFinal: true, ...opts.config };
   const driver = new SingleStreamDriver(ports, config);
   driver.pushUserTask(opts.task);
   return { driver, wireRequests, cleanup: () => rmSync(sandboxDir, { recursive: true, force: true }) };
@@ -353,7 +355,7 @@ describe('0.5.0 压缩：效果压缩（§5.6(1)）', () => {
         executeTools: noopExecutor(),
         onToolSettled: () => {},
       },
-      { provider: 'mock', model: 'm', streamIdleTimeoutMs: 30_000, maxSteps: 12, effectElision: true, effectElisionKeepRecent: 2, maxInputTokens: 0, surfaceCompaction: false, observeBudgetTokens: 0 },
+      { provider: 'mock', model: 'm', streamIdleTimeoutMs: 30_000, maxSteps: 12, requireFinal: true, effectElision: true, effectElisionKeepRecent: 2, maxInputTokens: 0, surfaceCompaction: false, observeBudgetTokens: 0 },
     );
     driver.pushUserTask('效果压缩演练：连续四条命令后幂等重发第一条。');
     try {
@@ -372,6 +374,56 @@ describe('0.5.0 压缩：效果压缩（§5.6(1)）', () => {
       assert.ok(
         !replayBlock!.contentTexts.some((t) => t.includes('A-original-output') && t.includes('duplicate-replay') && t.includes('原结果')),
         '原始输出正文不随折叠回灌重发',
+      );
+    } finally {
+      void normalizeStreamShim;
+      void estimatePromptTokens;
+    }
+  });
+
+  it('E2. 回退点：effectElision=false → 不折叠，幂等重发仍回灌原始输出（行为等价 0.4.x）', async () => {
+    // 与 E1 同一剧本，只把 effectElision 关掉（§12.4 回退演练第一项）。
+    // 期望：不产生 [applied pN] 效果行；重发块回到原始结果正文；账本无 duplicate-replay-folded。
+    const bashStep = (id: string, cmd: string, note: string) => [
+      blockStart,
+      { type: 'text-delta', index: 0, text: `${note}\n<tf-bash cmd="${cmd}" id="${id}"/>\n` },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ];
+    const streams: Array<Array<unknown>> = [
+      bashStep('b1', 'echo A-original-output', '第一条命令。'),
+      bashStep('b2', 'echo B', '第二条。'),
+      bashStep('b3', 'echo C', '第三条。'),
+      bashStep('b4', 'echo D', '第四条。'),
+      [blockStart, { type: 'text-delta', index: 0, text: '再取一次第一条命令的结果。\n<tf-bash cmd="echo A-original-output" id="b1"/>\n' }, { type: 'finish', reason: { kind: 'stop' } }],
+      [blockStart, { type: 'text-delta', index: 0, text: '<tf-final id="f1" summary="完成：效果压缩回退点演练通过。"/>\n' }, { type: 'finish', reason: { kind: 'stop' } }],
+    ];
+    const wireRequests: Array<StreamRequestOptions & { contentTexts: string[] }> = [];
+    const driver = new SingleStreamDriver(
+      {
+        stream: (options) => {
+          const idx = Math.min(wireRequests.length, streams.length - 1);
+          wireRequests.push({ ...options, contentTexts: options.messages.map((m) => m.content.map((b) => b.text ?? '').join('\n')) });
+          return (async function* () { for (const c of streams[idx]!) yield c as never; })();
+        },
+        executeTools: noopExecutor(),
+        onToolSettled: () => {},
+      },
+      { provider: 'mock', model: 'm', streamIdleTimeoutMs: 30_000, maxSteps: 12, requireFinal: true, effectElision: false, effectElisionKeepRecent: 2, maxInputTokens: 0, surfaceCompaction: false, observeBudgetTokens: 0 },
+    );
+    driver.pushUserTask('效果压缩回退点演练：连续四条命令后幂等重发第一条。');
+    try {
+      const reason = await driver.runTurn();
+      assert.equal(reason.kind, 'completed', JSON.stringify(reason));
+      const records = driver.snapshot().records;
+      assert.ok(
+        !records.some((r) => r.kind === 'observation' && r.reason === 'duplicate-replay-folded'),
+        '关闭后不得走折叠通道',
+      );
+      const allTexts = wireRequests.flatMap((r) => r.contentTexts);
+      assert.ok(!allTexts.some((t) => t.includes('[applied p1]')), '关闭后不得出现 [applied pN] 效果行');
+      assert.ok(
+        allTexts.some((t) => t.includes('[tf-stream:replay') && t.includes('以下回灌它的原结果') && t.includes('pwsh:ok')),
+        '关闭后重发仍回灌原始结果正文（等价 0.4.x）',
       );
     } finally {
       void normalizeStreamShim;

@@ -273,7 +273,7 @@ describe('0.5.0 通道：来源皆无 → 拒绝进入，回退标准（不静�
       assert.equal(status.channel, 'standard', '回退标准通道');
       assert.equal(status.requestedChannel, 'code', '请求值如实保留（控制栏显示"代码通道不可用"）');
       assert.ok(status.channelFallback !== undefined && status.channelFallback.includes('不可用'), status.channelFallback ?? '');
-      assert.ok(h.warnings.some((w) => w.includes('代码通道不可用')), '告警不静默（§5.2）');
+      assert.ok(h.warnings.some((w) => w.includes('PTC兼容模式不可用')), '告警不静默（§5.2；0.6.1 更名）');
       void warnings;
       // 标准通道下 tf-final 正常收敛
       const reason = await h.driver.runTurn();
@@ -296,6 +296,58 @@ describe('0.5.0 通道：来源皆无 → 拒绝进入，回退标准（不静�
       assert.ok(result.detail!.includes('未检测到 PTC'), result.detail);
       const status = h.driver.runtimeStatus();
       assert.equal(status.channel, 'standard', '未切换');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('R3. 0.6.1 惰性探针：装载期无来源、窗口后开 PTC → setChannel 实时补判放行（修复"写入失败"误拒）', async () => {
+    // 真实场景：插件装载时宿主 PTC preset 尚未挂载（preset 按窗口/会话选择）——装载期探测
+    // 为空；用户随后在已开 PTC 的窗口里切到 PTC 兼容模式。0.6.0 的定死判据会永久拒绝；
+    // 0.6.1 setChannel 走惰性探针现取 tools/ptcRuntime 再判，命中即放行。
+    let probeResult: 'preset' | 'bridge' | null = null;
+    const h = makeHarness({
+      chunks: [blockStart, { type: 'text-delta', index: 0, text: '代码通道交付。' }, stop],
+      config: {
+        maxInputTokens: 0,
+        surfaceCompaction: false,
+        maxSteps: 4,
+        codeSourceProbe: () => probeResult,
+      },
+    });
+    h.driver.setIdentity('s', 't');
+    try {
+      assert.equal(h.driver.runtimeStatus().channel, 'standard', '构造期探针为空 → 标准通道');
+      const refused = h.driver.setChannel('code');
+      assert.equal(refused.ok, false, '探针为空仍拒绝（不静默）');
+      // 窗口后开 PTC：探针命中
+      probeResult = 'preset';
+      const queued = h.driver.setChannel('code');
+      assert.equal(queued.ok, true, `惰性探针命中后必须放行：${JSON.stringify(queued)}`);
+      h.driver.pushUserTask('切到 PTC 兼容模式。');
+      const status = h.driver.runtimeStatus();
+      assert.equal(status.channel, 'code', '任务边界生效');
+      assert.equal(status.codeSource, 'preset');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('R4. 0.6.1 惰性探针：channel=code 构造期探针命中 → 不回退，直接进入代码通道', async () => {
+    const h = makeHarness({
+      chunks: [blockStart, { type: 'text-delta', index: 0, text: '代码通道交付。' }, stop],
+      config: {
+        channel: 'code',
+        maxInputTokens: 0,
+        surfaceCompaction: false,
+        codeSourceProbe: () => 'bridge',
+      },
+    });
+    try {
+      const status = h.driver.runtimeStatus();
+      assert.equal(status.channel, 'code', '构造期探针命中 → 不回退');
+      assert.equal(status.requestedChannel, 'code');
+      assert.equal(status.channelFallback, undefined, '无回退事实');
     } finally {
       h.cleanup();
     }

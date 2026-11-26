@@ -1,0 +1,78 @@
+{
+  "id": "U5",
+  "question": "surfaceOp:'replace' 是否被宿主接受并影响下一请求",
+  "observation": "replace 后下一请求的 messages 基线",
+  "verdict": "unsupported",
+  "scope": "plugin-seam",
+  "hostVerification": "pending",
+  "reason": "适配层契约里没有 surfaceOp 字段（0.5.0 已决议不使用该通道）：插件无法表达\"替换历史\"，历史改写不可行，RA-2 只能\"不产生\"而不是\"事后删\"。",
+  "requests": [
+    {
+      "index": 0,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3,
+          "head": "SYS"
+        },
+        {
+          "role": "user",
+          "chars": 6,
+          "head": "turn-0"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 1,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3,
+          "head": "SYS"
+        },
+        {
+          "role": "user",
+          "chars": 6,
+          "head": "turn-1"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 2,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3,
+          "head": "SYS"
+        },
+        {
+          "role": "user",
+          "chars": 6,
+          "head": "turn-2"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3,
+      "hasReasoningBlocks": false
+    }
+  ],
+  "diff": [
+    "3 个请求的 StreamRequestOptions 均不含 surfaceOp 字段（契约无此键）"
+  ],
+  "evidence": [
+    {
+      "at": "entry/loop.ts:148",
+      "quote": "export interface StreamRequestOptions {"
+    },
+    {
+      "at": "kernel/render.ts:583",
+      "quote": "requestHistoryCompression(req: {"
+    }
+  ]
+}

@@ -6,13 +6,15 @@
  * 本文件不 import 任何模块（连 node:crypto 都不用）——内容寻址（sha256）
  * 归 state.ts 管，这里只需要一个"内容是否变化"的判定哈希（FNV-1a 足够）。
  *
- * info_gain 三档规则表（写死，规则式分类，禁止调用模型）：
+ * info_gain 三档反馈形态（0.5.1 / 2.2 对齐上游 max_content_chars=0：默认全文回灌）：
  * | info_gain | 触发条件                                       | 处理                     |
  * |-----------|-----------------------------------------------|--------------------------|
- * | high      | read/grep/glob/web/test/build 的首次输出；      | 放行注入（行骨架）        |
+ * | full      | read/grep/glob/web/test/build 的首次或变化输出；| 放行注入（全文/骨架）     |
  * |           | 一切执行失败                                   |                          |
- * | low       | write/append/mkdir（含 bash）的成功回执         | 句柄化，不注入            |
- * | none      | 重复观测、内容哈希未变、空输出                   | 连句柄目录都不更新，只记 ledger |
+ * | handle    | write/append/mkdir/office/goal 的成功回执       | 句柄化，不注入            |
+ * | dedup     | 重复观测、内容哈希未变、空输出                   | 只记 ledger，回灌去重字面量 |
+ *
+ * 命名与 request 记录的 feedbackBytes 三桶（full/dedup/handle）逐字一致——字节可外部复算。
  *
  * 计数器口径（对齐 08 号任务书 eval/METRICS.md：injected_ratio = injected / produced）：
  * - produced：observe() 收到的每一条观测（含 none）；
@@ -23,17 +25,19 @@
  * 口径若变，只改上报层，不改本文件逻辑。
  */
 
+import { redactSecrets } from './security.ts';
+
 /** 工具族：分类器的输入粒度 */
 export type ToolFamily =
   | 'read' | 'grep' | 'glob' | 'web' | 'test' | 'build'   // 高增益候选族
   | 'code'                                                // tf-code 程序化结果（高增益：首个/变化结果注骨架）
   | 'skill' | 'agent' | 'job' | 'ask'                     // v0.4.0 tf-call 扩族（高增益：内容型产出必须可见）
   | 'write' | 'append' | 'mkdir'                          // 低增益回执族
-  | 'bash'                                                // 成功记 ledger、失败注入（README §5）
+  | 'bash'                                                // 0.5.2：成功输出按首次/变化回灌（审计 C1）
   | 'office' | 'goal'                                     // v0.4.0 tf-call 扩族（低增益回执：产物/状态确认）
   | 'other';                                              // 未识别工具：默认按 low（默认不回灌）
 
-export type InfoGain = 'high' | 'low' | 'none';
+export type InfoGain = 'full' | 'dedup' | 'handle';
 
 export interface ObservationInput {
   /** 工具名，如 'tf-read' / 'tf-write' / 'tf-bash' / 'grep' */
@@ -66,9 +70,13 @@ export interface ClassificationContext {
 const HIGH_GAIN_FAMILIES: ReadonlySet<ToolFamily> = new Set([
   'read', 'grep', 'glob', 'web', 'test', 'build', 'code',
   'skill', 'agent', 'job', 'ask',
+  // 0.5.2（审计 C1）：bash 成功输出必须可见——上游 thinkflow 把 shell stdout 原样回给模型；
+  // 只记回执时模型跑完 `npm test`/`git status` 看不到任何内容，只能重跑或凭空猜。
+  // 走 high 族语义：首次或内容变化 → full，重复且未变 → dedup（不会重复烧 token）。
+  'bash',
 ]);
 const LOW_RECEIPT_FAMILIES: ReadonlySet<ToolFamily> = new Set([
-  'write', 'append', 'mkdir', 'bash', 'office', 'goal',
+  'write', 'append', 'mkdir', 'office', 'goal',
 ]);
 
 /** 工具名 → 工具族。tf-* 命令名与其同族名一一对应；未知工具归 other。 */
@@ -107,30 +115,28 @@ export function classifyTool(tool: string): ToolFamily {
  */
 export function classify(input: ObservationInput, ctx?: ClassificationContext): Classification {
   if (!input.ok) {
-    return { info_gain: 'high', reason: 'execution-failure' };
+    return { info_gain: 'full', reason: 'execution-failure' };
   }
   if (input.content === '') {
-    return { info_gain: 'none', reason: 'empty-output' };
+    return { info_gain: 'dedup', reason: 'empty-output' };
   }
   const family = classifyTool(input.tool);
   if (LOW_RECEIPT_FAMILIES.has(family)) {
-    return family === 'bash'
-      ? { info_gain: 'low', reason: 'successful-exec-receipt' }
-      : { info_gain: 'low', reason: 'successful-write-receipt' };
+    return { info_gain: 'handle', reason: 'successful-write-receipt' };
   }
   if (HIGH_GAIN_FAMILIES.has(family)) {
     const hash = hashContent(input.content);
     // 首次（无历史）或内容已变化（新版本）→ high；重复且哈希未变 → none
     if (ctx?.lastHash === undefined) {
-      return { info_gain: 'high', reason: `first-observation:${family}` };
+      return { info_gain: 'full', reason: `first-observation:${family}` };
     }
     if (ctx.lastHash === hash) {
-      return { info_gain: 'none', reason: 'duplicate-observation' };
+      return { info_gain: 'dedup', reason: 'duplicate-observation' };
     }
-    return { info_gain: 'high', reason: `content-changed:${family}` };
+    return { info_gain: 'full', reason: `content-changed:${family}` };
   }
   // other：未知工具，保守处理为低增益回执（默认不回灌哲学）
-  return { info_gain: 'low', reason: 'unknown-tool-receipt' };
+  return { info_gain: 'handle', reason: 'unknown-tool-receipt' };
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +283,7 @@ export class InMemoryBlobSink implements BlobSink {
 }
 
 export interface ObsKernelOptions {
-  /** 饥饿防线阈值：连续 N 步无 high 注入时升级注入最近一条 low 观测（默认 5） */
+  /** 饥饿防线阈值：连续 N 步无 full 注入时升级注入最近一条 handle 观测（默认 5） */
   starvationThreshold?: number;
   /** blob 出口注入；缺省内存实现 */
   sink?: BlobSink;
@@ -286,6 +292,13 @@ export interface ObsKernelOptions {
    * `spanLedger: false` 行为等价 0.4.0——重复取回同一区间重复付费）。
    */
   spanLedger?: boolean;
+  /**
+   * 0.6.0 正式版（security 缺口修复）：模型可见输出脱敏（默认开）。
+   * observe() 登记前对内容做 redactSecrets（对齐 [TF]/output_capture.py:19-41：
+   * 落盘/回显前先脱敏）——句柄存储、全文回灌、recall 取回全部继承脱敏后的内容。
+   * false = 关闭（回退点；装配显式选择）。
+   */
+  redact?: boolean;
 }
 
 interface DirEntryInternal {
@@ -312,10 +325,111 @@ const DEFAULT_STARVATION_THRESHOLD = 5;
  * request:N 句柄别名（§7.6）、取回度量（§7.4）。
  * 每个任务一个实例（reset() 或直接 new）。
  */
+/**
+ * 0.6.0（PE-1）：query 未命中时的候选行段。命中率不足的主因是"只能盲试"——
+ * 未命中必须给出可执行线索（行号 + 首行），且不调模型、不改参数。
+ *
+ * 排序：按查询词在该行的命中次数降序，行号升序兜底；零命中也给候选（文件头部若干行），
+ * 绝不返回空（"未命中 100% 有候选"）。总长受 maxChars 约束（默认 2000）。
+ */
+export interface QueryCandidate {
+  line: number;
+  text: string;
+  score: number;
+}
+
+export function queryCandidates(
+  content: string,
+  query: string,
+  opts: { limit?: number; maxChars?: number } = {},
+): QueryCandidate[] {
+  const lines = content.split('\n');
+  const maxChars = Math.max(120, opts.maxChars ?? 2000);
+  const limit = Math.max(1, opts.limit ?? 3);
+  // 查询词：整串 + 按非字母数字切分出的词（中文按整串，避免把"配置项"切成单字）
+  const whole = query.trim();
+  const terms = new Set<string>();
+  if (whole !== '') terms.add(whole);
+  for (const t of whole.split(/[^\p{L}\p{N}_]+/u)) {
+    if (t !== '' && t !== whole) terms.add(t);
+  }
+  const scored: QueryCandidate[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const text = lines[i]!;
+    if (text.trim() === '') continue;
+    let score = 0;
+    for (const term of terms) {
+      if (term === '') continue;
+      let from = 0;
+      while (true) {
+        const hit = text.indexOf(term, from);
+        if (hit < 0) break;
+        score += 1;
+        from = hit + Math.max(1, term.length);
+      }
+    }
+    scored.push({ line: i + 1, text: text.trim().slice(0, 120), score });
+  }
+  const ranked = scored
+    .filter((c) => c.score > 0)
+    .sort((a, b) => (b.score - a.score) || (a.line - b.line));
+  const picked: QueryCandidate[] = [];
+  const seenLines = new Set<number>();
+  const push = (c: QueryCandidate): void => {
+    if (picked.length >= limit || seenLines.has(c.line)) return;
+    picked.push(c);
+    seenLines.add(c.line);
+  };
+  for (const c of ranked) push(c);
+  // 零命中/命中不足：用文件头部行补足（候选必须有，但不冒充"命中"）
+  if (picked.length < limit) {
+    for (const c of scored) {
+      if (picked.length >= limit) break;
+      push({ ...c, score: 0 });
+    }
+  }
+  // 总长上限：逐条裁剪（宁可少一条也不超预算）
+  const out: QueryCandidate[] = [];
+  let used = 0;
+  for (const c of picked) {
+    const cost = `L${c.line} ${c.text}`.length + 1;
+    if (used + cost > maxChars) {
+      // 0.6.0 复查修复（O2）：头注释承诺"绝不返回空"——此前第一条即超预算时整体
+      // break 返回 []。现在至少保留一条（裁剪到剩余预算内），契约成立。
+      if (out.length === 0) {
+        const room = Math.max(1, maxChars - used - 1);
+        out.push({ line: c.line, text: c.text.slice(0, room), score: c.score });
+      }
+      break;
+    }
+    out.push(c);
+    used += cost;
+  }
+  return out;
+}
+
+/** 0.6.0（PE-3）：句柄的外部文件绑定——read 时登记的快照（path + mtimeMs + size）。 */
+export interface FileBinding {
+  path: string;
+  mtimeMs: number;
+  size: number;
+}
+
+/** 快照与当前 stat 是否不一致（mtime 或 size 任一变化 = 文件已变）。纯函数。 */
+export function isBindingStale(binding: FileBinding, current: { mtimeMs: number; size: number }): boolean {
+  return binding.mtimeMs !== current.mtimeMs || binding.size !== current.size;
+}
+
+/** 0.6.0（PE-3）：`[stale]` 一行文案（模型必须知道"内容变了"，不许静默替换旧文）。 */
+export function staleLine(binding: FileBinding, current: { mtimeMs: number; size: number }): string {
+  return `[stale] handle 对应的文件已变更（${binding.path}）：登记时 mtime=${Math.round(binding.mtimeMs)} size=${binding.size}，当前 mtime=${Math.round(current.mtimeMs)} size=${current.size}。旧文本不代表当前内容——请重新 tf-read 该文件后再取回。`;
+}
+
 export class ObservationLedger {
   private readonly threshold: number;
   private readonly sink: BlobSink;
   private readonly spanLedgerEnabled: boolean;
+  private readonly redactEnabled: boolean;
 
   private seqCounter = 0;
   private readonly contentByHandle = new Map<string, string>();
@@ -348,6 +462,8 @@ export class ObservationLedger {
   private producedTotal = 0;
   private peekedTotal = 0;
   private drySteps = 0;
+  /** 0.6.0（PE-3）：句柄 → 外部文件绑定（read 时登记的 mtime+size 快照）。 */
+  private readonly fileBindings = new Map<string, FileBinding>();
 
   constructor(options: ObsKernelOptions = {}) {
     const t = options.starvationThreshold ?? DEFAULT_STARVATION_THRESHOLD;
@@ -357,6 +473,7 @@ export class ObservationLedger {
     this.threshold = t;
     this.sink = options.sink ?? new InMemoryBlobSink();
     this.spanLedgerEnabled = options.spanLedger !== false;
+    this.redactEnabled = options.redact !== false;
   }
 
   // ------------------------------------------------------------------
@@ -454,6 +571,28 @@ export class ObservationLedger {
   }
 
   /**
+   * 0.6.0 正式版（conversation 缺口）：用户请求原文句柄化 + request:N 别名登记
+   *（对齐 [TF]/conversation.py:25-36）。**不走 observe() 的工具观测口径**——
+   * 请求原文不是工具产出，不进 produced/injected 度量（否则每个任务凭空多一条
+   * "写观测"，污染 §7.4 指标）；只进句柄目录与存储，tf-peek handle="request:N" 可取回。
+   */
+  registerRequestText(requestSeq: number, text: string): string {
+    const content = this.redactEnabled ? redactSecrets(text) : text;
+    const key = `request:${requestSeq}:task`;
+    const version = (this.versionByKey.get(key) ?? 0) + 1;
+    const handle = `obs:request:req-t${requestSeq}@v${version}`;
+    const hash = hashContent(content);
+    this.contentByHandle.set(handle, content);
+    this.sink.put(handle, content);
+    this.hashByHandle.set(handle, hash);
+    this.versionByKey.set(key, version);
+    this.lastHashByKey.set(key, hash);
+    this.handleByKey.set(key, handle);
+    this.registerRequestHandle(requestSeq, handle);
+    return handle;
+  }
+
+  /**
    * 0.5.0（Appendix B："peek 增符号定位与 span 去重"）：按符号定位取回——
    * 在句柄内容中查找**顶层符号**定义行（TOP_LEVEL_SYMBOL_RE），返回 ±window 行窗口。
    * 模型不再需要按行号猜测（§7.2 问题 1 的直接修复）；找不到返回 null（调用方按
@@ -470,7 +609,11 @@ export class ObservationLedger {
     }
     const lines = content.split('\n');
     if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
-    const re = new RegExp(`\\b${escapeRegExp(symbol)}\\b`);
+    // 0.6.0 复查修复（O1）：JS \b 只在 ASCII 词字符（[\w]）边界成立——纯中文符号两侧
+    // 无 ASCII 词字符交界，\b 恒不成立，中文符号定位 100% 失败（unknown-symbol）。
+    // 改用显式 lookaround：两侧不得是 ASCII 词字符（字母/数字/下划线）。对 ASCII 符号
+    // 语义与 \b 一致；对中文符号，两侧是中文/空白/标点均可命中（中文本身非词字符）。
+    const re = new RegExp(`(?<![A-Za-z0-9_])${escapeRegExp(symbol)}(?![A-Za-z0-9_])`);
     let found = -1;
     for (let i = 0; i < lines.length; i++) {
       if (TOP_LEVEL_SYMBOL_RE.test(lines[i]!) && re.test(lines[i]!)) {
@@ -513,13 +656,15 @@ export class ObservationLedger {
 
   /** 登记一条工具产出观测，返回三档结果（O1）。 */
   observe(input: ObservationInput): ObservationResult {
+    // 0.6.0 正式版：脱敏先于一切登记/落盘/回灌（密钥赋值 → [REDACTED]）。
+    if (this.redactEnabled) input = { ...input, content: redactSecrets(input.content) };
     this.producedTotal++;
     this.producedBytes += Buffer.byteLength(input.content, 'utf8');
     const family = classifyTool(input.tool);
     const cls = classify(input, { lastHash: this.lastHashByKey.get(input.key) });
     const seq = ++this.seqCounter;
 
-    if (cls.info_gain === 'none') {
+    if (cls.info_gain === 'dedup') {
       // none：连句柄目录都不更新，只记 ledger。回灌字面量计入 injected（占请求体积）。
       this.ledger.push({
         handle: this.handleByKey.get(input.key) ?? '',
@@ -527,13 +672,13 @@ export class ObservationLedger {
         family,
         version: this.versionByKey.get(input.key) ?? 0,
         seq,
-        info_gain: 'none',
+        info_gain: 'dedup',
         reason: cls.reason,
       });
       this.injectedTotal++;
       return {
         handle: this.handleByKey.get(input.key) ?? null,
-        info_gain: 'none',
+        info_gain: 'dedup',
         reason: cls.reason,
         seq,
         payload: { kind: 'unchanged', text: UNCHANGED_TEXT },
@@ -570,12 +715,12 @@ export class ObservationLedger {
       info_gain: cls.info_gain, reason: cls.reason,
     });
 
-    if (cls.info_gain === 'high') {
+    if (cls.info_gain === 'full') {
       const skeleton = renderSkeleton(input.content);
       this.injectedTotal++;
       return {
         handle,
-        info_gain: 'high',
+        info_gain: 'full',
         reason: cls.reason,
         seq,
         payload: { kind: 'skeleton', skeleton, rendered: skeletonToText(skeleton) },
@@ -586,7 +731,7 @@ export class ObservationLedger {
     this.lowRecords.push({ handle, key: input.key, content: input.content, seq });
     return {
       handle,
-      info_gain: 'low',
+      info_gain: 'handle',
       reason: cls.reason,
       seq,
       payload: { kind: 'receipt', handle, note: '句柄化，不注入' },
@@ -609,13 +754,96 @@ export class ObservationLedger {
     return lines.slice(from - 1, to).join('\n');
   }
 
+  /**
+   * 2.3：字符级取回（对齐 thinkflow recall.py:34 recall_text）。
+   * offset = 字符起点（UTF-16 索引，与 JS slice 一致）；limit = 最大字符数；
+   * query = 字面续搜串——从 offset 起找首次出现，命中则从该处返回；未命中返回 null
+   * （调用方上报 query-not-found，不静默）。返回 continuation 提示供模型续搜。
+   */
+  recallText(
+    handle: string,
+    opts: { offset?: number; limit?: number; query?: string },
+  ): { text: string; start: number; end: number; continuation: string | null } | null {
+    const content = this.contentByHandle.get(handle);
+    if (content === undefined) return null;
+    // 审查修正：limit<=0 明确返回空（预算耗尽时不得回退到 8000 绕过 peekBudgetChars）。
+    const limit = opts.limit === undefined ? 8000 : Math.floor(opts.limit);
+    if (limit <= 0) return { text: '', start: 0, end: 0, continuation: null };
+    const rawOffset = Math.floor(opts.offset ?? 0);
+    if (rawOffset < 0) return null; // 对齐 [TF]/recall.py:39 负 offset 拒绝
+    if (rawOffset > content.length) return null; // 对齐 [TF]/recall.py:43 offset 越界拒绝
+    const hasQuery = opts.query !== undefined && opts.query !== '';
+    let start = rawOffset;
+    let continueFrom: number | undefined;
+    if (hasQuery) {
+      const found = content.indexOf(opts.query!, start);
+      if (found < 0) return null; // 调用方上报 query-not-found
+      // 对齐 [TF]/recall.py:63-69：回退 min(200, limit//4) 字符并对齐行首。
+      const back = Math.min(200, Math.floor(limit / 4));
+      let queryStart = Math.max(0, found - back);
+      const prefix = content.slice(queryStart, found);
+      const lineBreak = Math.max(prefix.lastIndexOf('\n'), prefix.lastIndexOf('\r'));
+      if (lineBreak >= 0) queryStart += lineBreak + 1;
+      start = queryStart;
+      // 对齐 [TF]/recall.py:78：续搜锚点 = 命中位置 + query 长度（不是窗口末尾）。
+      continueFrom = found + opts.query!.length;
+    }
+    let end = Math.min(content.length, start + limit);
+    let text = content.slice(start, end);
+    if (hasQuery) {
+      // 对齐 [TF]/recall.py:71-76：截到命中后的第一个行尾。
+      const matchInText = content.indexOf(opts.query!, start) - start;
+      const cr = text.indexOf('\r', Math.max(0, matchInText));
+      const lf = text.indexOf('\n', Math.max(0, matchInText));
+      const lineEnd = Math.min(...[cr, lf].filter((p) => p >= 0), text.length);
+      if (lineEnd < text.length) {
+        text = text.slice(0, lineEnd);
+        end = start + text.length;
+      }
+    }
+    this.peekedTotal++;
+    this.injectedTotal++;
+    this.derefBytes += Buffer.byteLength(text, 'utf8');
+    // 审查修正：与 peekWithLedger/peekBySymbol 一致计入 peekRequests 与 kMean。
+    this.peekRequestTotal++;
+    this.peekCountByHandle.set(handle, (this.peekCountByHandle.get(handle) ?? 0) + 1);
+    return {
+      text,
+      start,
+      end,
+      // query 命中用续搜锚点；纯 offset 用窗口末尾。
+      continuation: (() => {
+        const from = continueFrom ?? end;
+        return from < content.length ? (hasQuery ? `query=${opts.query} next offset=${from}` : `next offset=${from}`) : null;
+      })(),
+    };
+  }
+
   /** 标记句柄失效（如文件被外部删除/覆盖）。返回新 seq 供装配器推进游标；未知 key 返回 null。 */
-  markStale(key: string): number | null {
-    const entry = this.dirByKey.get(key);
+  markStale(key: string): number | null {    const entry = this.dirByKey.get(key);
     if (!entry) return null;
     entry.stale = true;
     entry.lastSeq = ++this.seqCounter;
     return entry.lastSeq;
+  }
+
+  // ------------------------------------------------------- 0.6.0 TF-PEEK（PE-1/PE-3）
+
+  /** PE-1：query 未命中时的候选行段（纯计算，不调模型；永不返回空）。 */
+  queryCandidates(handle: string, query: string, opts: { limit?: number; maxChars?: number } = {}): QueryCandidate[] {
+    const content = this.contentByHandle.get(handle);
+    if (content === undefined) return [];
+    return queryCandidates(content, query, opts);
+  }
+
+  /** PE-3：登记/更新句柄的文件绑定（tf-read 成功时调用；旧绑定被覆盖）。 */
+  registerFileBinding(handle: string, binding: FileBinding): void {
+    this.fileBindings.set(handle, binding);
+  }
+
+  /** PE-3：读取句柄的文件绑定（无绑定 = 该句柄不是文件读取产物，peek 不做 stat 校验）。 */
+  fileBindingOf(handle: string): FileBinding | undefined {
+    return this.fileBindings.get(handle);
   }
 
   /** 句柄目录差分（O3）：added / changed / stale 三列表，按 seq 升序。 */
@@ -637,9 +865,9 @@ export class ObservationLedger {
 
   /**
    * 饥饿防线（M2 关键防线）：每个 step 结束时由 loop 调用。
-   * 连续 threshold 步没有任何 high 注入 → 把最近一条 low 观测的骨架
+   * 连续 threshold 步没有任何 full 注入 → 把最近一条 handle 观测的骨架
    * 升格注入，防止模型在信息真空中瞎猜。触发后计数清零（再连续 N 步可再次触发）。
-   * 无 low 观测可升级时不触发、不清零（继续等待）。
+   * 无 handle 观测可升级时不触发、不清零（继续等待）。
    */
   noteStep(highInjectedThisStep: boolean): ObservationResult | null {
     if (highInjectedThisStep) {
@@ -654,7 +882,7 @@ export class ObservationLedger {
     this.injectedTotal++;
     return {
       handle: rec.handle,
-      info_gain: 'high',
+      info_gain: 'full',
       reason: 'starvation-promotion',
       seq: rec.seq,
       payload: { kind: 'skeleton', skeleton, rendered: skeletonToText(skeleton) },
@@ -836,6 +1064,20 @@ export function renderReadIndex(content: string, opts: ReadIndexOptions = {}): s
   let body = anchors.map((a) => `  L${a.line} ${a.text}`).join('\n');
   if (head.length + 1 + body.length > maxIndexChars) {
     body = anchors.map((a) => `  L${a.line} ${symbolNameOf(a.text)}`).join('\n');
+    // 0.6.0（PE-2）：锚点可加密（peekAnchorEvery=100）→ 降级形态仍可能超上限；
+    // 此时按行截断（保留前 N 个锚 + 一行省略说明），硬保证 ≤ maxIndexChars。
+    if (head.length + 1 + body.length > maxIndexChars) {
+      const keptLines: string[] = [];
+      let used = head.length + 1;
+      for (const a of anchors) {
+        const row = `  L${a.line} ${symbolNameOf(a.text)}`;
+        if (used + row.length + 1 > maxIndexChars - 24) break;
+        keptLines.push(row);
+        used += row.length + 1;
+      }
+      const omitted = anchors.length - keptLines.length;
+      body = [...keptLines, omitted > 0 ? `  …（其余 ${omitted} 个锚点已省略：读窗口请用 tf-grep 收窄）` : ''].join('\n');
+    }
   }
 
   const parts = [head];
@@ -844,7 +1086,58 @@ export function renderReadIndex(content: string, opts: ReadIndexOptions = {}): s
   if (undeliveredDesc !== '') {
     parts.push(`未投递区间：${undeliveredDesc} → 用 tf-peek handle=... from_line=.. to_line=.. 取回`);
   }
-  return parts.join('\n');
+  const text = parts.join('\n');
+  if (text.length <= maxIndexChars) return text;
+
+  // 0.6.0（PE-2）：超上限时的**降级顺序**。导航信息优先：已投递区间是"历史账"，
+  // 索引与未投递区间才是"接下来读哪里"——所以降级后把已投递放最后并截断，
+  // 而不是让它在前面把索引整段挤掉（审查实测：40 个已投递区间就能挤掉索引）。
+  // 默认（未超限）输出字节不变：上面已按 0.5.0 顺序返回。
+  const mergedDelivered = mergeSpans(delivered);
+  const deliveredShort = mergedDelivered.length === 0
+    ? ''
+    : `已投递 ${mergedDelivered.length} 段：${mergedDelivered.slice(-6).map((sp) => `L${sp.from}-${sp.to}`).join(' + ')}${mergedDelivered.length > 6 ? ' +…' : ''}`;
+  const undeliveredLine = undeliveredDesc === ''
+    ? ''
+    : `未投递区间：${undeliveredDesc.length > 600 ? `${undeliveredDesc.slice(0, 600)}…` : undeliveredDesc} → 用 tf-peek 按窗口取回`;
+  const anchorLines = anchors.map((a) => `  L${a.line} ${symbolNameOf(a.text)}`);
+  const fixed = [head, undeliveredLine, deliveredShort].filter((x) => x !== '');
+  const fixedChars = fixed.reduce((n, x) => n + x.length + 1, 0);
+  const indexHeader = `索引（每 ${anchorEvery} 行一个锚；超限只给符号名）：`;
+  const room = Math.max(0, maxIndexChars - fixedChars - indexHeader.length - 26);
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of anchorLines) {
+    if (used + line.length + 1 > room) break;
+    kept.push(line);
+    used += line.length + 1;
+  }
+  const omitted = anchorLines.length - kept.length;
+  const tailNote = omitted > 0 ? `  …（其余 ${omitted} 个锚点已省略：用 tf-grep 收窄）` : '';
+  const composed = [
+    head,
+    kept.length > 0 ? `${indexHeader}\n${kept.join('\n')}${tailNote === '' ? '' : `\n${tailNote}`}` : '',
+    undeliveredLine,
+    deliveredShort,
+  ].filter((x) => x !== '').join('\n');
+  return composed.slice(0, maxIndexChars);
+}
+
+/** 区间归一：排序 + 合并相邻/重叠（只用于超限降级路径，默认输出字节不受影响）。 */
+function mergeSpans(spans: ReadonlyArray<{ from: number; to: number }>): Array<{ from: number; to: number }> {
+  const sorted = [...spans]
+    .filter((sp) => sp.to >= sp.from)
+    .sort((a, b) => (a.from - b.from) || (a.to - b.to));
+  const out: Array<{ from: number; to: number }> = [];
+  for (const sp of sorted) {
+    const last = out[out.length - 1];
+    if (last !== undefined && sp.from <= last.to + 1) {
+      last.to = Math.max(last.to, sp.to);
+    } else {
+      out.push({ from: sp.from, to: sp.to });
+    }
+  }
+  return out;
 }
 
 /** 从锚文本提取符号名（R9 降级形态：只给符号名不给行内容）。 */

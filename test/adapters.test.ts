@@ -310,16 +310,16 @@ describe('07 obs-broker', () => {
     assert.equal(counters.produced, 1);
     assert.equal(counters.injected, 1, '首次 high 骨架计入 injected（08 号口径）');
     const audit = handle.faults.records.find((r) => r.kind === 'audit');
-    assert.equal((audit?.data['info_gain'] as string), 'high');
+    assert.equal((audit?.data['info_gain'] as string), 'full');
     assert.equal((audit?.data['handle'] as string), 'obs:read:r1@v1');
   });
 
-  it('B2: 失败结果 info_gain=high（模型必须看到失败）且原样放行', async () => {
+  it('B2: 失败结果 info_gain=full（模型必须看到失败）且原样放行', async () => {
     const { handle, postExecute } = setup();
     const result = { isError: true, content: [{ type: 'text', text: 'EFAIL: boom' }] };
     await postExecute({ callId: 'b1', name: 'tf-bash', arguments: { cmd: 'boom' } }, result, () => Promise.resolve(result));
     const audit = handle.faults.records.find((r) => r.kind === 'audit');
-    assert.equal((audit?.data['info_gain'] as string), 'high');
+    assert.equal((audit?.data['info_gain'] as string), 'full');
     assert.equal((audit?.data['isError'] as boolean), true);
   });
 
@@ -329,7 +329,7 @@ describe('07 obs-broker', () => {
     await postExecute({ callId: 'c1', name: 'tf-read', arguments: { file_path: 'same.txt' } }, result, () => Promise.resolve(result));
     await postExecute({ callId: 'c2', name: 'tf-read', arguments: { file_path: 'same.txt' } }, result, () => Promise.resolve(result));
     const audits = handle.faults.records.filter((r) => r.kind === 'audit');
-    assert.equal((audits[1]?.data['info_gain'] as string), 'none');
+    assert.equal((audits[1]?.data['info_gain'] as string), 'dedup');
     assert.equal((audits[1]?.data['reason'] as string), 'duplicate-observation');
   });
 

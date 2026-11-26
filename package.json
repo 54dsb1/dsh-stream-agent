@@ -3,7 +3,7 @@
   "version": "0.5.0",
   "license": "Apache-2.0",
   "type": "module",
-  "description": "单流协议 DSH 插件 0.5.0：单插件双通道（标准/代码）× 上下文档位（轻/标准/深）· 双旋钮预算（maxSteps/maxInputTokens）· span 账本去重 · 行锚索引取回 · 确定性压缩与效果折叠 · 计划性换基 · PTC 三来源让位",
+  "description": "单流协议 DSH 插件 0.5.0：单插件双通道（标准/代码）× 上下文档位（轻/标准/深）· 行为预设（5 套可改）与上下文原样档 · 双旋钮预算（maxSteps/maxInputTokens）· span 账本去重 · 行锚索引取回 · 确定性压缩与效果折叠 · 计划性换基 · PTC 三来源让位 · 用户自定义上限（limits，0 = 不限制） · 变更回执与守卫式回滚（tf-changes/tf-diff/tf-revert） · 默认密钥保护 · 围栏隔离 / 同轮交付 / 验收证据绑定 / 全文回灌",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -33,7 +33,10 @@
     "check": "node scripts/check-consistency.mjs",
     "gate": "node scripts/gate.mjs",
     "release": "node scripts/release.mjs",
-    "release:dry": "node scripts/release.mjs --dry-run"
+    "release:dry": "node scripts/release.mjs --dry-run",
+    "drill": "node eval/tools/rollback-drill.mjs",
+    "eval:four-arm": "node eval/tools/four-arm-real.mjs",
+    "eval:verdict": "node eval/tools/four-arm-verdict.mjs --selftest"
   },
   "engines": {
     "node": ">=22.18",

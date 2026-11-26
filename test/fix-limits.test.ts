@@ -116,7 +116,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 5
 // 修复 1：自写回验 receipt
 // ---------------------------------------------------------------------------
 
-describe('修复限制 1：自写回验 receipt（写批任务 token 偏重）', () => {
+describe('修复限制 1：自写回验（0.5.1 默认 full；receipt 为 0.4.x 回退点）', () => {
   let harness: Harness | undefined;
   beforeEach(() => {
     harness?.cleanup();
@@ -135,8 +135,8 @@ describe('修复限制 1：自写回验 receipt（写批任务 token 偏重）',
     ],
   };
 
-  it('R1. 写后读同路径 → receipt 回执（不回灌全文），任务收敛', async () => {
-    harness = makeHarness({ task: '回验演练：写 a.txt 再读回。', scenarios: [writeReadScenario] });
+  it('R1. 回退点 selfReadFeedback=receipt：写后读同路径 → 回执（不回灌全文），任务收敛', async () => {
+    harness = makeHarness({ task: '回验演练：写 a.txt 再读回。', scenarios: [writeReadScenario], config: { selfReadFeedback: 'receipt' } });
     try {
       const reason = await harness.driver.runTurn();
       assert.equal(reason.kind, 'completed');
@@ -156,8 +156,8 @@ describe('修复限制 1：自写回验 receipt（写批任务 token 偏重）',
     }
   });
 
-  it('R2. config selfReadFeedback=full → 恢复 v0.1 完整反馈行为', async () => {
-    harness = makeHarness({ task: '回验演练：写 a.txt 再读回。', scenarios: [writeReadScenario], config: { selfReadFeedback: 'full' } });
+  it('R2. 默认（0.5.1 / 2.2：不配置 selfReadFeedback）→ 完整反馈行为', async () => {
+    harness = makeHarness({ task: '回验演练：写 a.txt 再读回。', scenarios: [writeReadScenario] });
     try {
       const reason = await harness.driver.runTurn();
       assert.equal(reason.kind, 'completed');

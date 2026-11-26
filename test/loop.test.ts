@@ -143,6 +143,9 @@ function makeHarness(opts: {
     provider: 'mock',
     model: 'mock-scenario',
     streamIdleTimeoutMs: opts.config?.streamIdleTimeoutMs ?? 30_000,
+    // 0.5.1（1.1）：本文件的收束/重入用例覆盖 0.4.x 收束机制（缺 final → nudge → 重入），
+    // 显式走回退开关；新默认（流末正文即交付）的用例在 test/v051-closeout.test.ts。
+    requireFinal: true,
     ...opts.config,
   };
   const driver = new SingleStreamDriver(ports, config);
@@ -221,10 +224,12 @@ describe('A. mock E2E（验收核心）', () => {
     }
   });
 
-  it('A2. waitTools 挂起-重入：依赖有序、单流内完成；high 观测按重入规则注入骨架', async () => {
+  it('A2. waitTools 挂起-重入：依赖有序、单流内完成；full 观测按重入规则注入', async () => {
+    // 0.5.1（2.2）：默认 selfReadFeedback='full'；本用例保住 0.4.x receipt 回退点的覆盖
     harness = makeHarness({
       task: '先写两个文件再读回来。',
       scenarios: loadScenarios('wait-tools-continue.json', 'wait-tools-xml.json'),
+      config: { selfReadFeedback: 'receipt' },
     });
     try {
       const reason = await harness.driver.runTurn();
@@ -361,7 +366,7 @@ describe('B. O6 preflight 前缀断言', () => {
           stream: (o) => normalizeStreamShim(model.adapter.stream({ provider: o.provider, model: o.model, messages: o.messages, signal: o.signal })),
           executeTools: createSandboxExecutor(sandboxDir),
         },
-        { provider: 'mock', model: 'm' },
+        { provider: 'mock', model: 'm', requireFinal: true },
         brokenRenderer,
       );
       driver.pushUserTask('前缀破坏演练：写一个文件。');
@@ -1396,8 +1401,16 @@ describe('K. final 收束闸（v0.3.1 截断修复）', () => {
       const reason = await harness.driver.runTurn();
       assert.equal(reason.kind, 'blocked', '占位答案不得被当作完成');
       assert.ok(reason.kind === 'blocked' && reason.detail.includes('final 被拒'), `reason 应说明 final 被拒，实际 ${JSON.stringify(reason)}`);
-      // 同 kind 的拒绝只注入一次：第 2 条占位 final 起不再烧注入，走 nudge → blocked
-      assert.equal(harness.driver.snapshot().requestCount, 3, '拒绝注入一次 + nudge 一次，共 3 个请求');
+      // 同 kind 的拒绝只注入一次：第 2 条占位 final（换了个占位词）不再烧注入。
+      // 0.5.3：上限交给用户后（limits 缺省 0 = 不限制）收敛必须**结构性**——同一拒绝事由
+      // + 零新增产出即收场 blocked，不再借 nudge/停滞预算这类数值护栏兜底，故请求数从 3 降为 2
+      //（旧实现是"去重 → 空尾 → nudge 一次 → 仍无产出 → blocked"，nudge 的措辞与拒绝注入重复，
+      //  信息面零增量，白烧一个请求）。
+      assert.equal(harness.driver.snapshot().requestCount, 2, '拒绝注入一次即收场（结构性收敛，不再补一条同义 nudge）');
+      assert.ok(
+        faultsOf(harness.driver.snapshot()).some((f) => f.fault === 'final-reject-exhausted'),
+        '必须记 final-reject-exhausted（去重命中 = 结构性撞墙）',
+      );
     } finally {
       harness.cleanup();
     }

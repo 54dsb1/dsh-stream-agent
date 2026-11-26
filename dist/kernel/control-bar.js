@@ -34,6 +34,8 @@ import {
   publicLegacyModeCatalog,
 } from './modes.js';
                                                                            
+                                                         
+import { formatLimitValue, hasLimit, limitSpecOf } from './limits.js';
 
                                
 export const LANGS                  = ['zh', 'en'];
@@ -66,6 +68,31 @@ const TEXT = {
   },
   blockA: { zh: '① 执行通道', en: '(1) Execution channel' },
   blockB: { zh: '② 上下文档位', en: '(2) Context tier' },
+  blockC: { zh: '③ 用户上限', en: '(3) User limits' },
+  blockD: { zh: '④ 行为开关', en: '(4) Behavior switches' },
+  foldLabel: { zh: '上下文折叠', en: 'Context fold' },
+  finalLabel: { zh: '流末验收', en: 'Final check' },
+  switchOn: { zh: '开', en: 'on' },
+  switchOff: { zh: '关', en: 'off' },
+  foldHint: {
+    zh: 'f 切换：关闭后压缩 / 效果折叠 / 段丢弃全部停用，超窗口由预算拒绝而不是静默截断',
+    en: 'f toggles: off disables compaction / effect folding / segment drop; over-budget is refused, not silently truncated',
+  },
+  finalHint: {
+    zh: 'v 切换：关闭后不要求 tf-final、不判 accepts；tf-plan 仍解析',
+    en: 'v toggles: off removes tf-final / accepts checks; tf-plan is still parsed',
+  },
+  foldUnset: { zh: '已开启，未设阈值，不触发', en: 'on, no thresholds, not triggered' },
+  /** 0.6.1 更名：PTC兼容模式（原"代码通道"）没有流末验收闸——开关可写但不生效，控制面必须如实灰显。 */
+  finalInertCode: { zh: 'PTC兼容模式无验收闸，不生效', en: 'PTC-compat channel has no final gate; inert' },
+  // —— 0.6.1：行为预设已移除（上限/开关一律用户自定义或走 thinkflow 对齐默认层）——
+  // —— 0.6.0 正式版：上下文"完全不处理"开放选项 ——
+  rawLabel: { zh: '上下文原样', en: 'Raw context' },
+  rawHint: {
+    zh: 'x 切换：开启后压缩/效果折叠/段丢弃/重复抑制/读取与回灌截断全部停用（内容原样进请求；预算上限仍按你的 limits 生效）',
+    en: 'x toggles: off-processing disables compaction / effect fold / segment drop / dedup / read & feedback truncation (content passes through untouched; your limits still apply)',
+  },
+  rawForcedFold: { zh: '原样开启，折叠强制关', en: 'raw on; fold forced off' },
   channel: { zh: '通道', en: 'Channel' },
   tier: { zh: '档位', en: 'Tier' },
   current: { zh: '当前', en: 'Current' },
@@ -76,8 +103,8 @@ const TEXT = {
   sourceNone: { zh: '不可用', en: 'unavailable' },
   sourceStandard: { zh: '不适用（标准通道）', en: 'n/a (standard channel)' },
   sourceUnavailableDetail: {
-    zh: '代码通道不可用：未检测到 PTC 预设或 ptcRuntime',
-    en: 'code channel unavailable: no PTC preset or ptcRuntime detected',
+    zh: 'PTC兼容模式不可用：未检测到 PTC 预设或 ptcRuntime',
+    en: 'PTC-compat channel unavailable: no PTC preset or ptcRuntime detected',
   },
   fits: { zh: '适合', en: 'Use when' },
   cost: { zh: '代价', en: 'Trade-off' },
@@ -98,16 +125,16 @@ const TEXT = {
     en: 'Two-block guide (picking the wrong channel costs more than the wrong tier)',
   },
   helpHint: {
-    zh: '1-5 选通道/档位，c 切通道，t 切档位，l 切语言，q 返回',
-    en: '1-5 pick channel/tier, c channel, t tier, l language, q back',
+    zh: '1-5 选通道/档位，c 切通道，t 切档位，u 编辑上限，f 折叠，v 验收，x 原样，l 切语言，q 返回',
+    en: '1-5 pick channel/tier, c channel, t tier, u limits, f fold, v final, x raw, l language, q back',
   },
   panelHint: {
-    zh: '1-5 选通道/档位 | Up/Down 移动 | Enter 应用 | c 通道 | t 档位 | l 中/英 | ? 帮助 | r 重置 | q 退出',
-    en: '1-5 pick | Up/Down move | Enter apply | c channel | t tier | l language | ? help | r reset | q quit',
+    zh: '1-5 选通道/档位 | Up/Down 移动 | Enter 应用 | c 通道 | t 档位 | u 上限 | f 折叠 | v 验收 | x 原样 | l 中/英 | ? 帮助 | r 重置 | q 退出',
+    en: '1-5 pick | Up/Down move | Enter apply | c channel | t tier | u limits | f fold | v final | x raw | l language | ? help | r reset | q quit',
   },
   bannerKeys: {
-    zh: '交互栏支持 1-5 选通道/档位、c/t 快切、l 切语言、? 看指南',
-    en: 'Interactive bar: 1-5 pick, c/t quick switch, l language, ? guide',
+    zh: '交互栏支持 1-5 选通道/档位、c/t 快切、u 编辑上限、f/v/x 开关、l 切语言、? 看指南',
+    en: 'Interactive bar: 1-5 pick, c/t quick switch, u limits, f/v/x switches, l language, ? guide',
   },
   stepTitle: { zh: '上手四步', en: 'Four steps' },
   step1: {
@@ -154,10 +181,36 @@ const TEXT = {
     en: 'Unknown tier; valid: light / standard / deep',
   },
   legacyAliased: {
-    zh: '（旧模式值已按别名映射：0.5.x 保留别名，0.6.0 移除）',
-    en: '(legacy mode value mapped via alias: kept in 0.5.x, removed in 0.6.0)',
+    zh: '（旧模式值已按别名映射）',
+    en: '(legacy mode value mapped via alias)',
   },
   unknownLang: { zh: '未知语言，可选值：zh / en', en: 'Unknown language; valid: zh / en' },
+  /** 0.6.0 复查补键：CLI mode 子命令此前引用不存在的 key（t() 兜底回退成 key 本身）。 */
+  mode: { zh: '旧模式', en: 'Legacy mode' },
+  // —— 0.5.3：区块 C「用户上限」（0.6.1 起默认数值面 = thinkflow 对齐层，用户 limits 覆盖）——
+  limitsUnsetAll: {
+    zh: '全部未设（生效数值 = thinkflow 对齐默认层；写 limits 即覆盖，0 = 不限制）',
+    en: 'all unset (effective numbers = thinkflow-aligned defaults; your limits override, 0 = none)',
+  },
+  limitsSummary: { zh: '已定义', en: 'defined' },
+  limitsEdit: { zh: '编辑', en: 'Edit' },
+  limitsEditHint: {
+    zh: 'u 编辑上限 · 输入 key=value 回车生效（key=v;k=v 可一次写多项，reset 清空）· 键名见 dsh-stream-agent limits',
+    en: 'u edits limits: type key=value then Enter (k=v;k=v for several, reset clears); key list: dsh-stream-agent limits',
+  },
+  limitsEditing: { zh: '上限编辑', en: 'limits' },
+  limitsEditingHint: {
+    zh: '输入 key=value 后回车（reset 清空 · Esc 取消）',
+    en: 'type key=value then Enter (reset clears, Esc cancels)',
+  },
+  limitsApplied: { zh: '已写入上限', en: 'limits written' },
+  limitsCleared: { zh: '已清空自定义上限（回到 thinkflow 对齐默认层）', en: 'custom limits cleared (back to thinkflow-aligned defaults)' },
+  limitsRejected: { zh: '上限未通过校验', en: 'limits rejected' },
+  limitsCancelled: { zh: '已取消上限编辑', en: 'limits edit cancelled' },
+  limitsNeedRuntime: {
+    zh: '（控制栏只写入预设文件：下一次创建 agent 生效）',
+    en: '(the bar only writes the preset file: applies to the next agent)',
+  },
   usage: { zh: '用法', en: 'Usage' },
   stateFile: { zh: '状态文件', en: 'State file' },
 }                                                     ;
@@ -362,6 +415,14 @@ function labeled(label        , value        , width        , labelWidth        
                      
                
              
+                                                  
+                       
+                                                 
+                        
+                                                                               
+                       
+                                                                 
+                       
  
 
 export function createControlState(partial                        = {})               {
@@ -369,6 +430,10 @@ export function createControlState(partial                        = {})         
     channel: isChannelId(partial.channel) ? partial.channel : DEFAULT_CHANNEL,
     tier: isTierId(partial.tier) ? partial.tier : DEFAULT_TIER,
     lang: isLang(partial.lang) ? partial.lang : DEFAULT_LANG,
+    ...(partial.limits === undefined ? {} : { limits: partial.limits }),
+    ...(partial.contextFold === undefined ? {} : { contextFold: partial.contextFold }),
+    ...(partial.finalCheck === undefined ? {} : { finalCheck: partial.finalCheck }),
+    ...(partial.contextRaw === undefined ? {} : { contextRaw: partial.contextRaw }),
   };
 }
 
@@ -393,17 +458,81 @@ export function createControlState(partial                        = {})         
                      
  
 
-/** 档位数值行（控制栏区块 B）：只展示实际数值，不做定性宣传（§4.2）。 */
-export function tierValuesLine(lang      )         {
-  const steps = TIER_SPECS.map((x) => x.values.maxSteps).join('/');
-  const input = TIER_SPECS.map((x) => `${Math.round(x.values.maxInputTokens / 1000)}k`).join('/');
-  const compaction = TIER_SPECS.map((x) => x.values.compactAggressiveness).join('/');
+/** 档位数值行（控制栏区块 B）：只展示实际数值，不做定性宣传（§4.2）。
+ * 0.5.2：档位不再预设上限——这里展示**生效值**（未设 = 不限制）。
+ * 0.6.1：默认数值面 = thinkflow 对齐层（keepRecent 30 / maxSummaryChars 16k / maxReadChars 200k / maxReentries 8），
+ * 轮数上限一律不设（maxSteps 已移除）。 */
+export function tierValuesLine(lang      , effective                                                 )         {
+  const fmt = (n                    , suffix = '')         => {
+    if (n === undefined) return lang === 'zh' ? '未设' : 'unset';
+    if (n === 0) return lang === 'zh' ? '不限制' : 'none';
+    return `${n}${suffix}`;
+  };
+  const steps = effective !== undefined ? fmt(effective.maxSteps) : fmt(undefined);
+  const input = effective !== undefined
+    ? (effective.maxInputTokens === undefined
+        ? fmt(undefined)
+        : effective.maxInputTokens === 0
+          ? fmt(0)
+          : `${Math.round(effective.maxInputTokens / 1000)}k`)
+    : fmt(undefined);
   return lang === 'zh'
-    ? `maxSteps ${steps} · maxInputTokens ${input} · 压缩 ${compaction}`
-    : `maxSteps ${steps} · maxInputTokens ${input} · compaction ${compaction}`;
+    ? `轮数 ${steps} · 上下文 ${input} · 默认 = thinkflow 对齐层（轮数不设上限）`
+    : `rounds ${steps} · context ${input} · defaults = thinkflow-aligned layer (no round cap)`;
 }
 
-/** 通道选择条：[1]*标准  [2] 代码（* = 已应用，> = 焦点） */
+/**
+ * 区块 C 的摘要行（0.5.3）：把用户定义的上限压成一行，未设项不出现。
+ * 0.6.1：空白（一项都没定义）= 显式说"全部未设（生效数值 = thinkflow 对齐默认层）"。
+ */
+export function limitsSummaryLine(limits                         , lang      )         {
+  const set = Object.keys(limits ?? {}).filter((k) => hasLimit(limits, k            ));
+  if (set.length === 0) return t('limitsUnsetAll', lang);
+  const order = ['maxSteps', 'maxInputTokens', 'peekBudgetChars', 'keepRecent', 'maxReentries', 'codeMaxSubcalls'];
+  const ranked = [...set].sort((a, b) => {
+    const ia = order.indexOf(a);
+    const ib = order.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  const shown = ranked.slice(0, 6).map((key) => {
+    const label = limitSpecOf(key)?.key ?? key;
+    return `${label} ${formatLimitValue(key            , limits?.[key            ])}`;
+  });
+  const rest = ranked.length - shown.length;
+  const suffix = rest > 0 ? ` · +${rest}` : '';
+  return `${shown.join(' · ')}${suffix}（${t('limitsSummary', lang)} ${set.length}）`;
+}
+
+/**
+ * 区块 D 的摘要行（0.6.0）：两个布尔开关的**有效状态**，不是仅显示开关值。
+ * contextFold 开启但三个阈值都没设 → 明确写“未触发”，避免用户以为已经在省 token。
+ */
+export function switchSummaryLine(
+  state              ,
+  lang      ,
+  /** 生效阈值（装配 config / 运行期 driver 的值）。给出时以它为准——只看 control.json
+   *  的 limits 会把"装配里设了阈值"误报成"未设阈值"。 */
+  effective                                                                                          ,
+)         {
+  const foldOn = state.contextFold !== false && state.contextRaw !== true;
+  const finalOn = state.finalCheck !== false;
+  const limits = state.limits ?? {};
+  const thresholds = [
+    effective?.maxInputTokens ?? limits.maxInputTokens,
+    effective?.effectElisionKeepRecent ?? limits.effectElisionKeepRecent,
+    effective?.segmentMaxChars ?? limits.segmentMaxChars,
+  ].some((value) => typeof value === 'number' && value > 0);
+  const fold = `${t('foldLabel', lang)}=${foldOn ? t('switchOn', lang) : t('switchOff', lang)}`
+    + (state.contextRaw === true ? `（${t('rawForcedFold', lang)}）` : foldOn && !thresholds ? `（${t('foldUnset', lang)}）` : '');
+  // 0.6.0（§0 A2）：代码通道把 finalCheck 置灰（可写但无闸门可关）——不能让它看起来"已生效"。
+  const inertOnCode = state.channel === 'code';
+  const final = `${t('finalLabel', lang)}=${finalOn ? t('switchOn', lang) : t('switchOff', lang)}`
+    + (inertOnCode ? `（${t('finalInertCode', lang)}）` : '');
+  const raw = `${t('rawLabel', lang)}=${state.contextRaw === true ? t('switchOn', lang) : t('switchOff', lang)}`;
+  return `${fold} · ${final} · ${raw}`;
+}
+
+/** 通道选择条：[1]*标准  [2] PTC兼容模式（* = 已应用，> = 焦点） */
 export function channelStrip(state              , focus            )         {
   return CHANNEL_SPECS.map((c) => {
     const mark = c.id === state.channel ? '*' : focus === c.id ? '>' : ' ';
@@ -490,6 +619,9 @@ export function renderStatusBar(state              , options               )    
   const parts = [`dsh-stream-agent ${options.version}`];
   if (status !== undefined) parts.push(status);
   parts.push(`${t('channel', lang)} ${state.channel}`, `${t('tier', lang)} ${state.tier}`);
+  parts.push(`fold ${state.contextFold === false || state.contextRaw === true ? t('switchOff', lang) : t('switchOn', lang)}`);
+  parts.push(`final ${state.finalCheck === false ? t('switchOff', lang) : t('switchOn', lang)}`);
+  parts.push(`raw ${state.contextRaw === true ? t('switchOn', lang) : t('switchOff', lang)}`);
   const line = parts.join(' | ');
   const limit = options.columns === undefined ? Number.POSITIVE_INFINITY : panelWidth(options.columns);
   return truncate(line, limit);
@@ -565,8 +697,16 @@ export function renderPanel(state              , options               )        
     ...labeled(t('tierValues', lang), tierValuesLine(lang), width - 4, labelWidth),
     ...labeled(t('cost', lang), tier.tradeoff[lang], width - 4, labelWidth),
     ...labeled(t('tierAdvanced', lang), t('advancedHint', lang), width - 4, labelWidth),
+    t('blockC', lang),
+    `  ${limitsSummaryLine(state.limits, lang)}`,
+    ...labeled(t('limitsEdit', lang), t('limitsEditHint', lang), width - 4, labelWidth),
+    t('blockD', lang),
+    `  ${switchSummaryLine(state, lang)}`,
+    ...labeled('f', t('foldHint', lang), width - 4, labelWidth),
+    ...labeled('v', t('finalHint', lang), width - 4, labelWidth),
+    ...labeled('x', t('rawHint', lang), width - 4, labelWidth),
     '',
-    ...labeled(t('commands', lang), 'dsh-stream-agent bar | status | channel <standard|code> | tier <light|standard|deep> | lang <zh|en>', width - 4, labelWidth),
+    ...labeled(t('commands', lang), 'dsh-stream-agent bar | status | channel <standard|code> | tier <light|standard|deep> | fold <on|off> | final <on|off> | raw <on|off> | lang <zh|en> | limits --set k=v', width - 4, labelWidth),
     '',
     ...labeled(t('keys', lang), t('panelHint', lang), width - 4, labelWidth),
     statsLine(options.stats, lang),
@@ -586,7 +726,6 @@ export function renderHelp(state              , options               )         
     lines.push(`[${c.order}]${mark}${c.label[lang]} (${c.id})`);
     lines.push(...labeled(`  ${t('fits', lang)}`, c.useWhen[lang], inner));
     lines.push(...labeled(`  ${t('cost', lang)}`, c.tradeoff[lang], inner));
-    lines.push(...labeled(`  0.4.0`, c.legacyBehavior[lang], inner));
   }
   lines.push('', t('blockB', lang));
   for (const x of TIER_SPECS) {
@@ -595,18 +734,36 @@ export function renderHelp(state              , options               )         
     lines.push(...labeled(`  ${t('fits', lang)}`, x.useWhen[lang], inner));
     lines.push(...labeled(`  ${t('cost', lang)}`, x.tradeoff[lang], inner));
   }
+  lines.push('', t('blockC', lang), `  ${limitsSummaryLine(state.limits, lang)}`);
+  lines.push(...labeled('  u', t('limitsEditHint', lang), inner));
+  lines.push('', t('blockD', lang), `  ${switchSummaryLine(state, lang)}`);
+  lines.push(...labeled('  x', t('rawHint', lang), inner));
   lines.push('', t('helpHint', lang));
   return box(`dsh-stream-agent v${options.version} - ${t('barTitle', lang)}`, lines, width);
 }
 
 /** 机器可读状态（--json / status --json）。 */
 export function renderJson(state              , options               )         {
+  const tier = getTier(state.tier);
   return JSON.stringify({
     version: options.version,
     active: options.active !== false,
     channel: { id: state.channel, label: getChannel(state.channel).label[state.lang] },
-    tier: { id: state.tier, label: getTier(state.tier).label[state.lang], values: getTier(state.tier).values },
+    tier: {
+      id: state.tier,
+      label: tier.label[state.lang],
+      values: tier.values,
+      /** 0.5.2：参考值（不生效；用户若要使用需写进 limits） */
+      reference: tier.reference,
+    },
     lang: state.lang,
+    /** 0.5.2：用户定义的上限（未出现的键 = 不限制） */
+    limits: state.limits ?? {},
+    /** 0.6.0：行为开关（缺省 = 开；只有显式 false 才是关） */
+    contextFold: state.contextFold !== false && state.contextRaw !== true,
+    finalCheck: state.finalCheck !== false,
+    /** 0.6.0 正式版：上下文完全不处理（0.6.1：行为预设字段已移除——limits 一律用户自定义） */
+    contextRaw: state.contextRaw === true,
     channels: publicChannelCatalog(),
     tiers: publicTierCatalog(),
     legacyModes: publicLegacyModeCatalog(),
@@ -629,6 +786,10 @@ export function renderJson(state              , options               )         
                                          
                              
                           
+                           
+                                   
+                                  
+                                  
                      
 
 /** 把一次按键（原始终端序列）解释为控制栏意图。q 在帮助页是"返回"，在面板是"退出"。 */
@@ -651,6 +812,12 @@ export function interpretKey(raw        , context                         = {}) 
   }
   // 快捷切换：c 通道（standard↔code），t 档位（light→standard→deep→light）
   if (key === 'c' || key === 'C') return { kind: 'cycle-channel' };
+  // 0.5.3：u = 编辑用户上限（区块 C）；会话层进入行内输入模式，键入的 key=value 不进这里
+  if (key === 'u' || key === 'U') return { kind: 'edit-limits' };
+  if (key === 'f' || key === 'F') return { kind: 'toggle-context-fold' };
+  if (key === 'v' || key === 'V') return { kind: 'toggle-final-check' };
+  // 0.6.0 正式版：x = 上下文"完全不处理"（0.6.1：p 键预设循环已随预设系统移除）
+  if (key === 'x' || key === 'X') return { kind: 'toggle-context-raw' };
   if (key === 't' || key === 'T') return { kind: 'cycle-tier' };
   if (key === '\x1b[A' || key === 'k' || key === 'K') return { kind: 'move', delta: -1 };
   if (key === '\x1b[B' || key === 'j' || key === 'J') return { kind: 'move', delta: 1 };

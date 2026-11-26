@@ -19,8 +19,8 @@ window.__ModuleLoader__.load({
 		 * and the loop's in-memory control object is the one writer.
 		 *
 		 * 0.5.0 two blocks (计划书 §3.3)：
-		 *   区块 A「执行通道」standard/code——用户选择的是模型看到什么；"依赖 PTC"是
-		 *   探测结果不是选项（页面不出现"PTC 模式"字样，来源行如实显示探测结果）。
+	 *   区块 A「执行通道」standard/code——用户选择的是模型看到什么；0.6.1 起第二项
+	 *   命名为「PTC兼容模式」，"依赖 PTC"仍是探测结果（来源行如实显示探测结果）。
 		 *   区块 B「上下文档位」light/standard/deep——只改数值，每档展示实际数值
 		 *   （maxSteps/maxInputTokens/压缩强度），不做定性宣传。
 		 *   两个区块都可回退：A→standard 即 0.4.0 balanced 行为面；B→standard 即 0.4.0 数值面。
@@ -44,13 +44,13 @@ window.__ModuleLoader__.load({
 				inactiveHint: "loop 没有注册 agent factory。通道/档位仍可写入状态文件，但修复装载并重启后才会生效。",
 				statusTitle: "当前状态",
 				channelTitle: "① 执行通道",
-				channelHint: "选模型看到什么：标准 = tf-* 命令；代码 = 单一 run_code 入口。",
+				channelHint: "选模型看到什么：标准 = tf-* 命令；PTC兼容模式 = 单一 run_code 入口。",
 				tierTitle: "② 上下文档位",
-				tierHint: "只改数值：步数上限、单请求上下文上限、压缩强度。不改工具面与执行器。",
+				tierHint: "只改压缩强度与展示参考值；默认数值面 = thinkflow 对齐层。",
 				tierValuesTitle: "实际数值",
 				advancedTitle: "高级",
 				advancedHint: "取回预算 / 前缀策略 / 重复抑制（peekBudgetChars / prefixPolicy / spanLedger）",
-				sourceTitle: "代码通道来源",
+				sourceTitle: "PTC兼容模式来源",
 				sourcePreset: "preset 完整兼容",
 				sourceBridge: "内置窄桥（受限）",
 				sourceNone: "不可用：未检测到 PTC 预设或 ptcRuntime",
@@ -85,9 +85,40 @@ window.__ModuleLoader__.load({
 				selected: "当前",
 				apply: "切换",
 				applying: "应用中…",
+				unlimited: "不限",
+				unsetHint: "0 = 不限制。默认数值面 = thinkflow 对齐层（轮数不设上限），你的 limits 逐项覆盖。",
+				limitsTitle: "③ 用户上限",
+				limitsHint: "轮数、上下文、取回预算、重入、tf-code 配额等全部由你定义（0 = 不限制）；留空 = 沿用 thinkflow 对齐默认层。",
+				limitsUnset: "留空 = 默认预设",
+				limitsApply: "写入上限",
+				limitsClear: "清空自定义（回默认）",
+				limitsEmpty: "状态里没有上限目录：请确认插件已正确装载。",
+				limitsWarn: "部分键未被接受",
+				limitsApplied: "上限已写入：新会话立即生效，运行中的会话在下一个任务边界生效。",
+				limitsCleared: "已清空自定义上限（回到 thinkflow 对齐默认预设）。",
+				limitsDegraded: "loop 未接管：上限已写入状态文件，修复装载并重启后生效。",
+				limitsCount: "已定义",
+				limitsGroupBudget: "预算",
+				limitsGroupTransport: "传输（wire）",
+				limitsGroupRetrieval: "取回与回灌",
+				limitsGroupCompaction: "压缩",
+				limitsGroupRebase: "换基与重入",
+				limitsGroupExecution: "并行与执行",
+				limitsGroupCode: "tf-code 配额",
+				switchesTitle: "④ 行为开关",
+				switchesHint: "折叠 = 压缩/效果折叠/段边界；验收 = tf-final/accepts；原样 = 上下文完全不处理（不压缩/不折叠/不丢段/不去重/不截断）。开关对新会话生效。",
+				foldLabel: "上下文折叠",
+				finalLabel: "流末验收",
+				rawLabel: "上下文原样（完全不处理）",
+				finalInert: "PTC兼容模式无验收闸，不生效",
+				switchOn: "开",
+				switchOff: "关",
+				hostPresetsTitle: "宿主会话预设（DSH 标准 / PTC）",
+				hostPresetsHint: "宿主 agent preset 名册（只读）。新建会话时在宿主会话页选择预设：standard ↔ 本插件 A 通道；ptc ↔ B 通道（PTC兼容模式）。",
+				hostPresetsNone: "宿主未提供预设名册（headless 或旧宿主）。",
+				tierReference: "参考值（未生效）",
 				useWhen: "什么时候选",
 				tradeoff: "代价",
-				legacy: "0.4.0 行为对照",
 				saved: "已保存。通道对新会话立即生效，会话内在下一个任务边界生效。",
 				noticeConflict: "状态已被其他窗口或 CLI 修改，已刷新为最新值。",
 				writeFailed: "写入失败",
@@ -101,7 +132,7 @@ window.__ModuleLoader__.load({
 					surfacePolicy: "工具面策略",
 				},
 				cli: "命令行等价操作",
-				cliHint: "dsh-stream-agent channel <standard|code> · tier <light|standard|deep> · lang <zh|en> · bar",
+				cliHint: "dsh-stream-agent channel <standard|code> · tier <light|standard|deep> · fold/final/raw <on|off> · lang <zh|en> · limits --set k=v · bar",
 				docs: "说明文档：README.md#桌面客户端控制页",
 			},
 			en: {
@@ -118,13 +149,13 @@ window.__ModuleLoader__.load({
 				inactiveHint: "The loop did not register an agent factory. Channel/tier changes still write the state file, but they only apply after the load failure is fixed and the client restarts.",
 				statusTitle: "Current state",
 				channelTitle: "(1) Execution channel",
-				channelHint: "Pick what the model sees: Standard = tf-* commands; Code = single run_code entry.",
+				channelHint: "Pick what the model sees: Standard = tf-* commands; PTC-compat = single run_code entry.",
 				tierTitle: "(2) Context tier",
-				tierHint: "Numbers only: step cap, per-request context cap, compaction strength. Never touches tool surface or executor.",
+				tierHint: "Compaction strength and display references only; the default numeric face is the thinkflow-aligned layer.",
 				tierValuesTitle: "Actual values",
 				advancedTitle: "Advanced",
 				advancedHint: "peek budget / prefix policy / dup suppression (peekBudgetChars / prefixPolicy / spanLedger)",
-				sourceTitle: "Code channel source",
+				sourceTitle: "PTC-compat source",
 				sourcePreset: "preset: full compatibility",
 				sourceBridge: "built-in narrow bridge (limited)",
 				sourceNone: "unavailable: no PTC preset or ptcRuntime detected",
@@ -159,9 +190,40 @@ window.__ModuleLoader__.load({
 				selected: "Current",
 				apply: "Switch",
 				applying: "Applying…",
+				unlimited: "unlimited",
+				unsetHint: "0 = unlimited. The default numeric face is the thinkflow-aligned layer (no round cap); your limits override item by item.",
+				limitsTitle: "(3) User limits",
+				limitsHint: "Rounds, context, retrieval budget, re-entries, tf-code quota: all yours to define (0 = unlimited). Blank = keep the thinkflow-aligned defaults.",
+				limitsUnset: "blank = default preset",
+				limitsApply: "Write limits",
+				limitsClear: "Clear overrides (defaults)",
+				limitsEmpty: "No limit catalog in the status payload: make sure the plugin is properly loaded.",
+				limitsWarn: "some keys rejected",
+				limitsApplied: "Limits written: new sessions pick them up immediately, running sessions at the next task boundary.",
+				limitsCleared: "Custom limits cleared (back to the thinkflow-aligned default preset).",
+				limitsDegraded: "No takeover: limits written to the state file, effective after reload and restart.",
+				limitsCount: "defined",
+				limitsGroupBudget: "Budget",
+				limitsGroupTransport: "Transport (wire)",
+				limitsGroupRetrieval: "Retrieval & feedback",
+				limitsGroupCompaction: "Compaction",
+				limitsGroupRebase: "Rebase & re-entry",
+				limitsGroupExecution: "Parallelism",
+				limitsGroupCode: "tf-code quota",
+				switchesTitle: "(4) Behavior switches",
+				switchesHint: "Fold = compaction/effect fold/segment boundary; Final = tf-final/accepts; Raw = no context processing at all. Switches apply to new sessions.",
+				foldLabel: "Context fold",
+				finalLabel: "Final check",
+				rawLabel: "Raw context (no processing)",
+				finalInert: "PTC-compat channel has no final gate; inert",
+				switchOn: "on",
+				switchOff: "off",
+				hostPresetsTitle: "Host session presets (DSH standard / PTC)",
+				hostPresetsHint: "Host agent preset roster (read-only). Pick a preset when creating a new session in the host session page: standard ↔ channel A; ptc ↔ channel B (PTC-compat).",
+				hostPresetsNone: "Host preset roster unavailable (headless or old host).",
+				tierReference: "reference (not applied)",
 				useWhen: "When to choose",
 				tradeoff: "Trade-off",
-				legacy: "0.4.0 behavior",
 				saved: "Saved. Applies to new sessions immediately; running sessions switch at the next task boundary.",
 				noticeConflict: "Another window or the CLI changed the state; refreshed to the latest value.",
 				writeFailed: "Write failed",
@@ -175,7 +237,7 @@ window.__ModuleLoader__.load({
 					surfacePolicy: "Surface policy",
 				},
 				cli: "CLI equivalents",
-				cliHint: "dsh-stream-agent channel <standard|code> · tier <light|standard|deep> · lang <zh|en> · bar",
+				cliHint: "dsh-stream-agent channel <standard|code> · tier <light|standard|deep> · fold/final/raw <on|off> · lang <zh|en> · limits --set k=v · bar",
 				docs: "Docs: README.en.md#desktop-control-page",
 			},
 		};
@@ -226,6 +288,7 @@ window.__ModuleLoader__.load({
 		function useControl() {
 			const [phase, setPhase] = useState("loading");
 			const [status, setStatus] = useState(null);
+			const [hostPresets, setHostPresets] = useState(null);
 			const [error, setError] = useState(null);
 			const [notice, setNotice] = useState(null);
 			const [busy, setBusy] = useState(false);
@@ -235,6 +298,7 @@ window.__ModuleLoader__.load({
 				try {
 					const payload = await call("GET");
 					setStatus(payload.status);
+					setHostPresets(payload.presets ?? null);
 					setError(null);
 					setPhase("ready");
 				} catch (cause) {
@@ -257,7 +321,12 @@ window.__ModuleLoader__.load({
 					if (payload?.status) setStatus(payload.status);
 					setPhase("ready");
 					setError(null);
-					setNotice({ kind: "ok", text: payload?.notice ?? copyFor(payload?.status?.lang ?? status?.lang).saved });
+					const copy = copyFor(payload?.status?.lang ?? status?.lang);
+					const warnings = Array.isArray(payload?.warnings) ? payload.warnings : [];
+					setNotice({
+						kind: warnings.length > 0 ? "warn" : "ok",
+						text: `${payload?.notice ?? copy.saved}${warnings.length > 0 ? ` (${copy.limitsWarn}: ${warnings.join("; ")})` : ""}`,
+					});
 				} catch (cause) {
 					if (cause?.status === 409 && cause?.payload?.status) {
 						setStatus(cause.payload.status);
@@ -274,7 +343,7 @@ window.__ModuleLoader__.load({
 				}
 			}, [busy, status]);
 
-			return { phase, status, error, notice, busy, reload: load, mutate };
+			return { phase, status, hostPresets, error, notice, busy, reload: load, mutate };
 		}
 
 		function Badge({ children, tone }) {
@@ -290,6 +359,13 @@ window.__ModuleLoader__.load({
 
 		function Params({ status, t }) {
 			const effective = status.effective ?? {};
+			// 0.5.2：0 表示"不限制"（limits 语义），不能原样显示成"上限 0"；
+			// 未定义同样是"不限制"，但那是"没设过"，用破折号区分。
+			const show = (value) => {
+				if (value === null || value === undefined) return "—";
+				if (value === 0) return t.unlimited;
+				return String(value);
+			};
 			const rows = [
 				["maxSteps", effective.maxSteps],
 				["maxInputTokens", effective.maxInputTokens],
@@ -302,8 +378,9 @@ window.__ModuleLoader__.load({
 			return h("div", { className: "sa-params" },
 				rows.map(([key, value]) => h("div", { className: "sa-param", key },
 					h("span", { className: "sa-param-key" }, t.params[key] ?? key),
-					h("span", { className: "sa-param-value" }, value === null || value === undefined ? "—" : String(value)),
+					h("span", { className: "sa-param-value" }, show(value)),
 				)),
+				h("div", { className: "sa-param-hint" }, t.unsetHint),
 			);
 		}
 
@@ -331,36 +408,146 @@ window.__ModuleLoader__.load({
 					h("span", { className: "sa-mode-row-label" }, t.tradeoff),
 					h("span", null, channel.tradeoff[lang]),
 				),
-				h("div", { className: "sa-mode-row sa-mode-saving" },
-					h("span", { className: "sa-mode-row-label" }, t.legacy),
-					h("span", null, channel.legacyBehavior[lang]),
-				),
 			);
 		}
 
 		function TierButton({ tier, lang, active, locked, busy, onSelect }) {
 			const t = copyFor(lang);
-			const v = tier.values;
+			// 0.5.2：档位不再预设上限（values 的数值位恒为 0 = 不限制），
+			// 卡片上能摆的只有**参考值**，并且必须标出来，否则用户会以为已经在生效。
+			const v = tier.reference ?? tier.values;
 			const values = `maxSteps ${v.maxSteps} · maxInputTokens ${Math.round(v.maxInputTokens / 1000)}k · ${t.params.compactAggressiveness} ${v.compactAggressiveness}`;
+			const caption = `${t.tierReference}：${values}`;
 			return h("button", {
 				type: "button",
 				className: `sa-tier${active ? " sa-tier-active" : ""}`,
 				disabled: locked || busy,
 				"aria-pressed": active,
 				onClick: () => onSelect(tier.id),
-				title: `${t.apply}: ${values}`,
+				title: `${t.apply}: ${caption}`,
 			},
 				h("div", { className: "sa-tier-head" },
 					h("span", { className: "sa-mode-name" }, tier.label[lang]),
 					active ? h(Badge, { tone: "brand" }, t.selected) : null,
 				),
-				h("div", { className: "sa-tier-values" }, values),
+				h("div", { className: "sa-tier-values" }, caption),
 				h("div", { className: "sa-tier-when" }, tier.useWhen[lang]),
 			);
 		}
 
+		/**
+		 * ③ 用户上限（0.5.3）。设计口径：**控件本身不预填任何值**——目录来自状态里的
+		 * limitCatalog（key/unit/group/label/value），value 未定义就渲染成空输入框。
+		 * 提交面 = { limits: {k: number}, limitsReplace: true }（整组替换，清空自定义 =
+		 * 回到默认预设），这样"用户删掉一个键"与"用户没设过这个键"在语义上完全一致。
+		 */
+		function LimitsEditor({ status, t, busy, onApply, onClear }) {
+			const catalog = Array.isArray(status.limitCatalog) ? status.limitCatalog : [];
+			const [draft, setDraft] = useState({});
+			const [dirty, setDirty] = useState(false);
+
+			useEffect(() => {
+				const next = {};
+				for (const item of catalog) next[item.key] = item.value === undefined ? "" : String(item.value);
+				setDraft(next);
+				setDirty(false);
+			}, [status.updatedAt, status.lang]);
+
+			if (catalog.length === 0) return h("div", { className: "sa-hint" }, t.limitsEmpty);
+
+			const configured = catalog.filter((item) => item.value !== undefined).length;
+			const edit = (key, value) => {
+				setDraft((current) => ({ ...current, [key]: value }));
+				setDirty(true);
+			};
+			const commit = () => {
+				const patch = {};
+				for (const item of catalog) {
+					const raw = draft[item.key];
+					if (raw === undefined || String(raw).trim() === "") continue;
+					patch[item.key] = Number(String(raw).trim());
+				}
+				onApply(patch);
+				setDirty(false);
+			};
+			const groups = [];
+			for (const item of catalog) {
+				const last = groups[groups.length - 1];
+				if (last !== undefined && last.group === item.group) last.items.push(item);
+				else groups.push({ group: item.group, items: [item] });
+			}
+			const groupLabel = (group) => t[`limitsGroup${group[0].toUpperCase()}${group.slice(1)}`] ?? group;
+
+			return h("div", null,
+				h("div", { className: "sa-limits-head" },
+					h(Badge, { tone: configured > 0 ? "ok" : "neutral" }, `${t.limitsCount} ${configured}/${catalog.length}`),
+					h("button", { type: "button", className: "sa-button", disabled: busy, onClick: commit },
+						busy ? t.applying : t.limitsApply),
+					h("button", { type: "button", className: "sa-button sa-button-ghost", disabled: busy, onClick: onClear },
+						t.limitsClear),
+					dirty ? h("span", { className: "sa-limits-dirty" }, "●") : null,
+				),
+				groups.map((section) => h("div", { className: "sa-limits-group", key: section.group },
+					h("div", { className: "sa-limits-group-title" }, groupLabel(section.group)),
+					h("div", { className: "sa-limits-grid" },
+						section.items.map((item) => h("label", { className: "sa-limit", key: item.key },
+							h("span", { className: "sa-limit-label" }, (item.label && item.label[status.lang === "en" ? "en" : "zh"]) ?? item.key),
+							h("input", {
+								className: "sa-limit-input",
+								type: "number",
+								min: 0,
+								step: 1,
+								inputMode: "numeric",
+								placeholder: t.limitsUnset,
+								value: draft[item.key] ?? "",
+								disabled: busy,
+								onChange: (event) => edit(item.key, event.target.value),
+							}),
+							h("span", { className: "sa-limit-key" }, item.unit === "count" ? item.key : `${item.key} · ${item.unit}`),
+						)),
+					),
+				)),
+			);
+		}
+
+		/** 0.6.0 正式版：行为开关（折叠 / 验收 / 原样）。PTC兼容模式验收闸置灰。 */
+		function Switches({ status, t, busy, onToggle }) {
+			const rows = [
+				["contextFold", t.foldLabel, status.contextFold !== false],
+				["finalCheck", t.finalLabel, status.finalCheck !== false],
+				["contextRaw", t.rawLabel, status.contextRaw === true],
+			];
+			return h("div", null,
+				rows.map(([key, label, on]) => {
+					const inert = key === "finalCheck" && status.channel === "code";
+					return h("div", { className: "sa-mode-row", key, style: { marginTop: "8px" } },
+						h("span", { className: "sa-mode-row-label" }, label),
+						h("span", null,
+							h("div", { className: "sa-segment", role: "group", "aria-label": label },
+								h("button", {
+									type: "button",
+									className: `sa-segment-button${on ? " sa-segment-active" : ""}`,
+									disabled: busy || inert,
+									"aria-pressed": on,
+									onClick: () => onToggle(key, true),
+								}, t.switchOn),
+								h("button", {
+									type: "button",
+									className: `sa-segment-button${!on ? " sa-segment-active" : ""}`,
+									disabled: busy || inert,
+									"aria-pressed": !on,
+									onClick: () => onToggle(key, false),
+								}, t.switchOff),
+							),
+							inert ? h("div", { className: "sa-hint" }, t.finalInert) : null,
+						),
+					);
+				}),
+			);
+		}
+
 		function ControlPage() {
-			const { phase, status, error, notice, busy, reload, mutate } = useControl();
+			const { phase, status, hostPresets, error, notice, busy, reload, mutate } = useControl();
 			const lang = status?.lang === "en" ? "en" : "zh";
 			const t = copyFor(lang);
 
@@ -439,7 +626,7 @@ window.__ModuleLoader__.load({
 						channelLocked ? h("div", { className: "sa-hint" }, status.channelSource === "env" ? t.lockedEnv : t.lockedConfig) : null,
 					),
 
-					// 区块 A：执行通道（§3.3——不出现"PTC 模式"字样；来源是探测结果行）
+					// 区块 A：执行通道（0.6.1：第二项 = PTC兼容模式；来源是探测结果行）
 					h("section", { className: "sa-section" },
 						h("div", { className: "sa-section-head" },
 							h("h2", { className: "sa-section-title" }, t.channelTitle),
@@ -484,6 +671,51 @@ window.__ModuleLoader__.load({
 							h("span", { className: "sa-mode-row-label" }, t.advancedTitle),
 							h("span", null, t.advancedHint),
 						),
+					),
+
+					// ③ 用户上限（0.5.3）：0.6.1 起默认面 = thinkflow 对齐层，这里写 limits 即逐项覆盖
+					h("section", { className: "sa-section" },
+						h("div", { className: "sa-section-head" },
+							h("h2", { className: "sa-section-title" }, t.limitsTitle),
+							h("span", { className: "sa-section-hint" }, t.limitsHint),
+						),
+						h(LimitsEditor, {
+							status,
+							t,
+							busy,
+							onApply: (patch) => mutate({ limits: patch, limitsReplace: true }),
+							onClear: () => mutate({ limits: null }),
+						}),
+					),
+
+					// ④ 行为开关（0.6.0 正式版）：折叠 / 验收 / 原样（完全不处理）
+					h("section", { className: "sa-section" },
+						h("div", { className: "sa-section-head" },
+							h("h2", { className: "sa-section-title" }, t.switchesTitle),
+							h("span", { className: "sa-section-hint" }, t.switchesHint),
+						),
+						h(Switches, {
+							status,
+							t,
+							busy,
+							onToggle: (key, value) => mutate({ [key]: value }),
+						}),
+					),
+
+					// 宿主会话预设名册（DSH 标准 / PTC 适配面；只读——切换在宿主会话页新建时选择）
+					h("section", { className: "sa-section" },
+						h("div", { className: "sa-section-head" },
+							h("h2", { className: "sa-section-title" }, t.hostPresetsTitle),
+							h("span", { className: "sa-section-hint" }, t.hostPresetsHint),
+						),
+						hostPresets && Array.isArray(hostPresets.items) && hostPresets.items.length > 0
+							? h("div", { className: "sa-params" },
+								hostPresets.items.map((p) => h("div", { className: "sa-param", key: p.id },
+									h("span", { className: "sa-param-key" }, `${p.id}${p.id === hostPresets.defaultId ? " · default" : ""}${p.broken ? " · broken" : ""}`),
+									h("span", { className: "sa-param-value" }, p.name ?? p.id),
+								)),
+							)
+							: h("div", { className: "sa-hint" }, hostPresets && hostPresets.error ? String(hostPresets.error) : t.hostPresetsNone),
 					),
 
 					// 运行状态（§3.3 底部状态行：本任务 N · 换基 · 重复取回 · 摘要）
@@ -606,6 +838,16 @@ window.__ModuleLoader__.load({
 .sa-banner-warn{background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#b26a00) 9%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#b26a00) 24%,transparent);color:var(--dsw-alias-label-primary,#1a1a1a);}
 .sa-banner-ok{background:color-mix(in srgb,var(--dsw-alias-state-business-primary,#1a7f37) 9%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-business-primary,#1a7f37) 22%,transparent);}
 .sa-banner-error{background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#d93025) 9%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary,#d93025) 22%,transparent);}
+.sa-limits-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 14px;}
+.sa-limits-dirty{color:var(--dsw-alias-brand-primary,#1a73e8);font-size:12px;}
+.sa-limits-group{margin:0 0 14px;}
+.sa-limits-group-title{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary,#5f6368);margin:0 0 8px;}
+.sa-limits-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px;}
+.sa-limit{display:flex;flex-direction:column;gap:4px;}
+.sa-limit-label{font-size:12px;color:var(--dsw-alias-label-secondary,#5f6368);}
+.sa-limit-input{width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.16));border-radius:8px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#202124);font:inherit;font-size:13px;}
+.sa-limit-input::placeholder{color:var(--dsw-alias-label-tertiary,#9aa0a6);}
+.sa-limit-key{font-size:11px;color:var(--dsw-alias-label-tertiary,#9aa0a6);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
 .sa-section{margin:0 0 26px;padding:18px 18px 16px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));border-radius:var(--dsw-radius-lg,12px);background:var(--dsw-alias-bg-layer-1,#fff);}
 .sa-section-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
 .sa-section-title{margin:0 0 12px;font-size:14px;font-weight:650;letter-spacing:.01em;}
@@ -644,6 +886,7 @@ window.__ModuleLoader__.load({
 .sa-param{display:flex;flex-direction:column;gap:2px;padding:9px 11px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,#f7f8f9);}
 .sa-param-key{color:var(--dsw-alias-label-tertiary,#80868b);font-size:11px;}
 .sa-param-value{font-size:13px;font-weight:600;}
+.sa-param-hint{grid-column:1/-1;color:var(--dsw-alias-label-tertiary,#80868b);font-size:11px;line-height:1.5;}
 .sa-segment{display:inline-flex;padding:2px;gap:2px;border-radius:var(--dsw-radius-md,8px);background:var(--dsw-alias-bg-layer-2,#f3f4f6);border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.06));}
 .sa-segment-button{appearance:none;border:0;background:transparent;color:var(--dsw-alias-label-secondary,#5f6368);font:inherit;font-size:12px;padding:5px 14px;border-radius:6px;cursor:pointer;}
 .sa-segment-button:disabled{opacity:.55;cursor:default;}

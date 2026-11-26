@@ -15,12 +15,16 @@
   读**外部文件**的完整反馈保持不变，正确率路径不受影响。
 - **取证**：`src/entry/loop.ts` 的 `#writtenPaths` 与 `#buildInjections` receipt 分支；
   `test/fix-limits.test.ts` R1–R3。
-- **余留**：真连收益需重跑两臂评测确认（本仓库 eval 数据是 0.1.0 口径）；`selfReadFeedback: 'full'`
-  可回退旧行为。
+- **余留**：真连收益需重跑两臂评测确认（本仓库 eval 数据是 0.1.0 口径）。
+- **0.5.1 回摆（如实记录）**：`selfReadFeedback` 默认已由 `receipt` 改为 `full`——自写路径同样全文
+  回灌，本条的"只注入回执"不再是默认行为，`selfReadFeedback: 'receipt'` 才是回退点。理由是上游
+  `max_content_chars=0`（观测全文可见）与"模型看不见自己写的原文就再读一遍"的实测代价；
+  取证改用 `test/fix-limits.test.ts` R1（`receipt` 回退点）/ R2（默认 `full`）与
+  `test/v051-closeout.test.ts` V2.2-1/V2.2-2（全文回灌 + `dedup` 桶）。
 
 ### 2. W1 / C2 退出码 1，但产物正确
 
-- **现象**：任务在重入预算（`maxReentries: 8`）内没有收敛，进程 `exit=1`，但 checks 判 PASS。
+- **现象**：任务在你设定的重入上限（例如 `maxReentries: 8`）内没有收敛，进程 `exit=1`，但 checks 判 PASS。
 - **原因**：防荡护栏按设计拦截——写批任务用满 9 次请求后不再放行。
 - **影响**：自动化流水线里会看到"失败退出码 + 正确产物"的组合。
 - **缓解**：把护栏理解为"预算耗尽"而非"任务失败"；需要更长回验循环时调 `maxReentries`。
@@ -80,8 +84,10 @@
    "无约束"，使用前自己确认后果。
 4. **preset/profile 不是安全边界**：它们只是组合边界，YAML 与插件仍执行宿主代码；安全声明
    只能引用 sandbox 事实（`docs/disabled-lines-audit.md`），不能引用"独立模式"。
-5. **插件级配额（K5）**：子调用次数 / 输出字节 / 墙钟三项硬限制（缺省 64 次 / 256KiB / 300s），
-   超限结构化终止（`kind: quota-exceeded`）——配额是插件侧护栏，不是宿主沙箱的一部分。
+5. **插件级配额（K5）**：子调用次数 / 输出字节 / 墙钟三项**默认不由插件设定**（0 = 不限制，
+   交给宿主 `maxPendingCalls` 128 / 64MiB / `runtime.timeout.maxMs`）；用户可用
+   `limits.codeMaxSubcalls` / `codeMaxOutputBytes` / `codeMaxWallMs` 收紧，超限结构化终止
+   （`kind: quota-exceeded`）——配额是插件侧护栏，不是宿主沙箱的一部分。
 6. **取消窗口（K4）**：回合取消直通 resolve 与绑定调用（回合 signal）；abort 后 drain 等待
    在途清理再收束（0 后置写是验收目标）；kill -9 级强杀的窗口语义见 5b-2。
 
@@ -118,9 +124,7 @@
 
 ### 7b. 长会话段边界的缓存重置（0.3.0 F7，ADR-001）
 
-- **行为**：追加区超过 `segmentMaxChars`（缺省 160k 字符 ≈ 40k tokens；0/负数关闭）时，
-  在**新回合开始处**把旧段整块丢弃（ADR-001 整块丢弃路线；原文句柄化 `obs:read:seg-*` 可
-  tf-peek 回取，绝不摘要改写）。
+- **行为**：追加区超过 `segmentMaxChars` 时，在**新回合开始处**把旧段整块丢弃（ADR-001 整块丢弃路线；原文句柄化 `obs:read:seg-*` 可 tf-peek 回取，绝不摘要改写）。**0.5.2 起该值不预设：未设 = 不切段**，要启用请显式写 `limits.segmentMaxChars`（参考值 160k 字符 ≈ 40k tokens）。
 - **代价（如实陈述）**：丢弃后的第一条请求是缓存冷请求（cacheWrite 重新计费）——这是
   "整块丢弃"路线的固有代价；阈值越高重置越少。发生时 policyLog + 台账显式记录，不是静默修复。
 - **边界纪律**：丢弃只落在完整回合边界（当前回合的块永不丢弃，工具调用与结果不被拆开）；
@@ -207,3 +211,99 @@
 - **原因**：把 lean 档绑进 lean 模式是行为变更（旧用户的稳定前缀会变），不属于"只追加"
   的版本纪律；待评审后再做。
 - **取证**：`test/v041-protocol.test.ts` D5（缺省构造的前缀与 0.4.0-beta.1 一致）。
+
+### 15. 计划与命令记录不跨 resume 持久化（0.5.2 如实声明）
+
+- **现象**：`tf-plan` 的验收项状态（verified / 证据）与 `#records` 只在驱动器内存里；
+  resume 后计划为空、历史命令记录为空。
+- **影响**：resume 后需要重新 `tf-plan` 声明验收项；final 闸不会因"旧计划未验证"而拒绝
+  （计划为空 ⇒ 不启用验收闸），因此**不会死锁**，但已获得的机器证据（谓词通过、回执）
+  需要重跑一次。
+- **未做原因**：计划快照的持久化格式（修订号 / 文本哈希 / 谓词 / 证据）需要与宿主 session
+  事件对齐，当前只在台账 `plugin:tf-agent/plan` 里有可复算的流水；落盘格式定稿前不写半成品。
+- **取证**：`src/entry/loop.ts` 的 `#plan` / `#records`（构造期为空）。
+
+### 16. 沙箱模式切换不中止在跑程序（0.5.2 如实声明）
+
+- **现象**：`tf-code sandbox=` 改变只影响**之后**的运行；已提交给宿主 PTC runtime 的程序
+  继续按旧策略跑完。宿主契约里"策略变化 → 中止在跑程序"的编排需要 runtime 侧支持
+  （`release` + 重新 `resolve` 的时机由宿主决定），插件不擅自 kill。
+- **替代保障**：`state=` 的保留态在策略变化时**作废**（不跨策略复用内存），并在台账
+  记 `plugin:tf-agent/code { dropped: true, reason }`。
+
+### 17. `receipt:N` 只覆盖"写后自读回执"（0.5.2 如实声明）
+
+- **现象**：目前只有 `tf-read` 命中本任务 `tf-write` 已写路径时产生的回执带编号
+  （`[tf-stream:receipt … receipt=N]`），可用 `tf-peek handle="receipt:N"` 复读。
+  其它命令的成功回执（`handle` 族）仍走句柄目录，不经 `receipt:N`。
+- **原因**：回执编号空间要避免与句柄空间混淆；先覆盖"跨步回看自己写过什么"这一最高频需求。
+
+## 六、0.6.0 RA-0 探针结论与未确认项（如实声明）
+
+探针产物：`eval/runs/ra0/U1-messages.json … U6-usage.json` + `summary.md`（`node eval/tools/ra0-probe.mjs` 可复跑）。
+**作用域**：只测本插件掌握的接缝（`DriverPorts.stream` 入参契约 + 适配器行为），探针自带 mock host，
+**不经过真实 DSH 宿主**——因此所有结论都不能读成「宿主已验证」。宿主侧
+（DSH `llm/stream`）的真实校验一律标 `hostVerification: pending`，离线不冒充已在宿主验证。
+
+### 18. U5 `surfaceOp:'replace'` 不支持（历史改写不可行）
+
+- **结论**：`unsupported`。适配层契约里没有 `surfaceOp` 字段（0.5.0 已决议不使用该通道）。
+- **影响**：插件无法表达"替换历史"；RA-2 的载荷去重只能"不产生第二份"，不能"事后删除已发内容"。
+- **路线判定**：`system-tools-only`——只做 system / tools 投影；messages 保持 append-only。
+- **取证**：`eval/runs/ra0/U5-surface-replace.json`；`src/entry/loop.ts` 的 `StreamRequestOptions` 无该字段。
+
+### 19. U3 reasoning 必需性未确认（unknown）
+
+- **结论**：`unknown`。本插件走文本协议，请求里从无 reasoning 块，因此"provider 是否要求原样回传"
+  离线无法判定；`reasoningPolicy` 固定 `provider-required`，不尝试丢弃旧推理。
+- **待确认**：真机 DeepSeek thinking 通道下补一次探针（计划 §2.2 U3）。
+- **取证**：`eval/runs/ra0/U3-reasoning.json`。
+
+### 20. RA-0 全部结论待宿主侧复核（hostVerification: pending）
+
+- **现状（0.6.0 收口）**：U1/U2/U4/U6 已全部改走**真实驱动器**（`SingleStreamDriver` + `ports.stream`，
+  各 3 个连续请求）：U1 对账"端口收到的 messages = 插件投影"（10 条逐字节一致）；U2 量到
+  "首请求 0 schema、后续 7 项 ≤7"；U4 量到 system 字节恒定（3502）而消息数 2→6→10；
+  U6 量到逐请求 `providerInputTokens / cacheRead / cacheWrite`。U3 仍是 `unknown`（provider 语义），
+  U5 是契约缺失（`StreamRequestOptions` 无 `surfaceOp`）。
+- **仍需真机**：宿主是否补回 messages/tools、是否强制注入 system、是否允许 messages 与其
+  session 投影不同——这三件只能在真机 profile 上重跑同一组探针，离线不做结论。
+- **处置**：`plan` 模式默认关闭（`assemblyPolicy: 'host'`），且任何前缀违规/投影异常自动回退 host
+  （`assembly-fallback` 台账可检索）。不因为"接缝看起来支持"就默认发布 plan 模式。
+- **未跑的指标（计划 §4.6，延后到真机）**：四分量（未缓存输入 / 缓存读 / 缓存写 / 输出）、严格二分量、
+  请求数与前缀命中、10 题任务集逐任务对比——都需要真实 API 与真实宿主，本轮离线阶段只回答
+  "装配形态是否正确"，不回答"省了多少 token"。
+
+## 七、0.6.0 正式版新增能力的边界（如实声明）
+
+### 21. tf-revert 是插件侧 fs 写回（不经宿主工具管线）
+
+- **现状**：回滚的原子写回（tmp+rename）由 entry 直接执行，路径根 = `projectDir ?? cwd`
+  （与 revisionFacts 同一解析口径）。宿主沙箱/审批不约束这条写回——守卫是
+  **expected 双重校验 + 私有回执目录（模型不可写）+ 快照哈希完整性**，不是宿主审批。
+- **待确认**：真机宿主是否要求所有文件写都经工具管线（hostVerification: pending）。
+  若要求，正确落点是把写回经 toolMapping 转宿主 write 工具（语义不变，端口替换）。
+- **崩溃窗口**：回执是写后确认（begin+complete 在写成功后结算），不是文件系统事务；
+  "写已发生但回执未落盘"的窗口由 F6 意图日志覆盖（resume 停机核对）。与 TF 同一免责声明。
+
+### 22. 密钥保护是 basename 模式 + 正则脱敏（不是完整 DLP）
+
+- 拒读判定只看 basename（与 TF fnmatch 口径一致）；内容脱敏只覆盖
+  `api_key/token/secret/password/access_token/refresh_token/bearer_token` 赋值形态。
+  变形密钥（Base64 整段、自定义键名）不在默认面内——需要更强策略请在宿主侧配置。
+- `allowSensitivePaths: true` / `redactOutput: false` 是显式回退点（装配级）。
+- 宿主工具自身的日志/显示面不在插件管辖（插件只保证**进模型请求的内容**脱敏）。
+
+### 23. 预设与开关的生效时机
+
+- 预设应用 = 整组替换 limits + 设置开关 + 落盘标记。**limits 立即对当前会话生效**
+  （setLimits replace）；**开关（fold/final/raw）在下一次创建 agent 时生效**——
+  它们进稳定前缀/观测管线，构造期冻结，会话内不突变（与 0.6.0-beta 的 fold/final 同口径）。
+- 任何手工修改 limits/开关把预设标记清为"自定义"；通道/档位切换不清标记。
+
+### 24. 上下文"完全不处理"（contextRaw）的精确语义
+
+- 停用：压缩、效果折叠、段边界丢弃、span 重复抑制、读取/回灌/原生结果/tf-code 注入截断。
+- **不停用**：用户 limits 的预算类上限（peekBudgetChars/readFeedbackBudgetPerRequest 等）——
+  那是预算拒绝，不是内容处理；句柄目录/行锚索引（导航辅助，只增不改内容）；脱敏（安全面）。
+- 原样档开启时折叠在生效面强制关（状态面如实写"原样开启，折叠强制关"）。

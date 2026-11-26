@@ -152,7 +152,8 @@ const presetRows = insertRows(join(pkgRoot, 'preset.yml'));
   notes.push('检查7 NOTICE 一致性：thinkflow 派生 / PTC 依赖分栏 / 两栏制条目齐备');
 }
 
-// ---- 检查 5（v0.4.0 G2）：协议命令表 ≤ 14（11 tf-* 基础 + tf-call + tf-ask + tf-skill 上限）----
+// ---- 检查 5（v0.4.0 G2；0.6.0 正式版 ADR-002）：协议命令表 ≤ 17
+//      （14 条基线 + v1.5.0 变更回执三命令 tf-changes/tf-diff/tf-revert；见 docs/adr-002-change-commands.md）----
 {
   const parserSrc = readFileSync(join(pkgRoot, 'src', 'kernel', 'parser.ts'), 'utf8');
   const namesBlock = parserSrc.match(/const COMMAND_NAMES: readonly TfCommandName\[\] =\s*\[([^\]]*)\]/);
@@ -160,10 +161,10 @@ const presetRows = insertRows(join(pkgRoot, 'preset.yml'));
     failures.push('检查5 parser.ts 缺 COMMAND_NAMES 清单（命令表唯一权威）');
   } else {
     const commands = namesBlock[1].split(',').map((s) => s.trim().replace(/'/g, '')).filter((s) => s.startsWith('tf-'));
-    if (commands.length > 14) {
-      failures.push(`检查5 协议命令表 ${commands.length} 条 > 14 硬上限（G2/§6.4：第 15 条必须走 ADR + 退役一条）`);
+    if (commands.length > 17) {
+      failures.push(`检查5 协议命令表 ${commands.length} 条 > 17 硬上限（G2/§6.4 + ADR-002：再加必须走 §8.1 + 新 ADR）`);
     } else {
-      notes.push(`检查5 协议命令表 ${commands.length}/14：${commands.join(', ')}`);
+      notes.push(`检查5 协议命令表 ${commands.length}/17（ADR-002）：${commands.join(', ')}`);
     }
     const readmePath = join(pkgRoot, 'README.md');
     if (existsSync(readmePath)) {

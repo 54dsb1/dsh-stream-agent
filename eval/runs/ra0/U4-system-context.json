@@ -1,0 +1,140 @@
+{
+  "id": "U4",
+  "question": "systemPrompt.context 是替换还是追加；多次注入是否累积",
+  "observation": "连续 3 次注入后的 system 字节",
+  "verdict": "supported",
+  "scope": "plugin-seam",
+  "hostVerification": "pending",
+  "reason": "真实驱动器 3 个请求：system 字节恒定（3502）而消息总数增长（2→6→10）、总字节增长（3512→3796→4080）——插件每次送完整 system，是替换语义；宿主是否再追加一份仍需真机确认",
+  "requests": [
+    {
+      "index": 0,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3502,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3502,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 1,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3502,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 a。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=1 上一步动作与结果]\n- r1 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r1@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3502,
+      "hasReasoningBlocks": false
+    },
+    {
+      "index": 2,
+      "messages": [
+        {
+          "role": "system",
+          "chars": 3502,
+          "head": "你是运行在 DeepSeek Harness 里的单流协议 agent。在一次回"
+        },
+        {
+          "role": "user",
+          "chars": 9,
+          "head": "读两个文件后收尾。"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 a。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=1 上一步动作与结果]\n- r1 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r1@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        },
+        {
+          "role": "assistant",
+          "chars": 4,
+          "head": "读 b。"
+        },
+        {
+          "role": "user",
+          "chars": 108,
+          "head": "[tf-stream:step step=2 上一步动作与结果]\n- r2 tf"
+        },
+        {
+          "role": "user",
+          "chars": 40,
+          "head": "[句柄目录增量 O3：只追加，历史目录见上文]\n+ obs:read:r2@v1"
+        },
+        {
+          "role": "user",
+          "chars": 128,
+          "head": "[tf-stream:observation handle=obs:read:r"
+        }
+      ],
+      "tools": 0,
+      "systemChars": 3502,
+      "hasReasoningBlocks": false
+    }
+  ],
+  "diff": [
+    "system 字节 3502 → 3502 → 3502",
+    "消息条数 2 → 6 → 10",
+    "请求总字节 3512 → 3796 → 4080"
+  ],
+  "evidence": [
+    {
+      "at": "kernel/render.ts:445",
+      "quote": "stableMessages(): RenderMessage[] {"
+    },
+    {
+      "at": "entry/loop.ts:3746",
+      "quote": "messages: toWireMessages(messages),"
+    }
+  ]
+}

@@ -197,7 +197,7 @@ describe('0.5.0 前缀：driver E2E', () => {
     }
   });
 
-  it('P3. stable-drift 始终 fail（不受 prefixPolicy 影响，§8.5 硬规则）', async () => {
+  it('P3. 0.6.1：stable-drift 默认接受继续（auto/rebase）；仅显式 fail 保留 fail-closed', async () => {
     for (const policy of ['auto', 'rebase', 'fail'] as const) {
       const h = makeHarness({
         task: `稳定段漂移演练（${policy}）。`,
@@ -213,22 +213,29 @@ describe('0.5.0 前缀：driver E2E', () => {
         },
       });
       try {
-        await h.driver.runTurn();
+        const reason = await h.driver.runTurn();
         const faults = h.driver.snapshot().records.filter((r) => r.kind === 'fault');
-        assert.equal(faults.some((r) => r.fault === 'prefix-broken'), true, `${policy}：stable-drift 必 fail`);
-        assert.equal(faults.some((r) => r.fault === 'prefix-reset'), false, `${policy}：stable-drift 0 放行`);
+        if (policy === 'fail') {
+          assert.equal(faults.some((r) => r.fault === 'prefix-broken'), true, 'fail：stable-drift 仍 fail-closed（显式回退面）');
+          assert.equal(faults.some((r) => r.fault === 'prefix-reset'), false, 'fail：0 放行');
+        } else {
+          // 0.6.1：接受为缓存重置点——同一份 next 照常发送，对话不中断
+          assert.equal(faults.some((r) => r.fault === 'prefix-reset'), true, `${policy}：stable-drift 接受（prefix-reset）`);
+          assert.equal(faults.some((r) => r.fault === 'prefix-broken'), false, `${policy}：不 fail-closed`);
+          assert.equal(reason.kind, 'completed', `${policy}：任务完成（JSON：${JSON.stringify(reason)}）`);
+        }
       } finally {
         h.cleanup();
       }
     }
   });
 
-  it('B1. 换基成本判据（§8.4）：rebaseBudgetRatio 约束 append-drift 受限换基——预算不足不换基', async () => {
-    // 探针在第 3 请求注入 append-drift（前两请求各自携带 durable 尾块后才有可篡改的
-    // 转正块）。prefixPolicy='rebase' 时放行还要求 §8.4 成本判据：
-    //   剩余预算（maxInputTokens − 当前估算）> 当前估算 × rebaseBudgetRatio。
-    // ratio=100 → 预算不足 → fail-closed；ratio=1.5 → 预算充足 → 放行（prefix-reset）。
-    for (const [ratio, expectReset] of [[100, false], [1.5, true]] as const) {
+  it('B1. 0.6.1：rebaseBudgetRatio / §8.4 成本判据随"受限换基"退役——预算不再约束接受', async () => {
+    // 旧契约（≤0.6.0）：prefixPolicy='rebase' 时放行还要求 §8.4 成本判据
+    //   （剩余预算 > 当前估算 × rebaseBudgetRatio），预算不足 → fail-closed。
+    // 0.6.1：接受 = 发送前放行同一份 next（0 额外请求 / 0 重发成本）——不存在"换基成本"，
+    // 预算判据失去意义。两个 ratio 值都必须接受继续（回归钉：判据退役后不复活）。
+    for (const ratio of [100, 1.5] as const) {
       const h = makeHarness({
         task: `换基判据演练（ratio=${ratio}）。`,
         streams: [
@@ -240,7 +247,9 @@ describe('0.5.0 前缀：driver E2E', () => {
           faultPrefixDrift: { kind: 'append', oncePerTurn: true },
           prefixPolicy: 'rebase',
           rebaseBudgetRatio: ratio,
-          maxInputTokens: 6_000,
+          // 0.5.2：token 估算按 CJK 加权（汉字 ≈0.9 token/字符），前缀估算变大——
+          // 6_000 会低于"3×前缀"下限保护，按新口径抬到 30_000。
+          maxInputTokens: 30_000,
           surfaceCompaction: false,
           observeBudgetTokens: 0,
         },
@@ -248,9 +257,9 @@ describe('0.5.0 前缀：driver E2E', () => {
       try {
         const reason = await h.driver.runTurn();
         const faults = h.driver.snapshot().records.filter((r) => r.kind === 'fault');
-        assert.equal(faults.some((r) => r.fault === 'prefix-reset'), expectReset, `ratio=${ratio}：${expectReset ? '放行（prefix-reset）' : '不换基'}`);
-        assert.equal(faults.some((r) => r.fault === 'prefix-broken'), !expectReset, `ratio=${ratio}：${expectReset ? '不 fail' : 'fail-closed 保留现场'}`);
-        if (expectReset) assert.equal(reason.kind, 'completed');
+        assert.equal(faults.some((r) => r.fault === 'prefix-reset'), true, `ratio=${ratio}：接受继续（prefix-reset）`);
+        assert.equal(faults.some((r) => r.fault === 'prefix-broken'), false, `ratio=${ratio}：预算判据退役，不 fail-closed`);
+        assert.equal(reason.kind, 'completed', `ratio=${ratio}：任务完成`);
       } finally {
         h.cleanup();
       }
@@ -265,7 +274,9 @@ describe('0.5.0 前缀：driver E2E', () => {
       streams: [readStream('a'), readStream('b'), readStream('c'),
         [blockStart, { type: 'text-delta', index: 0, text: '<tf-final id="f1" summary="完成：答案原文为限流演练通过。"/>\n' }, stop]],
       files: { 'f-a.txt': bigFile, 'f-b.txt': bigFile, 'f-c.txt': bigFile },
-      config: { maxInputTokens: 6_000, maxRebasesPerTurn: 0, keepRecent: 1, surfaceCompaction: true, observeBudgetTokens: 0 },
+      // 0.5.2：token 估算按 CJK 加权（汉字 ≈0.9 token/字符），前缀估算从 ~560 涨到 ~2015——
+      // 6_000 会低于"3×前缀"下限保护，按新口径抬到 8_000（仍能触顶触发压缩判定）。
+      config: { maxInputTokens: 8_000, maxRebasesPerTurn: 0, keepRecent: 1, surfaceCompaction: true, observeBudgetTokens: 0 },
     });
     try {
       const reason = await h.driver.runTurn();

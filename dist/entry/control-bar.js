@@ -73,7 +73,15 @@ export default function apply(ctx             , config                   = {})  
     // 来源告警；这里补装配显式 config.mode 的告警面）。
     warn(`control-bar 收到旧模式值 mode="${config.mode}"，已按别名映射为 channel=${resolved.channel}/tier=${resolved.tier}（0.5.x 保留别名，0.6.0 移除）`);
   }
-  let state               = createControlState({ channel: resolved.channel, tier: resolved.tier, lang: resolved.lang });
+  // 0.6.0：状态里必须带上三维开关（落盘会整体写回；漏带 = 关掉的开关被写回默认 true）。
+  let state               = createControlState({
+    channel: resolved.channel,
+    tier: resolved.tier,
+    lang: resolved.lang,
+    ...(resolved.limits === undefined ? {} : { limits: resolved.limits }),
+    contextFold: resolved.contextFold,
+    finalCheck: resolved.finalCheck,
+  });
   const file = resolved.file;
 
   const persist = ()       => {

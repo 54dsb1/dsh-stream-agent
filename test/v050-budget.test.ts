@@ -53,7 +53,8 @@ function makeHarness(opts: { task: string; scenarios: Scenario[]; config?: Parti
     executeTools: noopExecutor(),
     onToolSettled: () => model.notifyToolResult(),
   };
-  const config: StreamDriverConfig = { provider: 'mock', model: 'mock-scenario', streamIdleTimeoutMs: 30_000, ...opts.config };
+  // 0.5.1（1.1）：这些用例覆盖 0.4.x 收束机制（缺 final → nudge → 重入）→ 回退开关
+  const config: StreamDriverConfig = { provider: 'mock', model: 'mock-scenario', streamIdleTimeoutMs: 30_000, requireFinal: true, ...opts.config };
   const driver = new SingleStreamDriver(ports, config);
   driver.pushUserTask(opts.task);
   return { driver, wireRequests, cleanup: () => rmSync(sandboxDir, { recursive: true, force: true }) };
